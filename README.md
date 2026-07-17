@@ -12,17 +12,17 @@
 - 在独立会话区围绕视频继续追问。
 - 响应式桌面与移动端布局，并支持键盘操作和减少动画偏好。
 
-> 当前已启用 **Qwen 真实模型适配器**：不超过 7 MB 的本地视频可内联分析，带正确媒体响应头的 HTTPS 视频直链可由 Qwen 直接读取。B站页面地址和更大的本地文件仍需后续媒体取流/对象存储层。
+> 当前使用 **Qwen + DeepSeek 双模型适配器**：Qwen 负责视频理解和结构化总结，DeepSeek V4 Pro 负责基于总结、证据与历史消息继续对话。不超过 7 MB 的本地视频可内联分析，带正确媒体响应头的 HTTPS 视频直链可由 Qwen 直接读取。
 
-## Qwen 模型接口
+## 模型接口
 
 服务端已经接入阿里云百炼的 OpenAI 兼容接口，默认使用 `qwen3.5-omni-plus` 同时理解视频画面、语音和音效。模型层提供：
 
 - `GET /api/model/status`：检查服务端是否已经配置模型。
 - `POST /api/model/analyze`：接收视频公网 URL、关键帧列表或转写文本，返回结构化总结。
-- `POST /api/model/ask`：基于结构化总结、事实索引和可选的视频上下文继续问答。
+- `POST /api/model/ask`：使用 `deepseek-v4-pro`，基于结构化总结、事实索引和历史消息继续问答。
 
-复制 `.env.example` 为 `.env.local`，然后填写 `DASHSCOPE_API_KEY`。如果百炼控制台提供了带 Workspace ID 的专属兼容地址，同时修改 `DASHSCOPE_BASE_URL`。API Key 只在服务端读取，不会打包到浏览器。
+复制 `.env.example` 为 `.env.local`，填写 `DASHSCOPE_API_KEY` 和 `DEEPSEEK_API_KEY`。如果百炼控制台提供了带 Workspace ID 的专属兼容地址，同时修改 `DASHSCOPE_BASE_URL`。两种 API Key 都只在服务端读取，不会打包到浏览器。
 
 模型调用层与媒体获取层保持分离。页面已经调用真实模型；完成对象存储上传或 B 站受控取流后，只需继续把可由百炼访问的 HTTPS 视频地址传给 `POST /api/model/analyze`，即可扩展到大文件与 B站来源。
 

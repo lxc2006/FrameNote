@@ -12,6 +12,11 @@ import {
   QwenResponseError,
   parseVideoSummary,
 } from "./qwen-video-engine";
+import {
+  DeepSeekConfigurationError,
+  DeepSeekInputError,
+  DeepSeekResponseError,
+} from "./deepseek-conversation-engine";
 
 const MAX_JSON_BYTES = 14 * 1024 * 1024;
 const MAX_TRANSCRIPT_CHARACTERS = 1_500_000;
@@ -69,37 +74,45 @@ export function parseAskVideoRequest(value: unknown): AskVideoRequest {
   };
 }
 
-export function modelErrorResponse(error: unknown) {
-  if (error instanceof QwenConfigurationError) {
+export function modelErrorResponse(
+  error: unknown,
+  provider: "qwen" | "deepseek" = "qwen",
+) {
+  if (
+    error instanceof QwenConfigurationError ||
+    error instanceof DeepSeekConfigurationError
+  ) {
     return errorResponse(503, "MODEL_NOT_CONFIGURED", error.message, false);
   }
-  if (error instanceof QwenInputError) {
+  if (error instanceof QwenInputError || error instanceof DeepSeekInputError) {
     return errorResponse(400, "INVALID_MODEL_INPUT", error.message, false);
   }
-  if (error instanceof QwenResponseError) {
+  if (error instanceof QwenResponseError || error instanceof DeepSeekResponseError) {
     return errorResponse(502, "INVALID_MODEL_RESPONSE", error.message, true);
   }
   if (error instanceof OpenAI.APIError) {
+    const label = provider === "deepseek" ? "DeepSeek" : "Qwen";
+    const codePrefix = provider === "deepseek" ? "DEEPSEEK" : "QWEN";
     if (error.status === 401 || error.status === 403) {
       return errorResponse(
         502,
-        "QWEN_AUTH_FAILED",
-        "Qwen 鉴权失败，请检查 API Key、地域和 Base URL 是否匹配。",
+        `${codePrefix}_AUTH_FAILED`,
+        `${label} 鉴权失败，请检查 API Key 和 Base URL 是否匹配。`,
         false,
       );
     }
     if (error.status === 429) {
       return errorResponse(
         429,
-        "QWEN_RATE_LIMITED",
-        "Qwen 当前请求过多或额度不足，请稍后重试。",
+        `${codePrefix}_RATE_LIMITED`,
+        `${label} 当前请求过多或额度不足，请稍后重试。`,
         true,
       );
     }
     return errorResponse(
       502,
-      "QWEN_REQUEST_FAILED",
-      "Qwen 模型调用失败，请稍后重试。",
+      `${codePrefix}_REQUEST_FAILED`,
+      `${label} 模型调用失败，请稍后重试。`,
       true,
     );
   }

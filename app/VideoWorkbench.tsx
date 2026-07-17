@@ -325,7 +325,7 @@ export default function VideoWorkbench() {
           id: nextMessageId("assistant"),
           role: "assistant",
           content:
-            "Qwen 已完成视频理解与结构化总结。你可以继续问我核心观点、章节结构、术语解释或行动建议。",
+            "Qwen 已完成视频理解与结构化总结。接下来由 DeepSeek V4 Pro 回答核心观点、章节结构、术语解释或行动建议。",
         },
       ]);
       setPhase("ready");
@@ -443,11 +443,15 @@ export default function VideoWorkbench() {
         <div className="topbar-actions">
           <span className="engine-badge">
             <span className="status-dot" aria-hidden="true" />
-            {modelStatus?.configured
-              ? `Qwen · ${modelStatus.model}`
-              : modelStatus
-                ? "等待 Qwen API Key"
-                : "正在检查 Qwen"}
+            {modelStatus
+              ? modelStatus.configured && modelStatus.conversation.configured
+                ? "Qwen 视频 · DeepSeek 对话"
+                : modelStatus.configured
+                  ? "等待 DeepSeek API Key"
+                  : modelStatus.conversation.configured
+                    ? "等待 Qwen API Key"
+                    : "等待模型 API Key"
+              : "正在检查模型"}
           </span>
           <button className="new-task-button" type="button" onClick={resetWorkspace}>
             <span aria-hidden="true">＋</span>
@@ -641,9 +645,9 @@ export default function VideoWorkbench() {
           <div className="architecture-note">
             <span aria-hidden="true">◎</span>
             <div>
-              <strong>Qwen 模型接口已经就绪</strong>
+              <strong>Qwen 视频理解 + DeepSeek V4 Pro 对话</strong>
               <p>
-                小视频与 HTTPS 视频直链已使用真实 Qwen 接口；B站链接和大文件仍需接入媒体存储与取流。
+                Qwen 负责生成总结，DeepSeek 基于总结、证据和会话历史继续回答；B站链接和大文件仍需接入媒体存储与取流。
               </p>
             </div>
           </div>

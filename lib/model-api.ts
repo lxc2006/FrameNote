@@ -23,6 +23,11 @@ export interface ModelStatusResponse {
   configured: boolean;
   model: string;
   acceptedInputs: Array<"video_url" | "frames" | "transcript">;
+  conversation: {
+    provider: "deepseek";
+    configured: boolean;
+    model: string;
+  };
 }
 
 export interface AnalyzeVideoResponse {
@@ -32,7 +37,7 @@ export interface AnalyzeVideoResponse {
 }
 
 export interface AskVideoResponse {
-  provider: "qwen";
+  provider: "deepseek";
   model: string;
   answer: string;
 }

@@ -37,5 +37,9 @@ declare module "cloudflare:workers" {
     DASHSCOPE_BASE_URL?: string;
     QWEN_VIDEO_MODEL?: string;
     QWEN_REQUEST_TIMEOUT_MS?: string;
+    DEEPSEEK_API_KEY?: string;
+    DEEPSEEK_BASE_URL?: string;
+    DEEPSEEK_CHAT_MODEL?: string;
+    DEEPSEEK_REQUEST_TIMEOUT_MS?: string;
   };
 }

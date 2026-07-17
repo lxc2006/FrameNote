@@ -40,11 +40,11 @@ test("server-renders the FrameNote video workspace", async () => {
   assert.match(html, /上传视频/);
   assert.match(html, /B站链接/);
   assert.match(html, /视频总结对话/);
-  assert.match(html, /正在检查 Qwen/);
+  assert.match(html, /正在检查模型/);
   assert.doesNotMatch(html, /codex-preview|Your site is taking shape/i);
 });
 
-test("exposes Qwen model status without leaking credentials", async () => {
+test("exposes Qwen and DeepSeek model status without leaking credentials", async () => {
   const response = await request("/api/model/status");
   assert.equal(response.status, 200);
   assert.match(response.headers.get("cache-control") ?? "", /no-store/i);
@@ -54,7 +54,11 @@ test("exposes Qwen model status without leaking credentials", async () => {
   assert.equal(typeof payload.configured, "boolean");
   assert.equal(typeof payload.model, "string");
   assert.deepEqual(payload.acceptedInputs, ["video_url", "frames", "transcript"]);
+  assert.equal(payload.conversation.provider, "deepseek");
+  assert.equal(payload.conversation.model, "deepseek-v4-pro");
+  assert.equal(typeof payload.conversation.configured, "boolean");
   assert.equal("apiKey" in payload, false);
+  assert.equal("apiKey" in payload.conversation, false);
 });
 
 test("validates model requests before attempting a provider call", async () => {
@@ -70,7 +74,7 @@ test("validates model requests before attempting a provider call", async () => {
   assert.equal(payload.error.retryable, false);
 });
 
-test("calls Qwen for structured analysis and follow-up answers", async (t) => {
+test("uses Qwen for analysis and DeepSeek V4 Pro for follow-up answers", async (t) => {
   const providerRequests = [];
   const summary = {
     title: "测试视频",
@@ -89,25 +93,38 @@ test("calls Qwen for structured analysis and follow-up answers", async (t) => {
       body: JSON.parse(body),
     };
     providerRequests.push(providerRequest);
-    const content = providerRequest.body.response_format
-      ? `${JSON.stringify(summary)}\n\`\`\``
-      : "结论：模型调用链路可用。依据见 00:01。";
-    res.writeHead(200, { "content-type": "text/event-stream" });
-    res.write(
-      `data: ${JSON.stringify({
-        id: "chatcmpl-test",
-        object: "chat.completion.chunk",
+    if (providerRequest.body.model === "deepseek-v4-pro") {
+      res.writeHead(200, { "content-type": "application/json" });
+      res.end(JSON.stringify({
+        id: "chatcmpl-deepseek-test",
+        object: "chat.completion",
         created: 0,
-        model: "qwen3.5-omni-plus",
-        choices: [
-          {
-            index: 0,
-            delta: { content },
-            finish_reason: null,
+        model: "deepseek-v4-pro",
+        choices: [{
+          index: 0,
+          message: {
+            role: "assistant",
+            content: "结论：模型调用链路可用。依据见 00:01。",
           },
-        ],
-      })}\n\n`,
-    );
+          finish_reason: "stop",
+        }],
+      }));
+      return;
+    }
+
+    const content = `${JSON.stringify(summary)}\n\`\`\``;
+    res.writeHead(200, { "content-type": "text/event-stream" });
+    res.write(`data: ${JSON.stringify({
+      id: "chatcmpl-qwen-test",
+      object: "chat.completion.chunk",
+      created: 0,
+      model: "qwen3.5-omni-plus",
+      choices: [{
+        index: 0,
+        delta: { content },
+        finish_reason: null,
+      }],
+    })}\n\n`);
     res.end("data: [DONE]\n\n");
   });
   provider.listen(0, "127.0.0.1");
@@ -172,19 +189,20 @@ test("calls Qwen for structured analysis and follow-up answers", async (t) => {
       }),
     },
     {
-      DASHSCOPE_API_KEY: "local-test-key",
-      DASHSCOPE_BASE_URL: `http://127.0.0.1:${address.port}/compatible-mode/v1`,
-      QWEN_VIDEO_MODEL: "qwen3.5-omni-plus",
+      DEEPSEEK_API_KEY: "deepseek-test-key",
+      DEEPSEEK_BASE_URL: `http://127.0.0.1:${address.port}/deepseek`,
+      DEEPSEEK_CHAT_MODEL: "deepseek-v4-pro",
     },
   );
   assert.equal(askResponse.status, 200);
   const askPayload = await askResponse.json();
+  assert.equal(askPayload.provider, "deepseek");
+  assert.equal(askPayload.model, "deepseek-v4-pro");
   assert.equal(askPayload.answer, "结论：模型调用链路可用。依据见 00:01。");
-  assert.equal(providerRequests[1].body.response_format, undefined);
-  assert.match(
-    providerRequests[1].body.messages.at(-1).content.at(-1).text,
-    /结论是什么/,
-  );
+  assert.equal(providerRequests[1].authorization, "Bearer deepseek-test-key");
+  assert.equal(providerRequests[1].url, "/deepseek/chat/completions");
+  assert.equal(providerRequests[1].body.stream, false);
+  assert.match(providerRequests[1].body.messages.at(-1).content, /结论是什么/);
 });
 
 test("removes disposable starter assets and keeps model choice decoupled", async () => {
