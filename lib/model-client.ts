@@ -10,19 +10,12 @@ import type {
 export class ModelClientError extends Error {
   readonly code: string;
   readonly retryable: boolean;
-  readonly rawResponse?: string;
 
-  constructor(
-    message: string,
-    code = "MODEL_REQUEST_FAILED",
-    retryable = false,
-    rawResponse?: string,
-  ) {
+  constructor(message: string, code = "MODEL_REQUEST_FAILED", retryable = false) {
     super(message);
     this.name = "ModelClientError";
     this.code = code;
     this.retryable = retryable;
-    this.rawResponse = rawResponse;
   }
 }
 
@@ -71,14 +64,10 @@ async function requestModel<T>(path: string, init?: RequestInit): Promise<T> {
     const modelError = body && typeof body === "object" && "error" in body
       ? body.error
       : null;
-    if (modelError?.rawResponse) {
-      console.error("[Qwen analyze raw response]\n", modelError.rawResponse);
-    }
     throw new ModelClientError(
       modelError?.message ?? `模型服务返回 HTTP ${response.status}。`,
       modelError?.code,
       modelError?.retryable,
-      modelError?.rawResponse,
     );
   }
   if (!body) throw new ModelClientError("模型服务返回了空响应。", "EMPTY_RESPONSE", true);

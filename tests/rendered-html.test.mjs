@@ -90,7 +90,7 @@ test("calls Qwen for structured analysis and follow-up answers", async (t) => {
     };
     providerRequests.push(providerRequest);
     const content = providerRequest.body.response_format
-      ? JSON.stringify(summary)
+      ? `${JSON.stringify(summary)}\n\`\`\``
       : "结论：模型调用链路可用。依据见 00:01。";
     res.writeHead(200, { "content-type": "text/event-stream" });
     res.write(
