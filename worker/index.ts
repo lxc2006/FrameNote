@@ -1,10 +1,15 @@
 /** Cloudflare Worker entry point for the vinext-starter template. */
 import { handleImageOptimization, DEFAULT_DEVICE_SIZES, DEFAULT_IMAGE_SIZES } from "vinext/server/image-optimization";
 import handler from "vinext/server/app-router-entry";
+import { setQwenRuntimeBindings } from "../lib/server/qwen-config";
 
 interface Env {
   ASSETS: Fetcher;
   DB: D1Database;
+  DASHSCOPE_API_KEY?: string;
+  DASHSCOPE_BASE_URL?: string;
+  QWEN_VIDEO_MODEL?: string;
+  QWEN_REQUEST_TIMEOUT_MS?: string;
   IMAGES: {
     input(stream: ReadableStream): {
       transform(options: Record<string, unknown>): {
@@ -27,6 +32,7 @@ interface ExecutionContext {
 
 const worker = {
   async fetch(request: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
+    setQwenRuntimeBindings(env as unknown as Record<string, unknown>);
     const url = new URL(request.url);
 
     if (url.pathname === "/_vinext/image") {

@@ -33,5 +33,9 @@ interface D1Database {
 declare module "cloudflare:workers" {
   export const env: {
     DB: D1Database;
+    DASHSCOPE_API_KEY?: string;
+    DASHSCOPE_BASE_URL?: string;
+    QWEN_VIDEO_MODEL?: string;
+    QWEN_REQUEST_TIMEOUT_MS?: string;
   };
 }

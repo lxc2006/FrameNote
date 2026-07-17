@@ -14,6 +14,18 @@
 
 > 当前运行在 **Demo 适配器**：本地视频不会上传，B站视频不会实际下载，生成的总结也不代表原视频内容。界面内会持续显示这一状态，避免把模拟结果误认为真实 AI 输出。
 
+## Qwen 模型接口
+
+服务端已经接入阿里云百炼的 OpenAI 兼容接口，默认使用 `qwen3.5-omni-plus` 同时理解视频画面、语音和音效。模型层提供：
+
+- `GET /api/model/status`：检查服务端是否已经配置模型。
+- `POST /api/model/analyze`：接收视频公网 URL、关键帧列表或转写文本，返回结构化总结。
+- `POST /api/model/ask`：基于结构化总结、事实索引和可选的视频上下文继续问答。
+
+复制 `.env.example` 为 `.env.local`，然后填写 `DASHSCOPE_API_KEY`。如果百炼控制台提供了带 Workspace ID 的专属兼容地址，同时修改 `DASHSCOPE_BASE_URL`。API Key 只在服务端读取，不会打包到浏览器。
+
+模型调用层与媒体获取层保持分离。当前页面仍使用 Demo 流程；完成对象存储上传或 B 站受控取流后，把可由百炼访问的 HTTPS 视频地址传给 `POST /api/model/analyze` 即可切换到真实总结。
+
 ## 本地运行
 
 要求 Node.js `>=22.13.0` 与 pnpm。

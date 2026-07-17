@@ -482,9 +482,9 @@ export default function VideoWorkbench() {
           <div className="architecture-note">
             <span aria-hidden="true">◎</span>
             <div>
-              <strong>模型与部署方式可后置决定</strong>
+              <strong>Qwen 模型接口已经就绪</strong>
               <p>
-                当前使用演示适配器验证完整体验；后续可接入云端多模态 API、自托管模型或混合处理服务。
+                当前页面仍使用演示素材；媒体上传或取流完成后，可直接交给 Qwen 生成真实总结与回答。
               </p>
             </div>
           </div>

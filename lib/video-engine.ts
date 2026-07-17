@@ -21,26 +21,57 @@ export interface SummaryChapter {
   description: string;
 }
 
+export interface SummaryEvidence {
+  time: string;
+  fact: string;
+}
+
 export interface VideoSummary {
   title: string;
   overview: string;
   keyPoints: SummaryPoint[];
   chapters: SummaryChapter[];
   takeaway: string;
+  /**
+   * 给后续问答使用的事实索引。界面可以不展示，但服务端会用它减少
+   * 再次发送整段视频的次数。
+   */
+  evidence?: SummaryEvidence[];
+}
+
+export interface VideoModelContext {
+  /** Qwen 可读取的公网 HTTPS 视频地址或受支持的 data URL。 */
+  videoUrl?: string;
+  /** 已按时间顺序抽取的关键帧 URL；适用于已有媒体处理流水线的场景。 */
+  frameUrls?: string[];
+  /** 已有的字幕或 ASR 文本。它会与视频/关键帧证据一起使用。 */
+  transcript?: string;
+  /** 视频抽帧频率。长视频建议使用较低值。 */
+  fps?: number;
+}
+
+export interface VideoConversationMessage {
+  role: "assistant" | "user";
+  content: string;
 }
 
 export interface VideoEngine {
   readonly mode: "demo" | "remote";
-  analyze(source: VideoSourceDescriptor): Promise<VideoSummary>;
+  analyze(
+    source: VideoSourceDescriptor,
+    context?: VideoModelContext,
+  ): Promise<VideoSummary>;
   ask(
     question: string,
     source: VideoSourceDescriptor,
     summary: VideoSummary,
+    context?: VideoModelContext,
+    history?: VideoConversationMessage[],
   ): Promise<string>;
 }
 
 const wait = (milliseconds: number) =>
-  new Promise<void>((resolve) => window.setTimeout(resolve, milliseconds));
+  new Promise<void>((resolve) => globalThis.setTimeout(resolve, milliseconds));
 
 function createDemoSummary(source: VideoSourceDescriptor): VideoSummary {
   const origin =
