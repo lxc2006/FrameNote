@@ -40,7 +40,7 @@ test("server-renders the FrameNote video workspace", async () => {
   assert.match(html, /上传视频/);
   assert.match(html, /B站链接/);
   assert.match(html, /视频总结对话/);
-  assert.match(html, /演示适配器/);
+  assert.match(html, /正在检查 Qwen/);
   assert.doesNotMatch(html, /codex-preview|Your site is taking shape/i);
 });
 
@@ -188,11 +188,12 @@ test("calls Qwen for structured analysis and follow-up answers", async (t) => {
 });
 
 test("removes disposable starter assets and keeps model choice decoupled", async () => {
-  const [page, layout, packageJson, engine] = await Promise.all([
+  const [page, layout, packageJson, engine, workbench] = await Promise.all([
     readFile(new URL("../app/page.tsx", import.meta.url), "utf8"),
     readFile(new URL("../app/layout.tsx", import.meta.url), "utf8"),
     readFile(new URL("../package.json", import.meta.url), "utf8"),
     readFile(new URL("../lib/video-engine.ts", import.meta.url), "utf8"),
+    readFile(new URL("../app/VideoWorkbench.tsx", import.meta.url), "utf8"),
   ]);
 
   assert.match(page, /<VideoWorkbench \/>/);
@@ -201,6 +202,9 @@ test("removes disposable starter assets and keeps model choice decoupled", async
   assert.doesNotMatch(packageJson, /react-loading-skeleton/);
   assert.match(engine, /interface VideoEngine/);
   assert.match(engine, /mode: "demo"/);
+  assert.match(workbench, /analyzeVideo/);
+  assert.match(workbench, /askVideo/);
+  assert.doesNotMatch(workbench, /demoVideoEngine/);
 
   await assert.rejects(
     access(new URL("../app/_sites-preview/SkeletonPreview.tsx", import.meta.url)),

@@ -1063,6 +1063,20 @@ textarea:focus-visible {
   text-decoration: none;
 }
 
+.demo-disclaimer.real-model {
+  border-color: #c7e8dc;
+  background: #effaf6;
+}
+
+.demo-disclaimer.real-model .demo-tag {
+  background: #168866;
+}
+
+.demo-disclaimer.real-model p,
+.demo-disclaimer.real-model a {
+  color: #286b57;
+}
+
 .summary-document {
   padding: 28px 4px 4px;
 }

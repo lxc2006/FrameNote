@@ -10,13 +10,19 @@ import {
   useState,
 } from "react";
 import {
-  demoVideoEngine,
   extractBvid,
   formatDuration,
   formatFileSize,
   type VideoSourceDescriptor,
   type VideoSummary,
 } from "@/lib/video-engine";
+import {
+  ModelClientError,
+  analyzeVideo,
+  askVideo,
+  getModelStatus,
+} from "@/lib/model-client";
+import type { ModelStatusResponse } from "@/lib/model-api";
 
 type InputMode = "upload" | "bilibili";
 type Phase = "idle" | "processing" | "ready" | "error";
@@ -34,7 +40,7 @@ interface ChatMessage {
 }
 
 const acceptedExtensions = ["mp4", "mov", "webm", "mkv", "m4v"];
-const MAX_FILE_SIZE = 4 * 1024 * 1024 * 1024;
+const MAX_INLINE_VIDEO_SIZE = 7 * 1024 * 1024;
 
 const suggestions = ["这个视频的核心观点是什么？", "按时间线梳理章节", "给我三个行动建议"];
 
@@ -49,13 +55,63 @@ function titleFromFilename(filename: string) {
   return filename.replace(/\.[^.]+$/, "") || filename;
 }
 
+function publicVideoUrl(value: string) {
+  try {
+    const url = new URL(value.trim());
+    if (url.protocol !== "https:") return null;
+    return /\.(?:mp4|mov|webm|mkv|m4v|avi|flv|wmv)$/i.test(url.pathname)
+      ? url.href
+      : null;
+  } catch {
+    return null;
+  }
+}
+
+function titleFromUrl(value: string) {
+  try {
+    const pathname = new URL(value).pathname;
+    return decodeURIComponent(pathname.split("/").filter(Boolean).at(-1) ?? "在线视频");
+  } catch {
+    return "在线视频";
+  }
+}
+
+function fileToDataUrl(file: File) {
+  return new Promise<string>((resolve, reject) => {
+    const reader = new FileReader();
+    reader.onerror = () => reject(new Error("读取视频文件失败。"));
+    reader.onload = () => {
+      if (typeof reader.result !== "string") {
+        reject(new Error("读取视频文件失败。"));
+        return;
+      }
+      const base64 = reader.result.slice(reader.result.indexOf(",") + 1);
+      const mimeType = file.type.startsWith("video/")
+        ? file.type
+        : `video/${fileExtension(file.name) || "mp4"}`;
+      resolve(`data:${mimeType};base64,${base64}`);
+    };
+    reader.readAsDataURL(file);
+  });
+}
+
 function stagesFor(source: VideoSourceDescriptor) {
   if (source.kind === "upload") {
     return [
       "校验视频文件",
-      "读取媒体信息",
-      "提取音轨与关键帧",
-      "语音转写与内容理解",
+      "编码安全模型输入",
+      "提交视频素材",
+      "Qwen 理解画面与声音",
+      "生成结构化总结",
+    ];
+  }
+
+  if (source.kind === "url") {
+    return [
+      "校验视频直链",
+      "提交视频地址",
+      "读取视频媒体",
+      "Qwen 理解画面与声音",
       "生成结构化总结",
     ];
   }
@@ -94,11 +150,19 @@ export default function VideoWorkbench() {
   const [messages, setMessages] = useState<ChatMessage[]>([]);
   const [question, setQuestion] = useState("");
   const [isReplying, setIsReplying] = useState(false);
+  const [modelStatus, setModelStatus] = useState<ModelStatusResponse | null>(null);
+  const [activeModel, setActiveModel] = useState<string | null>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
   const runTokenRef = useRef(0);
   const messageCounterRef = useRef(0);
+  const analyzeAbortRef = useRef<AbortController | null>(null);
+  const askAbortRef = useRef<AbortController | null>(null);
 
   const bvid = useMemo(() => extractBvid(bilibiliInput), [bilibiliInput]);
+  const directVideoUrl = useMemo(
+    () => publicVideoUrl(bilibiliInput),
+    [bilibiliInput],
+  );
 
   const pendingSource = useMemo<VideoSourceDescriptor | null>(() => {
     if (mode === "upload") {
@@ -119,6 +183,16 @@ export default function VideoWorkbench() {
       };
     }
 
+    if (directVideoUrl) {
+      return {
+        kind: "url",
+        title: titleFromUrl(directVideoUrl),
+        subtitle: "HTTPS 视频直链 · 由 Qwen 直接读取",
+        sourceUrl: directVideoUrl,
+        downloadFirst: false,
+      };
+    }
+
     if (!bvid) return null;
 
     return {
@@ -129,7 +203,15 @@ export default function VideoWorkbench() {
       sourceUrl: `https://www.bilibili.com/video/${bvid}`,
       downloadFirst,
     };
-  }, [bvid, downloadFirst, mode, selectedVideo]);
+  }, [bvid, directVideoUrl, downloadFirst, mode, selectedVideo]);
+
+  useEffect(() => {
+    const controller = new AbortController();
+    void getModelStatus(controller.signal)
+      .then(setModelStatus)
+      .catch(() => setModelStatus(null));
+    return () => controller.abort();
+  }, []);
 
   useEffect(() => {
     return () => {
@@ -156,8 +238,8 @@ export default function VideoWorkbench() {
       return;
     }
 
-    if (file.size > MAX_FILE_SIZE) {
-      setNotice("演示版单个文件上限为 4 GB。正式接入对象存储后可按部署方案调整。");
+    if (file.size > MAX_INLINE_VIDEO_SIZE) {
+      setNotice("当前模型直传上限为 7 MB。更大的视频请改用可公开读取的 HTTPS 视频直链。");
       return;
     }
 
@@ -189,49 +271,87 @@ export default function VideoWorkbench() {
       return;
     }
 
+    if (pendingSource.kind === "bilibili") {
+      setNotice("B 站页面地址还需要先解析为可读取的视频流；请先上传小于 7 MB 的视频，或粘贴 HTTPS 视频直链。");
+      return;
+    }
+    if (pendingSource.kind === "upload" && selectedVideo && selectedVideo.file.size > MAX_INLINE_VIDEO_SIZE) {
+      setNotice("当前 Qwen 内联直传上限为 7 MB。更大的视频请使用可公开读取的 HTTPS 视频直链，或等待对象存储上传接入。");
+      return;
+    }
+
     const runToken = runTokenRef.current + 1;
     runTokenRef.current = runToken;
+    analyzeAbortRef.current?.abort();
+    askAbortRef.current?.abort();
+    askAbortRef.current = null;
+    const controller = new AbortController();
+    analyzeAbortRef.current = controller;
     const stages = stagesFor(pendingSource);
 
     setNotice(null);
     setPhase("processing");
     setSummary(null);
+    setActiveModel(null);
     setMessages([]);
     setActiveSource(pendingSource);
     setProcessingStages(stages);
     setStageIndex(0);
 
     try {
-      for (let index = 0; index < stages.length; index += 1) {
-        if (runTokenRef.current !== runToken) return;
-        setStageIndex(index);
-        await delay(index === stages.length - 1 ? 620 : 480);
-      }
-
-      const result = await demoVideoEngine.analyze(pendingSource);
+      setStageIndex(1);
+      const videoUrl = pendingSource.kind === "upload" && selectedVideo
+        ? await fileToDataUrl(selectedVideo.file)
+        : pendingSource.sourceUrl;
+      if (!videoUrl) throw new Error("没有可提交给模型的视频输入。");
+      if (runTokenRef.current !== runToken) return;
+      setStageIndex(2);
+      await delay(120);
+      setStageIndex(3);
+      const result = await analyzeVideo(
+        {
+          source: pendingSource,
+          context: { videoUrl, fps: 0.5 },
+        },
+        controller.signal,
+      );
       if (runTokenRef.current !== runToken) return;
 
-      setSummary(result);
+      setStageIndex(4);
+      setSummary(result.summary);
+      setActiveModel(result.model);
       setMessages([
         {
           id: nextMessageId("assistant"),
           role: "assistant",
           content:
-            "总结已经生成。你可以继续问我视频的核心观点、章节结构、术语解释或行动建议。当前回答会明确使用演示数据。",
+            "Qwen 已完成视频理解与结构化总结。你可以继续问我核心观点、章节结构、术语解释或行动建议。",
         },
       ]);
       setPhase("ready");
-    } catch {
+    } catch (error) {
       if (runTokenRef.current !== runToken) return;
+      if (error instanceof DOMException && error.name === "AbortError") return;
       setPhase("error");
-      setNotice("处理没有完成，请检查素材后重试。");
+      setNotice(
+        error instanceof ModelClientError || error instanceof Error
+          ? error.message
+          : "处理没有完成，请检查素材后重试。",
+      );
+    } finally {
+      if (analyzeAbortRef.current === controller) analyzeAbortRef.current = null;
     }
   }
 
   function resetWorkspace() {
     runTokenRef.current += 1;
+    analyzeAbortRef.current?.abort();
+    analyzeAbortRef.current = null;
+    askAbortRef.current?.abort();
+    askAbortRef.current = null;
     setPhase("idle");
     setSummary(null);
+    setActiveModel(null);
     setActiveSource(null);
     setProcessingStages([]);
     setStageIndex(-1);
@@ -243,7 +363,10 @@ export default function VideoWorkbench() {
 
   async function askQuestion(rawQuestion: string) {
     const trimmed = rawQuestion.trim();
-    if (!trimmed || !summary || !activeSource || isReplying) return;
+    if (!trimmed || !summary || !activeSource || isReplying || askAbortRef.current) return;
+
+    const controller = new AbortController();
+    askAbortRef.current = controller;
 
     const userMessage: ChatMessage = {
       id: nextMessageId("user"),
@@ -255,17 +378,40 @@ export default function VideoWorkbench() {
     setIsReplying(true);
 
     try {
-      const answer = await demoVideoEngine.ask(trimmed, activeSource, summary);
+      const result = await askVideo(
+        {
+          question: trimmed,
+          source: activeSource,
+          summary,
+          history: messages.slice(-12).map(({ role, content }) => ({ role, content })),
+        },
+        controller.signal,
+      );
+      if (askAbortRef.current !== controller) return;
       setMessages((current) => [
         ...current,
         {
           id: nextMessageId("assistant"),
           role: "assistant",
-          content: answer,
+          content: result.answer,
+        },
+      ]);
+    } catch (error) {
+      if (error instanceof DOMException && error.name === "AbortError") return;
+      if (askAbortRef.current !== controller) return;
+      setMessages((current) => [
+        ...current,
+        {
+          id: nextMessageId("assistant"),
+          role: "assistant",
+          content: error instanceof Error ? `回答失败：${error.message}` : "回答失败，请稍后重试。",
         },
       ]);
     } finally {
-      setIsReplying(false);
+      if (askAbortRef.current === controller) {
+        askAbortRef.current = null;
+        setIsReplying(false);
+      }
     }
   }
 
@@ -297,7 +443,11 @@ export default function VideoWorkbench() {
         <div className="topbar-actions">
           <span className="engine-badge">
             <span className="status-dot" aria-hidden="true" />
-            演示适配器
+            {modelStatus?.configured
+              ? `Qwen · ${modelStatus.model}`
+              : modelStatus
+                ? "等待 Qwen API Key"
+                : "正在检查 Qwen"}
           </span>
           <button className="new-task-button" type="button" onClick={resetWorkspace}>
             <span aria-hidden="true">＋</span>
@@ -312,7 +462,7 @@ export default function VideoWorkbench() {
             <span className="eyebrow">VIDEO INTELLIGENCE</span>
             <h1 id="setup-title">让一段视频，变成一次可继续的对话。</h1>
             <p>
-              上传本地视频，或粘贴 B 站链接。帧记会先生成结构化总结，再保留上下文回答你的后续问题。
+              上传小型本地视频，或粘贴 HTTPS 视频直链。帧记会先生成结构化总结，再保留上下文回答你的后续问题。
             </p>
           </div>
 
@@ -336,7 +486,7 @@ export default function VideoWorkbench() {
                 onClick={() => selectMode("bilibili")}
               >
                 <span aria-hidden="true">BV</span>
-                B站链接
+                B站 / 直链
               </button>
             </div>
 
@@ -366,7 +516,7 @@ export default function VideoWorkbench() {
                       ↥
                     </span>
                     <strong>拖放视频到这里</strong>
-                    <p>MP4、MOV、WebM、MKV、M4V，最大 4 GB</p>
+                    <p>MP4、MOV、WebM、MKV、M4V · 当前模型直传 ≤ 7 MB</p>
                     <button
                       type="button"
                       onClick={() => fileInputRef.current?.click()}
@@ -412,9 +562,13 @@ export default function VideoWorkbench() {
             ) : (
               <div className="source-form" role="tabpanel">
                 <label className="field-label" htmlFor="bilibili-source">
-                  视频链接或 BV 号
+                  B站链接、BV 号或 HTTPS 视频直链
                 </label>
-                <div className={`link-input ${bilibiliInput && !bvid ? "invalid" : ""}`}>
+                <div
+                  className={`link-input ${
+                    bilibiliInput && !bvid && !directVideoUrl ? "invalid" : ""
+                  }`}
+                >
                   <span aria-hidden="true">↗</span>
                   <input
                     id="bilibili-source"
@@ -423,30 +577,35 @@ export default function VideoWorkbench() {
                       setBilibiliInput(event.target.value);
                       setNotice(null);
                     }}
-                    placeholder="https://www.bilibili.com/video/BV..."
+                    placeholder="BV... 或 https://example.com/video.mp4"
                     autoComplete="off"
                     spellCheck={false}
                   />
-                  {bvid ? <span className="valid-mark">已识别</span> : null}
+                  {bvid || directVideoUrl ? (
+                    <span className="valid-mark">
+                      {directVideoUrl ? "视频直链" : "已识别"}
+                    </span>
+                  ) : null}
                 </div>
-                {bilibiliInput && !bvid ? (
-                  <p className="field-error">没有识别到有效的 BV 号，请检查输入。</p>
+                {bilibiliInput && !bvid && !directVideoUrl ? (
+                  <p className="field-error">没有识别到 BV 号或受支持的 HTTPS 视频直链。</p>
                 ) : (
-                  <p className="field-help">支持完整链接、短链解析后的链接或直接输入 BV 号。</p>
+                  <p className="field-help">视频直链可直接调用 Qwen；B站链接仍需先完成取流。</p>
                 )}
 
-                <label className="download-option">
+                <label className={`download-option ${directVideoUrl ? "disabled" : ""}`}>
                   <span className="switch-wrap">
                     <input
                       type="checkbox"
                       checked={downloadFirst}
+                      disabled={Boolean(directVideoUrl)}
                       onChange={(event) => setDownloadFirst(event.target.checked)}
                     />
                     <span className="switch" aria-hidden="true" />
                   </span>
                   <span>
-                    <strong>先下载视频，再进行总结</strong>
-                    <small>适合需要保留原文件，或模型要求本地媒体的情况</small>
+                    <strong>{directVideoUrl ? "视频直链由 Qwen 直接读取" : "先下载视频，再进行总结"}</strong>
+                    <small>{directVideoUrl ? "无需经过浏览器上传" : "B站来源需要在后续取流服务中处理"}</small>
                   </span>
                 </label>
               </div>
@@ -484,7 +643,7 @@ export default function VideoWorkbench() {
             <div>
               <strong>Qwen 模型接口已经就绪</strong>
               <p>
-                当前页面仍使用演示素材；媒体上传或取流完成后，可直接交给 Qwen 生成真实总结与回答。
+                小视频与 HTTPS 视频直链已使用真实 Qwen 接口；B站链接和大文件仍需接入媒体存储与取流。
               </p>
             </div>
           </div>
@@ -573,17 +732,17 @@ export default function VideoWorkbench() {
 
                 <div className="processing-tip">
                   <span aria-hidden="true">i</span>
-                  大视频处理会在服务端异步执行；关闭页面后也可通过任务 ID 恢复进度。
+                  视频理解可能需要几分钟；处理完成前请保持当前页面打开。
                 </div>
               </div>
             ) : null}
 
             {phase === "ready" && summary && activeSource ? (
               <div className="ready-view">
-                <div className="demo-disclaimer">
-                  <span className="demo-tag">DEMO</span>
+                <div className="demo-disclaimer real-model">
+                  <span className="demo-tag">QWEN</span>
                   <p>
-                    当前未连接真实视频模型，以下内容用于验证总结与追问体验，不代表原视频内容。
+                    以下内容由真实 Qwen 视频模型生成。AI 结果可能有误，请结合原视频核对重要信息。
                   </p>
                   {activeSource.sourceUrl ? (
                     <a href={activeSource.sourceUrl} target="_blank" rel="noreferrer">
@@ -609,7 +768,7 @@ export default function VideoWorkbench() {
                       <strong>{summary.chapters.length}</strong> 个章节
                     </span>
                     <span>
-                      <strong>Demo</strong> 分析引擎
+                      <strong>{activeModel ?? "Qwen"}</strong> 分析引擎
                     </span>
                   </div>
 

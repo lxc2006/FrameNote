@@ -1,4 +1,4 @@
-export type SourceKind = "upload" | "bilibili";
+export type SourceKind = "upload" | "bilibili" | "url";
 
 export interface VideoSourceDescriptor {
   kind: SourceKind;
@@ -77,6 +77,8 @@ function createDemoSummary(source: VideoSourceDescriptor): VideoSummary {
   const origin =
     source.kind === "bilibili"
       ? `${source.bvid ?? "该 BV 号"} 对应的 B 站视频`
+      : source.kind === "url"
+        ? `视频直链《${source.title}》`
       : `本地视频《${source.title}》`;
 
   return {

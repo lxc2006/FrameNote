@@ -130,8 +130,8 @@ function errorResponse(
 function parseSource(value: unknown): VideoSourceDescriptor {
   const object = recordValue(value, "source");
   const kind = object.kind;
-  if (kind !== "upload" && kind !== "bilibili") {
-    throw new QwenInputError("source.kind 必须是 upload 或 bilibili。");
+  if (kind !== "upload" && kind !== "bilibili" && kind !== "url") {
+    throw new QwenInputError("source.kind 必须是 upload、bilibili 或 url。");
   }
 
   return {
