@@ -42,5 +42,6 @@ export interface ModelApiErrorBody {
     code: string;
     message: string;
     retryable: boolean;
+    rawResponse?: string;
   };
 }

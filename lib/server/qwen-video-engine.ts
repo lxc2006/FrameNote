@@ -60,9 +60,12 @@ export class QwenInputError extends Error {
 }
 
 export class QwenResponseError extends Error {
-  constructor(message: string) {
+  readonly rawResponse?: string;
+
+  constructor(message: string, rawResponse?: string) {
     super(message);
     this.name = "QwenResponseError";
+    this.rawResponse = rawResponse;
   }
 }
 
@@ -103,6 +106,8 @@ export class QwenVideoEngine implements VideoEngine {
         content: parts,
       } as unknown as ChatCompletionMessageParam,
     ], true);
+
+    console.info("[Qwen analyze raw response]\n", raw);
 
     return parseVideoSummary(raw, source.title);
   }
@@ -250,7 +255,7 @@ export function parseVideoSummary(raw: string, fallbackTitle: string): VideoSumm
   try {
     value = JSON.parse(stripJsonFence(raw));
   } catch {
-    throw new QwenResponseError("Qwen 返回的总结不是有效 JSON。");
+    throw new QwenResponseError("Qwen 返回的总结不是有效 JSON。", raw);
   }
 
   const object = recordValue(value, "总结");

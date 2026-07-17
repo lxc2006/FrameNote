@@ -77,7 +77,13 @@ export function modelErrorResponse(error: unknown) {
     return errorResponse(400, "INVALID_MODEL_INPUT", error.message, false);
   }
   if (error instanceof QwenResponseError) {
-    return errorResponse(502, "INVALID_MODEL_RESPONSE", error.message, true);
+    return errorResponse(
+      502,
+      "INVALID_MODEL_RESPONSE",
+      error.message,
+      true,
+      error.rawResponse,
+    );
   }
   if (error instanceof OpenAI.APIError) {
     if (error.status === 401 || error.status === 403) {
@@ -120,9 +126,17 @@ function errorResponse(
   code: string,
   message: string,
   retryable: boolean,
+  rawResponse?: string,
 ) {
   return noStoreJson(
-    { error: { code, message, retryable } },
+    {
+      error: {
+        code,
+        message,
+        retryable,
+        ...(rawResponse ? { rawResponse } : {}),
+      },
+    },
     { status },
   );
 }
