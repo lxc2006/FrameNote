@@ -22,7 +22,7 @@ export interface ModelStatusResponse {
   provider: "qwen";
   configured: boolean;
   model: string;
-  acceptedInputs: Array<"video_url" | "frames" | "transcript">;
+  acceptedInputs: Array<"video_url" | "frames" | "audio" | "transcript">;
   conversation: {
     provider: "deepseek";
     configured: boolean;

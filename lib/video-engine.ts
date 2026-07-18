@@ -44,6 +44,12 @@ export interface VideoModelContext {
   videoUrl?: string;
   /** 已按时间顺序抽取的关键帧 URL；适用于已有媒体处理流水线的场景。 */
   frameUrls?: string[];
+  /** 与 frameUrls 一一对应的原视频时间（秒）。 */
+  frameTimestamps?: number[];
+  /** Qwen 可读取的公网音频地址或受支持的 Base64 data URL。 */
+  audioUrl?: string;
+  /** audioUrl 对应的容器格式。 */
+  audioFormat?: "mp3" | "wav" | "aac" | "m4a" | "ogg" | "webm";
   /** 已有的字幕或 ASR 文本。它会与视频/关键帧证据一起使用。 */
   transcript?: string;
   /** 视频抽帧频率。长视频建议使用较低值。 */

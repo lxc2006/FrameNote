@@ -12,14 +12,15 @@ FrameNote（帧记）是视频 AI 总结与持续问答工作台。当前技术�
 ### 产品与前端
 
 - 已完成响应式工作台：本地视频选择/预览、B站或直链输入、处理进度、结构化总结、章节时间线和连续追问。
-- 本地视频当前支持 MP4、MOV、WebM、MKV、M4V，模型内联直传上限为 7 MB。
+- 本地视频支持 MP4、MOV、WebM、MKV、M4V；浏览器通过 FFmpeg WebAssembly 抽取压缩 MP3 音轨和带时间索引的代表性关键帧，当前安全上限为 300 MB、60 分钟。
 - 支持可由模型直接访问的 HTTPS 视频直链；B站页面链接只做识别与规范化，尚不获取实际媒体流。
 - 已处理分析和问答请求的取消、重置竞态、错误提示及模型配置状态展示。
 
 ### 模型调用
 
 - `GET /api/model/status`：返回 Qwen 视频模型和 DeepSeek 对话模型的配置状态，不泄露密钥。
-- `POST /api/model/analyze`：调用 `qwen3.5-omni-plus`，接受视频 URL/Base64、关键帧或转写文本，返回概览、要点、章节、结论和证据索引。
+- `POST /api/model/analyze`：调用 `qwen3.5-omni-plus`，接受视频 URL/Base64、音频、关键帧或转写文本，返回概览、要点、章节、结论和证据索引。
+- 本地上传不再完整 Base64 直传原视频；默认把音轨压缩到约 6 MB 以内，最多提取 24 张、总量约 3 MB 的 960px JPEG 代表帧，再组合提交给 Qwen。
 - Qwen 请求使用服务端流式接收、JSON 模式、输入校验与提示注入防护；解析器兼容完整代码块及单独多出的 Markdown 围栏。
 - `POST /api/model/ask`：调用 `deepseek-v4-pro`，输入结构化总结、证据索引和最近 20 条历史消息；不重复发送完整视频。
 - Qwen 与 DeepSeek 均通过服务端环境变量配置，API Key 不进入客户端包。
@@ -28,12 +29,12 @@ FrameNote（帧记）是视频 AI 总结与持续问答工作台。当前技术�
 
 - 已实现统一的 Worker/Sites 运行时环境绑定、供应商鉴权/限流/失败错误映射和客户端错误处理。
 - 已覆盖服务端渲染、状态接口、请求校验、Qwen 分析、异常 JSON 围栏和 DeepSeek 问答的自动化回归；最近一次构建、类型检查、Lint 与 5 项测试均通过。
-- 私有站点已部署：[https://framenote-video-ai.tsanugussh.chatgpt.site](https://framenote-video-ai.tsanugussh.chatgpt.site)。最近部署源码提交为 `86de638`。
+- 私有站点已部署：[https://framenote-video-ai.tsanugussh.chatgpt.site](https://framenote-video-ai.tsanugussh.chatgpt.site)。以 `git log` 的最新提交为当前源码基线。
 - `.env.example` 仅保留空白占位符；本地密钥文件已由 `.gitignore` 排除。
 
 ## 正在进行
 
-- 建立并持续维护本交接文档；后续每次完成实质变更后同步更新。
+- 持续维护本交接文档；后续每次完成实质变更后同步更新。
 - 本地 `.env.local` 已检测到 Qwen 与 DeepSeek Key，但 DeepSeek 真实问答尚未执行端到端烟雾测试。
 - Sites 托管环境当前没有运行时变量，因此线上模型调用在配置 Secrets 前不可用。
 - 曾误填入 `.env.example` 的 DeepSeek Key 已清除，但因其出现在当前任务输出中，仍需在 DeepSeek 控制台轮换。
@@ -48,7 +49,7 @@ FrameNote（帧记）是视频 AI 总结与持续问答工作台。当前技术�
 
 ### P1：支持 B站与大文件
 
-1. 接入 R2/OSS/S3：预签名 multipart 直传，避免大视频经过 Base64 JSON 和普通 Worker 请求体。
+1. 接入 R2/OSS/S3：预签名 multipart 直传，承接超过浏览器本地处理上限、需要断点续传或后台恢复的视频。
 2. 接入 D1/数据库：保存来源、上传会话、任务状态、总结、证据和对话记录。
 3. 建立异步任务 API、队列和 SSE/轮询进度，支持失败重试、取消及页面恢复。
 4. 部署独立媒体 Worker：负责 ffprobe/FFmpeg、音视频合并、转写、关键帧和分段。
@@ -66,7 +67,8 @@ FrameNote（帧记）是视频 AI 总结与持续问答工作台。当前技术�
 
 | 位置 | 职责 |
 | --- | --- |
-| `app/VideoWorkbench.tsx` | 上传、来源输入、进度、总结和问答 UI |
+| `app/VideoWorkbench.tsx` | 上传、来源输入、本地预处理进度、总结和问答 UI |
+| `lib/client/video-preprocessor.ts` | FFmpeg WebAssembly 音轨压缩、关键帧抽取、时间索引和体积控制 |
 | `app/api/model/analyze/route.ts` | Qwen 视频分析接口 |
 | `app/api/model/ask/route.ts` | DeepSeek 视频问答接口 |
 | `app/api/model/status/route.ts` | 双模型配置状态 |
@@ -82,7 +84,8 @@ FrameNote（帧记）是视频 AI 总结与持续问答工作台。当前技术�
 - 本地密钥只放 `.env.local`；托管密钥只放 Sites Runtime Environment Variables，并标记为 Secret。
 - Qwen：`DASHSCOPE_API_KEY`，默认模型 `qwen3.5-omni-plus`。
 - DeepSeek：`DEEPSEEK_API_KEY`，默认模型 `deepseek-v4-pro`，默认 Base URL `https://api.deepseek.com`。
-- 普通模型请求体上限为 14 MB；7 MB 本地视频经 Base64 后仍可落在该限制内。
+- 模型请求体上限为 16 MB；本地预处理目标为音频原始产物约 6 MB、关键帧总量约 3 MB，避免 Base64 后超过请求限制。
+- FFmpeg 核心固定为 `@ffmpeg/core@0.12.10`，首次处理时从 jsDelivr 延迟加载；处理期间页面必须保持打开。
 - `.openai/hosting.json` 已绑定 Sites 项目，但 D1/R2 目前均为 `null`。
 
 ## 新任务接续步骤

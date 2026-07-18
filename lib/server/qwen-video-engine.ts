@@ -43,6 +43,10 @@ type QwenVideoPart =
       video: string[];
       fps?: number;
     }
+  | {
+      type: "input_audio";
+      input_audio: { data: string; format: string };
+    }
   | { type: "text"; text: string };
 
 export class QwenConfigurationError extends Error {
@@ -185,8 +189,15 @@ function requireModelContext(context?: VideoModelContext): VideoModelContext {
   if (!context) {
     throw new QwenInputError("缺少视频、关键帧或转写文本。");
   }
-  if (!context.videoUrl && !context.frameUrls?.length && !context.transcript?.trim()) {
-    throw new QwenInputError("至少需要 videoUrl、frameUrls 或 transcript 之一。");
+  if (
+    !context.videoUrl &&
+    !context.frameUrls?.length &&
+    !context.audioUrl &&
+    !context.transcript?.trim()
+  ) {
+    throw new QwenInputError(
+      "至少需要 videoUrl、frameUrls、audioUrl 或 transcript 之一。",
+    );
   }
   return context;
 }
@@ -206,6 +217,25 @@ function modelContextParts(context: VideoModelContext): QwenVideoPart[] {
       type: "video",
       video: context.frameUrls,
       ...(fps ? { fps } : {}),
+    });
+  }
+
+  if (context.audioUrl) {
+    parts.push({
+      type: "input_audio",
+      input_audio: {
+        data: context.audioUrl,
+        format: context.audioFormat ?? "mp3",
+      },
+    });
+  }
+
+  if (context.frameUrls?.length && context.frameTimestamps?.length) {
+    parts.push({
+      type: "text",
+      text: `关键帧与原视频时间的对应关系（按输入顺序，单位为秒）：${context.frameTimestamps
+        .map((time, index) => `第${index + 1}帧=${time.toFixed(2)}秒`)
+        .join("；")}`,
     });
   }
 

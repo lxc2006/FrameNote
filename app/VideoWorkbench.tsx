@@ -13,6 +13,7 @@ import {
   extractBvid,
   formatDuration,
   formatFileSize,
+  type VideoModelContext,
   type VideoSourceDescriptor,
   type VideoSummary,
 } from "@/lib/video-engine";
@@ -23,6 +24,12 @@ import {
   getModelStatus,
 } from "@/lib/model-client";
 import type { ModelStatusResponse } from "@/lib/model-api";
+import {
+  LOCAL_VIDEO_PREPROCESSING_LIMITS,
+  extractVideoEvidence,
+  type VideoPreprocessingResult,
+  type VideoPreprocessingStage,
+} from "@/lib/client/video-preprocessor";
 
 type InputMode = "upload" | "bilibili";
 type Phase = "idle" | "processing" | "ready" | "error";
@@ -40,12 +47,13 @@ interface ChatMessage {
 }
 
 const acceptedExtensions = ["mp4", "mov", "webm", "mkv", "m4v"];
-const MAX_INLINE_VIDEO_SIZE = 7 * 1024 * 1024;
+const preprocessingStageIndexes: Record<VideoPreprocessingStage, number> = {
+  "loading-engine": 1,
+  "extracting-audio": 2,
+  "extracting-frames": 3,
+};
 
 const suggestions = ["这个视频的核心观点是什么？", "按时间线梳理章节", "给我三个行动建议"];
-
-const delay = (milliseconds: number) =>
-  new Promise<void>((resolve) => window.setTimeout(resolve, milliseconds));
 
 function fileExtension(filename: string) {
   return filename.split(".").pop()?.toLowerCase() ?? "";
@@ -76,32 +84,14 @@ function titleFromUrl(value: string) {
   }
 }
 
-function fileToDataUrl(file: File) {
-  return new Promise<string>((resolve, reject) => {
-    const reader = new FileReader();
-    reader.onerror = () => reject(new Error("读取视频文件失败。"));
-    reader.onload = () => {
-      if (typeof reader.result !== "string") {
-        reject(new Error("读取视频文件失败。"));
-        return;
-      }
-      const base64 = reader.result.slice(reader.result.indexOf(",") + 1);
-      const mimeType = file.type.startsWith("video/")
-        ? file.type
-        : `video/${fileExtension(file.name) || "mp4"}`;
-      resolve(`data:${mimeType};base64,${base64}`);
-    };
-    reader.readAsDataURL(file);
-  });
-}
-
 function stagesFor(source: VideoSourceDescriptor) {
   if (source.kind === "upload") {
     return [
       "校验视频文件",
-      "编码安全模型输入",
-      "提交视频素材",
-      "Qwen 理解画面与声音",
+      "加载本地媒体引擎",
+      "抽取并压缩音轨",
+      "提取代表性关键帧",
+      "Qwen 融合音轨与画面",
       "生成结构化总结",
     ];
   }
@@ -145,6 +135,9 @@ export default function VideoWorkbench() {
   const [activeSource, setActiveSource] = useState<VideoSourceDescriptor | null>(null);
   const [processingStages, setProcessingStages] = useState<string[]>([]);
   const [stageIndex, setStageIndex] = useState(-1);
+  const [stageProgress, setStageProgress] = useState(0);
+  const [preprocessingResult, setPreprocessingResult] =
+    useState<VideoPreprocessingResult | null>(null);
   const [notice, setNotice] = useState<string | null>(null);
   const [isDragging, setIsDragging] = useState(false);
   const [messages, setMessages] = useState<ChatMessage[]>([]);
@@ -217,7 +210,7 @@ export default function VideoWorkbench() {
     return () => {
       if (selectedVideo?.objectUrl) URL.revokeObjectURL(selectedVideo.objectUrl);
     };
-  }, [selectedVideo]);
+  }, [selectedVideo?.objectUrl]);
 
   function nextMessageId(role: ChatMessage["role"]) {
     messageCounterRef.current += 1;
@@ -238,13 +231,18 @@ export default function VideoWorkbench() {
       return;
     }
 
-    if (file.size > MAX_INLINE_VIDEO_SIZE) {
-      setNotice("当前模型直传上限为 7 MB。更大的视频请改用可公开读取的 HTTPS 视频直链。");
+    if (file.size > LOCAL_VIDEO_PREPROCESSING_LIMITS.maxSourceBytes) {
+      setNotice(
+        `浏览器本地处理暂时支持不超过 ${Math.round(
+          LOCAL_VIDEO_PREPROCESSING_LIMITS.maxSourceBytes / 1024 / 1024,
+        )} MB 的视频；更大文件请使用 HTTPS 视频直链。`,
+      );
       return;
     }
 
     const objectUrl = URL.createObjectURL(file);
     setSelectedVideo({ file, objectUrl });
+    setPreprocessingResult(null);
     setNotice(null);
   }
 
@@ -272,11 +270,7 @@ export default function VideoWorkbench() {
     }
 
     if (pendingSource.kind === "bilibili") {
-      setNotice("B 站页面地址还需要先解析为可读取的视频流；请先上传小于 7 MB 的视频，或粘贴 HTTPS 视频直链。");
-      return;
-    }
-    if (pendingSource.kind === "upload" && selectedVideo && selectedVideo.file.size > MAX_INLINE_VIDEO_SIZE) {
-      setNotice("当前 Qwen 内联直传上限为 7 MB。更大的视频请使用可公开读取的 HTTPS 视频直链，或等待对象存储上传接入。");
+      setNotice("B 站页面地址还需要先解析为可读取的视频流；请先上传本地视频，或粘贴 HTTPS 视频直链。");
       return;
     }
 
@@ -297,27 +291,49 @@ export default function VideoWorkbench() {
     setActiveSource(pendingSource);
     setProcessingStages(stages);
     setStageIndex(0);
+    setStageProgress(0.2);
+    setPreprocessingResult(null);
 
     try {
-      setStageIndex(1);
-      const videoUrl = pendingSource.kind === "upload" && selectedVideo
-        ? await fileToDataUrl(selectedVideo.file)
-        : pendingSource.sourceUrl;
-      if (!videoUrl) throw new Error("没有可提交给模型的视频输入。");
+      let context: VideoModelContext;
+      if (pendingSource.kind === "upload") {
+        if (!selectedVideo?.duration) {
+          throw new Error("尚未读取到视频时长，请稍后重试。");
+        }
+        const extracted = await extractVideoEvidence(selectedVideo.file, {
+          durationSeconds: selectedVideo.duration,
+          signal: controller.signal,
+          onProgress: ({ stage, progress }) => {
+            if (runTokenRef.current !== runToken) return;
+            setStageIndex(preprocessingStageIndexes[stage]);
+            setStageProgress(progress);
+          },
+        });
+        context = extracted.context;
+        setPreprocessingResult(extracted);
+      } else {
+        const videoUrl = pendingSource.sourceUrl;
+        if (!videoUrl) throw new Error("没有可提交给模型的视频输入。");
+        setStageIndex(1);
+        setStageProgress(1);
+        setStageIndex(2);
+        setStageProgress(1);
+        context = { videoUrl, fps: 0.5 };
+      }
       if (runTokenRef.current !== runToken) return;
-      setStageIndex(2);
-      await delay(120);
-      setStageIndex(3);
+      setStageIndex(stages.length - 2);
+      setStageProgress(0.15);
       const result = await analyzeVideo(
         {
           source: pendingSource,
-          context: { videoUrl, fps: 0.5 },
+          context,
         },
         controller.signal,
       );
       if (runTokenRef.current !== runToken) return;
 
-      setStageIndex(4);
+      setStageIndex(stages.length - 1);
+      setStageProgress(1);
       setSummary(result.summary);
       setActiveModel(result.model);
       setMessages([
@@ -325,7 +341,7 @@ export default function VideoWorkbench() {
           id: nextMessageId("assistant"),
           role: "assistant",
           content:
-            "Qwen 已完成视频理解与结构化总结。接下来由 DeepSeek V4 Pro 回答核心观点、章节结构、术语解释或行动建议。",
+            "Qwen 已融合本地抽取的音轨、关键帧与时间索引并生成结构化总结。接下来由 DeepSeek V4 Pro 回答核心观点、章节结构、术语解释或行动建议。",
         },
       ]);
       setPhase("ready");
@@ -355,6 +371,8 @@ export default function VideoWorkbench() {
     setActiveSource(null);
     setProcessingStages([]);
     setStageIndex(-1);
+    setStageProgress(0);
+    setPreprocessingResult(null);
     setMessages([]);
     setQuestion("");
     setIsReplying(false);
@@ -422,7 +440,11 @@ export default function VideoWorkbench() {
 
   const progress =
     processingStages.length > 0
-      ? Math.round(((stageIndex + 1) / processingStages.length) * 100)
+      ? Math.round(
+          ((stageIndex + Math.max(0, Math.min(1, stageProgress))) /
+            processingStages.length) *
+            100,
+        )
       : 0;
 
   const shownSource = activeSource ?? pendingSource;
@@ -520,7 +542,11 @@ export default function VideoWorkbench() {
                       ↥
                     </span>
                     <strong>拖放视频到这里</strong>
-                    <p>MP4、MOV、WebM、MKV、M4V · 当前模型直传 ≤ 7 MB</p>
+                    <p>
+                      MP4、MOV、WebM、MKV、M4V · 浏览器本地抽取音轨与关键帧 · ≤ {Math.round(
+                        LOCAL_VIDEO_PREPROCESSING_LIMITS.maxSourceBytes / 1024 / 1024,
+                      )} MB
+                    </p>
                     <button
                       type="button"
                       onClick={() => fileInputRef.current?.click()}
@@ -647,7 +673,7 @@ export default function VideoWorkbench() {
             <div>
               <strong>Qwen 视频理解 + DeepSeek V4 Pro 对话</strong>
               <p>
-                Qwen 负责生成总结，DeepSeek 基于总结、证据和会话历史继续回答；B站链接和大文件仍需接入媒体存储与取流。
+                本地上传会先在浏览器中压缩音轨并提取关键帧，再由 Qwen 生成总结；DeepSeek 基于总结、证据和会话历史继续回答。
               </p>
             </div>
           </div>
@@ -765,6 +791,11 @@ export default function VideoWorkbench() {
                   </div>
 
                   <div className="summary-stats">
+                    {preprocessingResult ? (
+                      <span>
+                        <strong>{preprocessingResult.frameCount}</strong> 张关键帧
+                      </span>
+                    ) : null}
                     <span>
                       <strong>{summary.keyPoints.length}</strong> 个要点
                     </span>

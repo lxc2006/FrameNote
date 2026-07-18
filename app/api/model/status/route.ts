@@ -12,7 +12,7 @@ export async function GET() {
     provider: "qwen",
     configured: Boolean(config.apiKey),
     model: config.model,
-    acceptedInputs: ["video_url", "frames", "transcript"],
+    acceptedInputs: ["video_url", "frames", "audio", "transcript"],
     conversation: {
       provider: "deepseek",
       configured: Boolean(conversationConfig.apiKey),

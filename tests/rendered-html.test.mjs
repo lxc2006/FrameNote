@@ -53,7 +53,12 @@ test("exposes Qwen and DeepSeek model status without leaking credentials", async
   assert.equal(payload.provider, "qwen");
   assert.equal(typeof payload.configured, "boolean");
   assert.equal(typeof payload.model, "string");
-  assert.deepEqual(payload.acceptedInputs, ["video_url", "frames", "transcript"]);
+  assert.deepEqual(payload.acceptedInputs, [
+    "video_url",
+    "frames",
+    "audio",
+    "transcript",
+  ]);
   assert.equal(payload.conversation.provider, "deepseek");
   assert.equal(payload.conversation.model, "deepseek-v4-pro");
   assert.equal(typeof payload.conversation.configured, "boolean");
@@ -171,6 +176,45 @@ test("uses Qwen for analysis and DeepSeek V4 Pro for follow-up answers", async (
   assert.equal(videoPart.video_url.url, "https://media.example.com/test.mp4");
   assert.equal(videoPart.fps, 0.5);
 
+  const extractedMediaResponse = await request(
+    "/api/model/analyze",
+    {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        source: {
+          kind: "upload",
+          title: "本地预处理视频",
+          subtitle: "local.mp4",
+          downloadFirst: false,
+        },
+        context: {
+          frameUrls: [
+            "data:image/jpeg;base64,AAAA",
+            "data:image/jpeg;base64,BBBB",
+          ],
+          frameTimestamps: [0, 12.5],
+          audioUrl: "data:audio/mpeg;base64,CCCC",
+          audioFormat: "mp3",
+        },
+      }),
+    },
+    {
+      DASHSCOPE_API_KEY: "local-test-key",
+      DASHSCOPE_BASE_URL: `http://127.0.0.1:${address.port}/compatible-mode/v1`,
+      QWEN_VIDEO_MODEL: "qwen3.5-omni-plus",
+    },
+  );
+  assert.equal(extractedMediaResponse.status, 200);
+  const extractedMediaRequest = providerRequests[1];
+  const extractedParts = extractedMediaRequest.body.messages[1].content;
+  assert.equal(extractedParts[0].type, "video");
+  assert.equal(extractedParts[0].video.length, 2);
+  assert.equal(extractedParts[1].type, "input_audio");
+  assert.equal(extractedParts[1].input_audio.format, "mp3");
+  assert.equal(extractedParts[1].input_audio.data, "data:audio/mpeg;base64,CCCC");
+  assert.match(extractedParts[2].text, /第2帧=12\.50秒/);
+
   const askResponse = await request(
     "/api/model/ask",
     {
@@ -199,10 +243,10 @@ test("uses Qwen for analysis and DeepSeek V4 Pro for follow-up answers", async (
   assert.equal(askPayload.provider, "deepseek");
   assert.equal(askPayload.model, "deepseek-v4-pro");
   assert.equal(askPayload.answer, "结论：模型调用链路可用。依据见 00:01。");
-  assert.equal(providerRequests[1].authorization, "Bearer deepseek-test-key");
-  assert.equal(providerRequests[1].url, "/deepseek/chat/completions");
-  assert.equal(providerRequests[1].body.stream, false);
-  assert.match(providerRequests[1].body.messages.at(-1).content, /结论是什么/);
+  assert.equal(providerRequests[2].authorization, "Bearer deepseek-test-key");
+  assert.equal(providerRequests[2].url, "/deepseek/chat/completions");
+  assert.equal(providerRequests[2].body.stream, false);
+  assert.match(providerRequests[2].body.messages.at(-1).content, /结论是什么/);
 });
 
 test("removes disposable starter assets and keeps model choice decoupled", async () => {

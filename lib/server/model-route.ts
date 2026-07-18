@@ -18,10 +18,11 @@ import {
   DeepSeekResponseError,
 } from "./deepseek-conversation-engine";
 
-const MAX_JSON_BYTES = 14 * 1024 * 1024;
+const MAX_JSON_BYTES = 16 * 1024 * 1024;
 const MAX_TRANSCRIPT_CHARACTERS = 1_500_000;
 const MAX_HISTORY_MESSAGES = 20;
 const MAX_FRAME_URLS = 256;
+const AUDIO_FORMATS = ["mp3", "wav", "aac", "m4a", "ogg", "webm"] as const;
 
 export async function readJsonRequest(request: Request): Promise<unknown> {
   const contentType = request.headers.get("content-type") ?? "";
@@ -175,24 +176,72 @@ function parseContext(value: unknown, required: boolean): VideoModelContext {
   const frameUrls = object.frameUrls === undefined
     ? undefined
     : parseFrameUrls(object.frameUrls);
+  const frameTimestamps = object.frameTimestamps === undefined
+    ? undefined
+    : parseFrameTimestamps(object.frameTimestamps, frameUrls?.length);
+  const audioUrl = optionalString(object.audioUrl, "context.audioUrl", MAX_JSON_BYTES);
+  const audioFormat = object.audioFormat === undefined
+    ? undefined
+    : parseAudioFormat(object.audioFormat);
   const fps = object.fps === undefined ? undefined : numberValue(object.fps, "context.fps");
 
   if (videoUrl) validateMediaUrl(videoUrl, "context.videoUrl", "video");
+  if (audioUrl) validateMediaUrl(audioUrl, "context.audioUrl", "audio");
+  if (audioFormat && !audioUrl) {
+    throw new QwenInputError("context.audioFormat 需要与 context.audioUrl 一起提供。");
+  }
   if (fps !== undefined && (fps < 0.1 || fps > 10)) {
     throw new QwenInputError("context.fps 必须在 0.1 到 10 之间。");
   }
-  if (required && !videoUrl && !frameUrls?.length && !transcript) {
+  if (required && !videoUrl && !frameUrls?.length && !audioUrl && !transcript) {
     throw new QwenInputError(
-      "context 至少需要 videoUrl、frameUrls 或 transcript 之一。",
+      "context 至少需要 videoUrl、frameUrls、audioUrl 或 transcript 之一。",
     );
   }
 
   return {
     ...(videoUrl ? { videoUrl } : {}),
     ...(frameUrls ? { frameUrls } : {}),
+    ...(frameTimestamps ? { frameTimestamps } : {}),
+    ...(audioUrl ? { audioUrl } : {}),
+    ...(audioFormat ? { audioFormat } : {}),
     ...(transcript ? { transcript } : {}),
     ...(fps !== undefined ? { fps } : {}),
   };
+}
+
+function parseFrameTimestamps(value: unknown, frameCount?: number) {
+  if (!Array.isArray(value) || value.length === 0) {
+    throw new QwenInputError("context.frameTimestamps 必须是非空数组。");
+  }
+  if (!frameCount || value.length !== frameCount) {
+    throw new QwenInputError(
+      "context.frameTimestamps 必须与 context.frameUrls 数量一致。",
+    );
+  }
+  let previous = -1;
+  return value.map((item, index) => {
+    const time = numberValue(item, `context.frameTimestamps[${index}]`);
+    if (time < 0 || time < previous) {
+      throw new QwenInputError(
+        "context.frameTimestamps 必须是按时间升序排列的非负数。",
+      );
+    }
+    previous = time;
+    return time;
+  });
+}
+
+function parseAudioFormat(value: unknown) {
+  if (
+    typeof value !== "string" ||
+    !AUDIO_FORMATS.includes(value as (typeof AUDIO_FORMATS)[number])
+  ) {
+    throw new QwenInputError(
+      `context.audioFormat 必须是 ${AUDIO_FORMATS.join("、")} 之一。`,
+    );
+  }
+  return value as (typeof AUDIO_FORMATS)[number];
 }
 
 function parseFrameUrls(value: unknown) {
@@ -208,9 +257,17 @@ function parseFrameUrls(value: unknown) {
   });
 }
 
-function validateMediaUrl(value: string, field: string, mediaKind: "image" | "video") {
+function validateMediaUrl(
+  value: string,
+  field: string,
+  mediaKind: "image" | "video" | "audio",
+) {
   if (value.startsWith("https://")) return;
-  const dataPrefix = mediaKind === "video" ? /^data:(?:video\/[^;,]+)?;base64,/i : /^data:image\/[^;,]+;base64,/i;
+  const dataPrefix = mediaKind === "video"
+    ? /^data:(?:video\/[^;,]+)?;base64,/i
+    : mediaKind === "audio"
+      ? /^data:(?:audio\/[^;,]+)?;base64,/i
+      : /^data:image\/[^;,]+;base64,/i;
   if (dataPrefix.test(value)) return;
   throw new QwenInputError(`${field} 必须是 HTTPS 地址或受支持的 Base64 data URL。`);
 }
