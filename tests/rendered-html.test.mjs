@@ -79,6 +79,122 @@ test("validates model requests before attempting a provider call", async () => {
   assert.equal(payload.error.retryable, false);
 });
 
+test("validates and proxies Bilibili download jobs without exposing the service token", async (t) => {
+  const invalidResponse = await request("/api/bilibili/jobs", {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ bvid: "not-a-bvid" }),
+  });
+  assert.equal(invalidResponse.status, 400);
+  assert.equal((await invalidResponse.json()).error.code, "INVALID_BILIBILI_INPUT");
+
+  const unconfiguredResponse = await request("/api/bilibili/jobs", {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ bvid: "BV1nx411u79K" }),
+  });
+  assert.equal(unconfiguredResponse.status, 503);
+  assert.equal(
+    (await unconfiguredResponse.json()).error.code,
+    "MEDIA_SERVICE_NOT_CONFIGURED",
+  );
+
+  const insecureServiceResponse = await request(
+    "/api/bilibili/jobs",
+    {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ bvid: "BV1nx411u79K" }),
+    },
+    {
+      BILIBILI_MEDIA_SERVICE_URL: "http://media.example.com",
+      BILIBILI_MEDIA_SERVICE_TOKEN: "must-not-cross-plaintext-http",
+    },
+  );
+  assert.equal(insecureServiceResponse.status, 503);
+  assert.equal(
+    (await insecureServiceResponse.json()).error.code,
+    "MEDIA_SERVICE_NOT_CONFIGURED",
+  );
+
+  const jobId = "11111111-1111-4111-8111-111111111111";
+  const upstreamRequests = [];
+  const mediaService = createServer(async (req, res) => {
+    let body = "";
+    for await (const chunk of req) body += chunk;
+    upstreamRequests.push({
+      method: req.method,
+      url: req.url,
+      authorization: req.headers.authorization,
+      body: body ? JSON.parse(body) : null,
+    });
+    const ready = req.method !== "POST";
+    res.writeHead(req.method === "POST" ? 202 : 200, {
+      "content-type": "application/json",
+    });
+    res.end(JSON.stringify({
+      jobId,
+      status: ready ? "succeeded" : "queued",
+      phase: ready ? "ready" : "queued",
+      progress: ready ? 1 : 0,
+      source: {
+        bvid: "BV1nx411u79K",
+        ...(ready ? { title: "公开测试视频", durationSeconds: 80 } : {}),
+      },
+      ...(ready ? {
+        artifact: {
+          downloadUrl: `http://127.0.0.1/media/${jobId}`,
+          filename: "BV1nx411u79K.mp4",
+          mimeType: "video/mp4",
+          sizeBytes: 1024,
+          sha256: "0".repeat(64),
+          expiresAt: "2099-01-01T00:00:00Z",
+        },
+      } : {}),
+    }));
+  });
+  mediaService.listen(0, "127.0.0.1");
+  await once(mediaService, "listening");
+  t.after(() => mediaService.close());
+  const address = mediaService.address();
+  assert.ok(address && typeof address === "object");
+  const bindings = {
+    BILIBILI_MEDIA_SERVICE_URL: `http://127.0.0.1:${address.port}`,
+    BILIBILI_MEDIA_SERVICE_TOKEN: "media-service-test-token",
+  };
+
+  const createResponse = await request(
+    "/api/bilibili/jobs",
+    {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ bvid: "BV1nx411u79K" }),
+    },
+    bindings,
+  );
+  assert.equal(createResponse.status, 202);
+  assert.equal((await createResponse.json()).jobId, jobId);
+
+  const statusResponse = await request(`/api/bilibili/jobs/${jobId}`, undefined, bindings);
+  assert.equal(statusResponse.status, 200);
+  const statusPayload = await statusResponse.json();
+  assert.equal(statusPayload.status, "succeeded");
+  assert.equal(statusPayload.artifact.sizeBytes, 1024);
+  assert.equal(JSON.stringify(statusPayload).includes("media-service-test-token"), false);
+
+  const deleteResponse = await request(
+    `/api/bilibili/jobs/${jobId}`,
+    { method: "DELETE" },
+    bindings,
+  );
+  assert.equal(deleteResponse.status, 200);
+  assert.deepEqual(upstreamRequests.map(({ method }) => method), ["POST", "GET", "DELETE"]);
+  assert.deepEqual(upstreamRequests[0].body, { bvid: "BV1nx411u79K" });
+  assert.ok(upstreamRequests.every(
+    ({ authorization }) => authorization === "Bearer media-service-test-token",
+  ));
+});
+
 test("uses Qwen for analysis and DeepSeek V4 Pro for follow-up answers", async (t) => {
   const providerRequests = [];
   const summary = {
@@ -250,12 +366,13 @@ test("uses Qwen for analysis and DeepSeek V4 Pro for follow-up answers", async (
 });
 
 test("removes disposable starter assets and keeps model choice decoupled", async () => {
-  const [page, layout, packageJson, engine, workbench] = await Promise.all([
+  const [page, layout, packageJson, engine, workbench, bilibiliClient] = await Promise.all([
     readFile(new URL("../app/page.tsx", import.meta.url), "utf8"),
     readFile(new URL("../app/layout.tsx", import.meta.url), "utf8"),
     readFile(new URL("../package.json", import.meta.url), "utf8"),
     readFile(new URL("../lib/video-engine.ts", import.meta.url), "utf8"),
     readFile(new URL("../app/VideoWorkbench.tsx", import.meta.url), "utf8"),
+    readFile(new URL("../lib/client/bilibili-client.ts", import.meta.url), "utf8"),
   ]);
 
   assert.match(page, /<VideoWorkbench \/>/);
@@ -266,6 +383,8 @@ test("removes disposable starter assets and keeps model choice decoupled", async
   assert.match(engine, /mode: "demo"/);
   assert.match(workbench, /analyzeVideo/);
   assert.match(workbench, /askVideo/);
+  assert.match(workbench, /downloadBilibiliVideo/);
+  assert.match(bilibiliClient, /\/api\/bilibili\/jobs/);
   assert.doesNotMatch(workbench, /demoVideoEngine/);
 
   await assert.rejects(

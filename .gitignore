@@ -43,3 +43,5 @@ next-env.d.ts
 /.wrangler/
 /outputs/
 /work/
+/.venv/
+/media_service/work/

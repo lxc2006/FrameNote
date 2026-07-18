@@ -41,5 +41,8 @@ declare module "cloudflare:workers" {
     DEEPSEEK_BASE_URL?: string;
     DEEPSEEK_CHAT_MODEL?: string;
     DEEPSEEK_REQUEST_TIMEOUT_MS?: string;
+    BILIBILI_MEDIA_SERVICE_URL?: string;
+    BILIBILI_MEDIA_SERVICE_TOKEN?: string;
+    BILIBILI_MEDIA_REQUEST_TIMEOUT_MS?: string;
   };
 }

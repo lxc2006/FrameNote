@@ -30,6 +30,10 @@ import {
   type VideoPreprocessingResult,
   type VideoPreprocessingStage,
 } from "@/lib/client/video-preprocessor";
+import {
+  MAX_BILIBILI_BROWSER_BYTES,
+  downloadBilibiliVideo,
+} from "@/lib/client/bilibili-client";
 
 type InputMode = "upload" | "bilibili";
 type Phase = "idle" | "processing" | "ready" | "error";
@@ -106,21 +110,11 @@ function stagesFor(source: VideoSourceDescriptor) {
     ];
   }
 
-  if (source.downloadFirst) {
-    return [
-      "校验 B 站视频地址",
-      "下载视频到处理缓存",
-      "提取音轨与关键帧",
-      "语音转写与内容理解",
-      "生成结构化总结",
-    ];
-  }
-
   return [
     "校验 B 站视频地址",
-    "读取公开页面信息",
-    "获取可分析媒体流",
-    "语音转写与内容理解",
+    "下载并合并公开视频",
+    "提取音轨与关键帧",
+    "Qwen 融合声音与画面",
     "生成结构化总结",
   ];
 }
@@ -129,7 +123,6 @@ export default function VideoWorkbench() {
   const [mode, setMode] = useState<InputMode>("upload");
   const [selectedVideo, setSelectedVideo] = useState<SelectedVideo | null>(null);
   const [bilibiliInput, setBilibiliInput] = useState("");
-  const [downloadFirst, setDownloadFirst] = useState(true);
   const [phase, setPhase] = useState<Phase>("idle");
   const [summary, setSummary] = useState<VideoSummary | null>(null);
   const [activeSource, setActiveSource] = useState<VideoSourceDescriptor | null>(null);
@@ -191,12 +184,12 @@ export default function VideoWorkbench() {
     return {
       kind: "bilibili",
       title: `B站视频 ${bvid}`,
-      subtitle: downloadFirst ? "下载后分析 · 等待读取视频信息" : "直接分析 · 等待读取视频信息",
+      subtitle: "公开 UGC · 等待读取视频信息",
       bvid,
       sourceUrl: `https://www.bilibili.com/video/${bvid}`,
-      downloadFirst,
+      downloadFirst: true,
     };
-  }, [bvid, directVideoUrl, downloadFirst, mode, selectedVideo]);
+  }, [bvid, directVideoUrl, mode, selectedVideo]);
 
   useEffect(() => {
     const controller = new AbortController();
@@ -211,6 +204,19 @@ export default function VideoWorkbench() {
       if (selectedVideo?.objectUrl) URL.revokeObjectURL(selectedVideo.objectUrl);
     };
   }, [selectedVideo?.objectUrl]);
+
+  useEffect(() => {
+    const cancelActiveWork = () => {
+      runTokenRef.current += 1;
+      analyzeAbortRef.current?.abort();
+      askAbortRef.current?.abort();
+    };
+    globalThis.addEventListener("pagehide", cancelActiveWork);
+    return () => {
+      globalThis.removeEventListener("pagehide", cancelActiveWork);
+      cancelActiveWork();
+    };
+  }, []);
 
   function nextMessageId(role: ChatMessage["role"]) {
     messageCounterRef.current += 1;
@@ -269,11 +275,6 @@ export default function VideoWorkbench() {
       return;
     }
 
-    if (pendingSource.kind === "bilibili") {
-      setNotice("B 站页面地址还需要先解析为可读取的视频流；请先上传本地视频，或粘贴 HTTPS 视频直链。");
-      return;
-    }
-
     const runToken = runTokenRef.current + 1;
     runTokenRef.current = runToken;
     analyzeAbortRef.current?.abort();
@@ -296,6 +297,7 @@ export default function VideoWorkbench() {
 
     try {
       let context: VideoModelContext;
+      let analysisSource = pendingSource;
       if (pendingSource.kind === "upload") {
         if (!selectedVideo?.duration) {
           throw new Error("尚未读取到视频时长，请稍后重试。");
@@ -307,6 +309,54 @@ export default function VideoWorkbench() {
             if (runTokenRef.current !== runToken) return;
             setStageIndex(preprocessingStageIndexes[stage]);
             setStageProgress(progress);
+          },
+        });
+        context = extracted.context;
+        setPreprocessingResult(extracted);
+      } else if (pendingSource.kind === "bilibili") {
+        if (!pendingSource.bvid) {
+          throw new Error("没有可下载的 BV 号。");
+        }
+        setStageIndex(1);
+        setStageProgress(0);
+        const downloaded = await downloadBilibiliVideo(pendingSource.bvid, {
+          signal: controller.signal,
+          onProgress: ({ stage, progress }) => {
+            if (runTokenRef.current !== runToken) return;
+            setStageIndex(1);
+            setStageProgress(
+              stage === "preparing"
+                ? Math.min(0.78, progress * 0.78)
+                : 0.78 + progress * 0.22,
+            );
+          },
+        });
+        if (runTokenRef.current !== runToken) return;
+
+        analysisSource = {
+          ...pendingSource,
+          title: downloaded.title,
+          durationLabel: formatDuration(downloaded.durationSeconds),
+          subtitle: `${downloaded.bvid} · ${formatFileSize(
+            downloaded.sizeBytes,
+          )} · ${formatDuration(downloaded.durationSeconds)}`,
+        };
+        setActiveSource(analysisSource);
+        setStageIndex(2);
+        setStageProgress(0);
+        const extracted = await extractVideoEvidence(downloaded.file, {
+          durationSeconds: downloaded.durationSeconds,
+          signal: controller.signal,
+          onProgress: ({ stage, progress }) => {
+            if (runTokenRef.current !== runToken) return;
+            setStageIndex(2);
+            if (stage === "loading-engine") {
+              setStageProgress(progress * 0.1);
+            } else if (stage === "extracting-audio") {
+              setStageProgress(0.1 + progress * 0.45);
+            } else {
+              setStageProgress(0.55 + progress * 0.45);
+            }
           },
         });
         context = extracted.context;
@@ -325,7 +375,7 @@ export default function VideoWorkbench() {
       setStageProgress(0.15);
       const result = await analyzeVideo(
         {
-          source: pendingSource,
+          source: analysisSource,
           context,
         },
         controller.signal,
@@ -341,7 +391,9 @@ export default function VideoWorkbench() {
           id: nextMessageId("assistant"),
           role: "assistant",
           content:
-            "Qwen 已融合本地抽取的音轨、关键帧与时间索引并生成结构化总结。接下来由 DeepSeek V4 Pro 回答核心观点、章节结构、术语解释或行动建议。",
+            analysisSource.kind === "url"
+              ? "Qwen 已读取视频直链并生成结构化总结。接下来由 DeepSeek V4 Pro 回答核心观点、章节结构、术语解释或行动建议。"
+              : "Qwen 已融合抽取的音轨、关键帧与时间索引并生成结构化总结。接下来由 DeepSeek V4 Pro 回答核心观点、章节结构、术语解释或行动建议。",
         },
       ]);
       setPhase("ready");
@@ -488,7 +540,7 @@ export default function VideoWorkbench() {
             <span className="eyebrow">VIDEO INTELLIGENCE</span>
             <h1 id="setup-title">让一段视频，变成一次可继续的对话。</h1>
             <p>
-              上传小型本地视频，或粘贴 HTTPS 视频直链。帧记会先生成结构化总结，再保留上下文回答你的后续问题。
+              上传本地视频、粘贴 B站公开视频或 HTTPS 视频直链。帧记会先生成结构化总结，再保留上下文回答你的后续问题。
             </p>
           </div>
 
@@ -620,22 +672,26 @@ export default function VideoWorkbench() {
                 {bilibiliInput && !bvid && !directVideoUrl ? (
                   <p className="field-error">没有识别到 BV 号或受支持的 HTTPS 视频直链。</p>
                 ) : (
-                  <p className="field-help">视频直链可直接调用 Qwen；B站链接仍需先完成取流。</p>
+                  <p className="field-help">
+                    视频直链可直接调用 Qwen；B站仅处理你有权分析的公开 UGC，当前上限 {Math.round(
+                      MAX_BILIBILI_BROWSER_BYTES / 1024 / 1024,
+                    )} MB。
+                  </p>
                 )}
 
                 <label className={`download-option ${directVideoUrl ? "disabled" : ""}`}>
                   <span className="switch-wrap">
                     <input
                       type="checkbox"
-                      checked={downloadFirst}
-                      disabled={Boolean(directVideoUrl)}
-                      onChange={(event) => setDownloadFirst(event.target.checked)}
+                      checked
+                      disabled
+                      readOnly
                     />
                     <span className="switch" aria-hidden="true" />
                   </span>
                   <span>
-                    <strong>{directVideoUrl ? "视频直链由 Qwen 直接读取" : "先下载视频，再进行总结"}</strong>
-                    <small>{directVideoUrl ? "无需经过浏览器上传" : "B站来源需要在后续取流服务中处理"}</small>
+                    <strong>{directVideoUrl ? "视频直链由 Qwen 直接读取" : "下载公开视频，再进行总结"}</strong>
+                    <small>{directVideoUrl ? "无需经过浏览器上传" : "媒体服务合并音视频后，由浏览器临时处理"}</small>
                   </span>
                 </label>
               </div>
@@ -673,7 +729,7 @@ export default function VideoWorkbench() {
             <div>
               <strong>Qwen 视频理解 + DeepSeek V4 Pro 对话</strong>
               <p>
-                本地上传会先在浏览器中压缩音轨并提取关键帧，再由 Qwen 生成总结；DeepSeek 基于总结、证据和会话历史继续回答。
+                本地与 B站视频会先在浏览器中压缩音轨并提取关键帧，再由 Qwen 生成总结；DeepSeek 基于总结、证据和会话历史继续回答。
               </p>
             </div>
           </div>
