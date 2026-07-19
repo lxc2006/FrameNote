@@ -22,9 +22,7 @@ import {
   ModelClientError,
   analyzeVideo,
   askVideo,
-  getModelStatus,
 } from "@/lib/model-client";
-import type { ModelStatusResponse } from "@/lib/model-api";
 import {
   LOCAL_VIDEO_PREPROCESSING_LIMITS,
   extractVideoEvidence,
@@ -150,7 +148,6 @@ export default function VideoWorkbench() {
   const [messages, setMessages] = useState<ChatMessage[]>([]);
   const [question, setQuestion] = useState("");
   const [isReplying, setIsReplying] = useState(false);
-  const [modelStatus, setModelStatus] = useState<ModelStatusResponse | null>(null);
   const [activeModel, setActiveModel] = useState<string | null>(null);
   const [videoPreview, setVideoPreview] = useState<VideoPreview | null>(null);
   const [videoPreviewFailed, setVideoPreviewFailed] = useState(false);
@@ -207,14 +204,6 @@ export default function VideoWorkbench() {
       downloadFirst: true,
     };
   }, [bvid, directVideoUrl, mode, selectedVideo]);
-
-  useEffect(() => {
-    const controller = new AbortController();
-    void getModelStatus(controller.signal)
-      .then(setModelStatus)
-      .catch(() => setModelStatus(null));
-    return () => controller.abort();
-  }, []);
 
   useEffect(() => {
     return () => {
@@ -588,19 +577,9 @@ export default function VideoWorkbench() {
           </span>
         </a>
 
+        <h1 className="topbar-title">让一段视频，变成一次可继续的对话。</h1>
+
         <div className="topbar-actions">
-          <span className="engine-badge">
-            <span className="status-dot" aria-hidden="true" />
-            {modelStatus
-              ? modelStatus.configured && modelStatus.conversation.configured
-                ? "Qwen 视频 · DeepSeek 对话"
-                : modelStatus.configured
-                  ? "等待 DeepSeek API Key"
-                  : modelStatus.conversation.configured
-                    ? "等待 Qwen API Key"
-                    : "等待模型 API Key"
-              : "正在检查模型"}
-          </span>
           <button className="new-task-button" type="button" onClick={resetWorkspace}>
             <span aria-hidden="true">＋</span>
             新建任务
@@ -609,15 +588,7 @@ export default function VideoWorkbench() {
       </header>
 
       <div className="workspace" id="top">
-        <section className="setup-column" aria-labelledby="setup-title">
-          <div className="intro-block">
-            <span className="eyebrow">VIDEO INTELLIGENCE</span>
-            <h1 id="setup-title">让一段视频，变成一次可继续的对话。</h1>
-            <p>
-              上传本地视频、粘贴 B站公开视频或 HTTPS 视频直链。帧记会先生成结构化总结，再保留上下文回答你的后续问题。
-            </p>
-          </div>
-
+        <section className="setup-column" aria-label="添加并分析视频">
           <div className="source-card">
             <div className="mode-tabs" role="tablist" aria-label="选择视频来源">
               <button

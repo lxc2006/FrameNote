@@ -82,14 +82,15 @@ textarea:focus-visible {
   position: sticky;
   z-index: 20;
   top: 0;
-  display: flex;
+  display: grid;
   align-items: center;
-  justify-content: space-between;
   min-height: 72px;
   padding: 12px clamp(20px, 4vw, 64px);
   border-bottom: 1px solid rgba(213, 219, 225, 0.84);
   background: rgba(244, 245, 247, 0.88);
   backdrop-filter: blur(18px);
+  grid-template-columns: auto minmax(0, 1fr) auto;
+  gap: clamp(24px, 4vw, 72px);
 }
 
 .brand {
@@ -136,32 +137,24 @@ textarea:focus-visible {
   text-transform: uppercase;
 }
 
+.topbar-title {
+  overflow: hidden;
+  margin: 0;
+  color: var(--ink-strong);
+  font-size: clamp(19px, 1.65vw, 28px);
+  font-weight: 760;
+  letter-spacing: -0.045em;
+  line-height: 1.12;
+  text-align: center;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
 .topbar-actions {
   display: flex;
   align-items: center;
+  justify-self: end;
   gap: 12px;
-}
-
-.engine-badge {
-  display: inline-flex;
-  min-height: 36px;
-  align-items: center;
-  gap: 8px;
-  padding: 0 12px;
-  border: 1px solid var(--line);
-  border-radius: 999px;
-  background: rgba(255, 255, 255, 0.72);
-  color: var(--muted);
-  font-size: 12px;
-  font-weight: 650;
-}
-
-.status-dot {
-  width: 7px;
-  height: 7px;
-  border-radius: 50%;
-  background: #e0a438;
-  box-shadow: 0 0 0 4px rgba(224, 164, 56, 0.13);
 }
 
 .new-task-button {
@@ -203,51 +196,11 @@ textarea:focus-visible {
 }
 
 .setup-column {
-  padding: clamp(50px, 7vh, 86px) 0 64px;
-}
-
-.intro-block {
-  max-width: 540px;
-}
-
-.eyebrow {
-  display: inline-flex;
-  align-items: center;
-  gap: 9px;
-  color: var(--accent-deep);
-  font-size: 11px;
-  font-weight: 800;
-  letter-spacing: 0.16em;
-}
-
-.eyebrow::before {
-  width: 18px;
-  height: 2px;
-  border-radius: 999px;
-  background: var(--accent);
-  content: "";
-}
-
-.intro-block h1 {
-  max-width: 520px;
-  margin: 19px 0 16px;
-  color: var(--ink-strong);
-  font-size: clamp(34px, 3.15vw, 52px);
-  font-weight: 760;
-  letter-spacing: -0.055em;
-  line-height: 1.1;
-}
-
-.intro-block p {
-  max-width: 510px;
-  margin: 0;
-  color: var(--muted);
-  font-size: 15px;
-  line-height: 1.78;
+  padding: 20px 0 64px;
 }
 
 .source-card {
-  margin-top: 34px;
+  margin-top: 0;
   padding: 7px;
   border: 1px solid var(--line);
   border-radius: 21px;
@@ -1757,10 +1710,9 @@ textarea:focus-visible {
   }
 
   .setup-column {
-    padding: 54px 0 34px;
+    padding: 24px 0 34px;
   }
 
-  .intro-block,
   .architecture-note {
     max-width: none;
   }
@@ -1781,6 +1733,14 @@ textarea:focus-visible {
   .topbar {
     min-height: 64px;
     padding: 10px 16px;
+    grid-template-columns: minmax(0, 1fr) auto;
+    column-gap: 14px;
+    row-gap: 8px;
+  }
+
+  .brand {
+    grid-row: 1;
+    grid-column: 1;
   }
 
   .brand-mark {
@@ -1788,9 +1748,23 @@ textarea:focus-visible {
     height: 38px;
   }
 
-  .brand-copy small,
-  .engine-badge {
+  .brand-copy small {
     display: none;
+  }
+
+  .topbar-title {
+    overflow: visible;
+    grid-row: 2;
+    grid-column: 1 / -1;
+    font-size: clamp(19px, 5.8vw, 23px);
+    line-height: 1.18;
+    text-overflow: clip;
+    white-space: normal;
+  }
+
+  .topbar-actions {
+    grid-row: 1;
+    grid-column: 2;
   }
 
   .new-task-button {
@@ -1808,19 +1782,11 @@ textarea:focus-visible {
   }
 
   .setup-column {
-    padding-top: 38px;
-  }
-
-  .intro-block h1 {
-    font-size: clamp(32px, 10.4vw, 44px);
-  }
-
-  .intro-block p {
-    font-size: 14px;
+    padding-top: 16px;
   }
 
   .source-card {
-    margin-top: 27px;
+    margin-top: 0;
     border-radius: 18px;
   }
 

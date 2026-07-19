@@ -45,11 +45,19 @@ test("server-renders the FrameNote video workspace", async () => {
   const html = await response.text();
   assert.match(html, /<html lang="zh-CN">/i);
   assert.match(html, /<title>帧记 FrameNote｜B站视频 AI 总结<\/title>/i);
-  assert.match(html, /让一段视频，变成一次可继续的对话/);
+  assert.match(
+    html,
+    /<header class="topbar">[\s\S]*<h1 class="topbar-title">让一段视频，变成一次可继续的对话。<\/h1>[\s\S]*新建任务[\s\S]*<\/header>/,
+  );
+  assert.equal((html.match(/<h1\b/gi) ?? []).length, 1);
   assert.match(html, /上传视频/);
   assert.match(html, /B站链接/);
   assert.match(html, /视频总结对话/);
-  assert.match(html, /正在检查模型/);
+  assert.doesNotMatch(html, /VIDEO INTELLIGENCE|正在检查模型/);
+  assert.doesNotMatch(
+    html,
+    /上传本地视频、粘贴 B站公开视频或 HTTPS 视频直链/,
+  );
   assert.doesNotMatch(html, /codex-preview|Your site is taking shape/i);
 });
 
@@ -537,6 +545,10 @@ test("removes disposable starter assets and keeps model choice decoupled", async
   assert.match(workbench, /showDownloadedVideo\(downloaded\.file\)/);
   assert.match(workbench, /requireAudio:\s*true/);
   assert.match(workbench, /声音与音乐/);
+  assert.doesNotMatch(
+    workbench,
+    /engine-badge|VIDEO INTELLIGENCE|intro-block|setup-title|getModelStatus|ModelStatusResponse/,
+  );
   assert.match(workbench, /aria-label="视频预览与下载"/);
   assert.match(workbench, /download=\{videoPreview\.filename\}/);
   assert.match(workbench, /"下载视频"/);
