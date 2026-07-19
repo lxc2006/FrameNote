@@ -319,8 +319,9 @@ test("server-renders the FrameNote video workspace", async () => {
   assert.match(html, /<title>帧记 FrameNote｜B站视频 AI 总结<\/title>/i);
   assert.match(
     html,
-    /<header class="topbar">[\s\S]*<h1 class="topbar-title">让一段视频，变成一次可继续的对话。<\/h1>[\s\S]*新建任务[\s\S]*<\/header>/,
+    /<header class="topbar">[\s\S]*<h1 class="topbar-title">让一段视频，变成一次可继续的对话。<\/h1>[\s\S]*设置[\s\S]*<\/header>/,
   );
+  assert.doesNotMatch(html, /新建任务/);
   assert.equal((html.match(/<h1\b/gi) ?? []).length, 1);
   assert.match(html, /上传视频/);
   assert.match(html, /B站链接/);
@@ -1065,12 +1066,26 @@ test("removes disposable starter assets and keeps model choice decoupled", async
   assert.match(settingsMenu, /localStorage\.getItem/);
   assert.match(settingsMenu, /localStorage\.setItem/);
   assert.match(settingsMenu, /root\.dataset\.theme/);
-  assert.match(settingsMenu, /root\.dataset\.fontSize/);
-  assert.match(settingsMenu, /fontSize:\s*"comfortable"/);
+  assert.match(settingsMenu, /uiFontSize:\s*DEFAULT_FONT_SIZE/);
+  assert.match(settingsMenu, /textFontSize:\s*DEFAULT_FONT_SIZE/);
+  assert.match(settingsMenu, /DEFAULT_FONT_SIZE\s*=\s*16/);
+  assert.match(settingsMenu, /value="youyuan">幼圆/);
+  assert.match(settingsMenu, /value="kaiti">楷体/);
+  assert.match(settingsMenu, /value="microsoft-yahei">微软雅黑/);
+  assert.match(settingsMenu, /value="consolas">Consolas/);
+  assert.match(settingsMenu, /type="number"/);
+  assert.match(settingsMenu, /--ui-font-size/);
+  assert.match(settingsMenu, /--text-font-size/);
   assert.match(styles, /html\[data-theme="dark"\]/);
-  assert.match(styles, /html\[data-font-size="comfortable"\]/);
-  assert.match(styles, /--font-zh:/);
-  assert.match(styles, /--font-en:/);
+  assert.match(styles, /--ui-font-zh:/);
+  assert.match(styles, /--ui-font-en:/);
+  assert.match(styles, /--text-font-zh:/);
+  assert.match(styles, /--text-font-en:/);
+  assert.match(styles, /html\[data-theme="dark"\] \.primary-action/);
+  assert.doesNotMatch(workbench, /new-task-button|新建任务/);
+  assert.doesNotMatch(workbench, /download-option|switch-wrap|下载公开视频，再进行总结/);
+  assert.match(styles, /\.conversation-library\s*\{[^}]*display:\s*flex/s);
+  assert.match(styles, /\.conversation-list\s*\{[^}]*flex:\s*1/s);
   assert.equal(JSON.parse(hostingJson).d1, "DB");
   assert.match(databaseSchema, /sqliteTable\(\s*"conversations"/);
   assert.match(databaseSchema, /sqliteTable\(\s*"conversation_messages"/);

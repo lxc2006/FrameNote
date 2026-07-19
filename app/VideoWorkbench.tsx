@@ -826,10 +826,6 @@ export default function VideoWorkbench() {
 
         <div className="topbar-actions">
           <UserSettingsMenu />
-          <button className="new-task-button" type="button" onClick={resetWorkspace}>
-            <span aria-hidden="true">＋</span>
-            新建任务
-          </button>
         </div>
       </header>
 
@@ -976,21 +972,6 @@ export default function VideoWorkbench() {
                   </p>
                 )}
 
-                <label className={`download-option ${directVideoUrl ? "disabled" : ""}`}>
-                  <span className="switch-wrap">
-                    <input
-                      type="checkbox"
-                      checked
-                      disabled
-                      readOnly
-                    />
-                    <span className="switch" aria-hidden="true" />
-                  </span>
-                  <span>
-                    <strong>{directVideoUrl ? "视频直链由 Qwen 直接读取" : "下载公开视频，再进行总结"}</strong>
-                    <small>{directVideoUrl ? "无需经过浏览器上传" : "媒体服务合并音视频后，由浏览器临时处理"}</small>
-                  </span>
-                </label>
               </div>
             )}
 
