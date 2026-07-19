@@ -65,7 +65,10 @@ export async function downloadBilibiliVideo(
     jobId = snapshot.jobId;
     reportServerProgress(snapshot, options.onProgress);
 
-    while (snapshot.status === "queued" || snapshot.status === "running") {
+    while (
+      (snapshot.status === "queued" || snapshot.status === "running") &&
+      !snapshot.error
+    ) {
       if (Date.now() >= deadline) {
         throw new BilibiliClientError(
           "B站下载任务超过 22 分钟仍未完成，已自动取消。",
@@ -154,7 +157,10 @@ async function requestJob(path: string, init?: RequestInit) {
       upstream?.retryable ?? response.status >= 500,
     );
   }
-  if (!body || "error" in body || !isJobSnapshot(body)) {
+  // Job snapshots and API error responses both have a top-level `error` field.
+  // On a successful HTTP response, validate the job shape instead of treating a
+  // failed job's error details as an API-level error.
+  if (!isJobSnapshot(body)) {
     throw new BilibiliClientError(
       "B站下载服务返回了无效任务状态。",
       "INVALID_MEDIA_RESPONSE",
@@ -387,14 +393,30 @@ async function cleanupJob(jobId: string) {
   }
 }
 
-function isJobSnapshot(value: BilibiliJobSnapshot) {
+function isJobSnapshot(value: unknown): value is BilibiliJobSnapshot {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return false;
+  const snapshot = value as Record<string, unknown>;
+  const source = snapshot.source;
   return (
-    typeof value.jobId === "string" &&
-    typeof value.status === "string" &&
-    typeof value.phase === "string" &&
-    typeof value.progress === "number" &&
-    Boolean(value.source) &&
-    typeof value.source.bvid === "string"
+    typeof snapshot.jobId === "string" &&
+    typeof snapshot.status === "string" &&
+    typeof snapshot.phase === "string" &&
+    typeof snapshot.progress === "number" &&
+    Boolean(source) &&
+    typeof source === "object" &&
+    !Array.isArray(source) &&
+    typeof (source as Record<string, unknown>).bvid === "string" &&
+    (snapshot.error === undefined || isJobError(snapshot.error))
+  );
+}
+
+function isJobError(value: unknown) {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return false;
+  const error = value as Record<string, unknown>;
+  return (
+    typeof error.code === "string" &&
+    typeof error.message === "string" &&
+    typeof error.retryable === "boolean"
   );
 }
 

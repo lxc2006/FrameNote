@@ -1,4 +1,11 @@
 import type { VideoModelContext } from "../video-engine";
+import {
+  canUseNativeFrameExtraction,
+  extractFramesWithFallback,
+  extractFramesWithFfmpegSeeks,
+  extractFramesWithNativeVideo,
+  type TimedVideoFrame,
+} from "./frame-extractor";
 
 export const LOCAL_VIDEO_PREPROCESSING_LIMITS = {
   maxSourceBytes: 300 * 1024 * 1024,
@@ -8,6 +15,7 @@ export const LOCAL_VIDEO_PREPROCESSING_LIMITS = {
   targetFrameIntervalSeconds: 12,
   frameWidth: 960,
   jpegQuality: 6,
+  nativeJpegQuality: 0.82,
   targetAudioBytes: 6 * 1024 * 1024,
   targetFrameBytes: 3 * 1024 * 1024,
 } as const;
@@ -60,8 +68,11 @@ export async function extractVideoEvidence(
     import("@ffmpeg/util"),
   ]);
   const ffmpeg = new FFmpeg();
+  let coreURL: string | undefined;
+  let wasmURL: string | undefined;
   let activeStage: VideoPreprocessingStage = "loading-engine";
   const progressListener = ({ progress }: { progress: number }) => {
+    if (activeStage === "extracting-frames") return;
     options.onProgress?.({
       stage: activeStage,
       progress: clamp(progress, 0, 1),
@@ -70,17 +81,12 @@ export async function extractVideoEvidence(
   ffmpeg.on("progress", progressListener);
 
   try {
+    [coreURL, wasmURL] = await Promise.all([
+      toBlobURL(`${FFMPEG_CORE_BASE_URL}/ffmpeg-core.js`, "text/javascript"),
+      toBlobURL(`${FFMPEG_CORE_BASE_URL}/ffmpeg-core.wasm`, "application/wasm"),
+    ]);
     await ffmpeg.load(
-      {
-        coreURL: await toBlobURL(
-          `${FFMPEG_CORE_BASE_URL}/ffmpeg-core.js`,
-          "text/javascript",
-        ),
-        wasmURL: await toBlobURL(
-          `${FFMPEG_CORE_BASE_URL}/ffmpeg-core.wasm`,
-          "application/wasm",
-        ),
-      },
+      { coreURL, wasmURL },
       { signal: options.signal },
     );
     throwIfAborted(options.signal);
@@ -112,7 +118,7 @@ export async function extractVideoEvidence(
         `${audioBitrateKbps}k`,
         "audio.mp3",
       ],
-      -1,
+      selectAudioTimeout(options.durationSeconds),
       { signal: options.signal },
     );
     const audioData = audioExitCode === 0
@@ -123,34 +129,39 @@ export async function extractVideoEvidence(
     activeStage = "extracting-frames";
     options.onProgress?.({ stage: activeStage, progress: 0 });
     const framePlan = createFramePlan(options.durationSeconds);
-    const frameExitCode = await ffmpeg.exec(
-      [
-        "-i",
-        inputPath,
-        "-map",
-        "0:v:0",
-        "-vf",
-        `fps=1/${framePlan.intervalSeconds.toFixed(3)},scale=${LOCAL_VIDEO_PREPROCESSING_LIMITS.frameWidth}:-2`,
-        "-frames:v",
-        String(framePlan.count),
-        "-q:v",
-        String(LOCAL_VIDEO_PREPROCESSING_LIMITS.jpegQuality),
-        "frame-%03d.jpg",
-      ],
-      -1,
-      { signal: options.signal },
-    );
-    if (frameExitCode !== 0) {
-      throw new VideoPreprocessingError("无法从该视频中提取关键帧，请检查视频编码格式。");
+    const frames: TimedVideoFrame[] = await extractFramesWithFallback({
+      minimumFrames: LOCAL_VIDEO_PREPROCESSING_LIMITS.minKeyframes,
+      signal: options.signal,
+      ...(canUseNativeFrameExtraction(file)
+        ? {
+            nativeExtractor: (onProgress: (progress: number) => void) =>
+              extractFramesWithNativeVideo(file, {
+                timestamps: framePlan.timestamps,
+                width: LOCAL_VIDEO_PREPROCESSING_LIMITS.frameWidth,
+                jpegQuality: LOCAL_VIDEO_PREPROCESSING_LIMITS.nativeJpegQuality,
+                signal: options.signal,
+                onProgress,
+              }),
+          }
+        : {}),
+      fallbackExtractor: (onProgress) =>
+        extractFramesWithFfmpegSeeks(ffmpeg, {
+          inputPath,
+          timestamps: framePlan.timestamps,
+          width: LOCAL_VIDEO_PREPROCESSING_LIMITS.frameWidth,
+          jpegQuality: LOCAL_VIDEO_PREPROCESSING_LIMITS.jpegQuality,
+          signal: options.signal,
+          onProgress,
+        }),
+      onProgress: (progress) =>
+        options.onProgress?.({ stage: activeStage, progress }),
+    });
+    if (frames.length < LOCAL_VIDEO_PREPROCESSING_LIMITS.minKeyframes) {
+      throw new VideoPreprocessingError(
+        "关键帧提取超时或视频无法快速定位，请尝试 MP4/H.264 视频。",
+      );
     }
 
-    const frameNames = (await ffmpeg.listDir("/", { signal: options.signal }))
-      .filter((entry) => !entry.isDir && /^frame-\d+\.jpg$/.test(entry.name))
-      .map((entry) => entry.name)
-      .sort();
-    const frames = await Promise.all(
-      frameNames.map((name) => readBinaryFile(ffmpeg, name, options.signal)),
-    );
     const selectedFrames = selectFramesWithinBudget(
       frames,
       LOCAL_VIDEO_PREPROCESSING_LIMITS.targetFrameBytes,
@@ -166,12 +177,7 @@ export async function extractVideoEvidence(
     const audioUrl = audioData
       ? await bytesToDataUrl(audioData, "audio/mpeg")
       : undefined;
-    const frameTimestamps = selectedFrames.map((frame) =>
-      Math.min(
-        options.durationSeconds,
-        frame.sourceIndex * framePlan.intervalSeconds,
-      ),
-    );
+    const frameTimestamps = selectedFrames.map((frame) => frame.timestamp);
     const frameBytes = selectedFrames.reduce(
       (total, frame) => total + frame.data.byteLength,
       0,
@@ -201,6 +207,8 @@ export async function extractVideoEvidence(
   } finally {
     ffmpeg.off("progress", progressListener);
     ffmpeg.terminate();
+    if (coreURL?.startsWith("blob:")) URL.revokeObjectURL(coreURL);
+    if (wasmURL?.startsWith("blob:")) URL.revokeObjectURL(wasmURL);
   }
 }
 
@@ -233,7 +241,14 @@ function selectAudioBitrate(durationSeconds: number) {
   return AUDIO_BITRATES_KBPS.find((bitrate) => bitrate <= targetKbps) ?? 8;
 }
 
-function createFramePlan(durationSeconds: number) {
+function selectAudioTimeout(durationSeconds: number) {
+  return Math.min(
+    10 * 60 * 1_000,
+    Math.max(2 * 60 * 1_000, Math.ceil(durationSeconds * 750)),
+  );
+}
+
+export function createFramePlan(durationSeconds: number) {
   const count = clamp(
     Math.ceil(
       durationSeconds /
@@ -245,26 +260,28 @@ function createFramePlan(durationSeconds: number) {
   return {
     count,
     intervalSeconds: Math.max(0.25, durationSeconds / count),
+    timestamps: Array.from({ length: count }, (_, index) =>
+      Math.min(durationSeconds, (index * durationSeconds) / count),
+    ),
   };
 }
 
-function selectFramesWithinBudget(frames: Uint8Array[], budget: number) {
-  const indexed = frames.map((data, sourceIndex) => ({ data, sourceIndex }));
-  const totalBytes = indexed.reduce((total, frame) => total + frame.data.byteLength, 0);
-  if (totalBytes <= budget) return indexed;
+function selectFramesWithinBudget(frames: TimedVideoFrame[], budget: number) {
+  const totalBytes = frames.reduce((total, frame) => total + frame.data.byteLength, 0);
+  if (totalBytes <= budget) return frames;
 
   const estimatedCount = Math.max(
     1,
     Math.floor((frames.length * budget) / totalBytes),
   );
   const targetCount = Math.min(frames.length, estimatedCount);
-  if (targetCount === 1) return [indexed[Math.floor(indexed.length / 2)]];
+  if (targetCount === 1) return [frames[Math.floor(frames.length / 2)]];
 
   return Array.from({ length: targetCount }, (_, index) => {
     const sourceIndex = Math.round(
-      (index * (indexed.length - 1)) / (targetCount - 1),
+      (index * (frames.length - 1)) / (targetCount - 1),
     );
-    return indexed[sourceIndex];
+    return frames[sourceIndex];
   });
 }
 

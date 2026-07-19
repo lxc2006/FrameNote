@@ -21,7 +21,15 @@ JOB_ID_RE = re.compile(
     r"^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$",
     re.ASCII,
 )
-FINAL_ARTIFACT_RE = re.compile(r"^artifact\.(mp4|mkv|webm|mov)$", re.IGNORECASE)
+FINAL_ARTIFACT_RE = re.compile(r"^artifact\.mp4$", re.IGNORECASE)
+BROWSER_COMPATIBLE_FORMAT = (
+    r"bv[height<=720][ext=mp4][vcodec~='^(?:h264|avc[13](?:\.|$))']"
+    r"+ba[ext=m4a][acodec~='^(?:aac|mp4a\.40\.)']/"
+    r"b[height<=720][ext=mp4][vcodec~='^(?:h264|avc[13](?:\.|$))']"
+    r"[acodec~='^(?:aac|mp4a\.40\.)']"
+)
+BROWSER_VIDEO_CODECS = frozenset({"h264"})
+BROWSER_AUDIO_CODECS = frozenset({"aac"})
 
 
 class WorkerFailure(RuntimeError):
@@ -209,9 +217,68 @@ def find_artifact(job_dir: Path) -> Path:
     return artifact
 
 
+def validate_artifact_probe(payload: dict[str, Any], max_duration: int) -> None:
+    try:
+        format_name = payload["format"]["format_name"]
+        duration = float(payload["format"]["duration"])
+        streams = payload["streams"]
+    except (KeyError, TypeError, ValueError) as exc:
+        raise WorkerFailure("PROBE_FAILED", "视频媒体信息无效。", True) from exc
+    if not isinstance(format_name, str) or "mp4" not in format_name.split(","):
+        raise WorkerFailure(
+            "UNSUPPORTED_CONTAINER",
+            "下载结果不是浏览器可处理的 MP4 文件。",
+            False,
+        )
+    if not isinstance(streams, list):
+        raise WorkerFailure("PROBE_FAILED", "视频媒体信息无效。", True)
+    if not math.isfinite(duration) or duration <= 0 or duration > max_duration + 1:
+        raise WorkerFailure("VIDEO_TOO_LONG", "最终视频超过 60 分钟限制。", False)
+
+    video_streams = [
+        stream
+        for stream in streams
+        if isinstance(stream, dict) and stream.get("codec_type") == "video"
+    ]
+    if not video_streams:
+        raise WorkerFailure("PROBE_FAILED", "下载结果不包含视频轨道。", True)
+    if any(
+        stream.get("codec_name") not in BROWSER_VIDEO_CODECS
+        for stream in video_streams
+    ):
+        raise WorkerFailure(
+            "UNSUPPORTED_VIDEO_CODEC",
+            "下载结果不是浏览器可处理的 H.264 视频。",
+            False,
+        )
+
+    audio_streams = [
+        stream
+        for stream in streams
+        if isinstance(stream, dict) and stream.get("codec_type") == "audio"
+    ]
+    if not audio_streams:
+        raise WorkerFailure("PROBE_FAILED", "下载结果不包含音频轨道。", True)
+    if any(
+        stream.get("codec_name") not in BROWSER_AUDIO_CODECS
+        for stream in audio_streams
+    ):
+        raise WorkerFailure(
+            "UNSUPPORTED_AUDIO_CODEC",
+            "下载结果不是浏览器可处理的 AAC 音频。",
+            False,
+        )
+
+
 def verify_artifact(
     ffprobe: str, artifact: Path, max_duration: int, max_bytes: int
 ) -> tuple[int, str]:
+    if artifact.suffix.lower() != ".mp4":
+        raise WorkerFailure(
+            "UNSUPPORTED_CONTAINER",
+            "下载结果不是浏览器可处理的 MP4 文件。",
+            False,
+        )
     try:
         stat = artifact.stat()
     except OSError as exc:
@@ -223,7 +290,7 @@ def verify_artifact(
         "-v",
         "error",
         "-show_entries",
-        "format=duration,size:stream=codec_type",
+        "format=format_name,duration,size:stream=codec_type,codec_name",
         "-of",
         "json",
         str(artifact),
@@ -247,17 +314,9 @@ def verify_artifact(
         raise WorkerFailure("PROBE_FAILED", "下载的视频未通过媒体校验。", True)
     try:
         payload = json.loads(result.stdout)
-        duration = float(payload["format"]["duration"])
-        streams = payload.get("streams", [])
-    except (KeyError, TypeError, ValueError, json.JSONDecodeError) as exc:
+    except json.JSONDecodeError as exc:
         raise WorkerFailure("PROBE_FAILED", "视频媒体信息无效。", True) from exc
-    if not math.isfinite(duration) or duration <= 0 or duration > max_duration + 1:
-        raise WorkerFailure("VIDEO_TOO_LONG", "最终视频超过 60 分钟限制。", False)
-    if not any(
-        isinstance(stream, dict) and stream.get("codec_type") == "video"
-        for stream in streams
-    ):
-        raise WorkerFailure("PROBE_FAILED", "下载结果不包含视频轨道。", True)
+    validate_artifact_probe(payload, max_duration)
     digest = hashlib.sha256()
     with artifact.open("rb") as handle:
         for chunk in iter(lambda: handle.read(1024 * 1024), b""):
@@ -285,6 +344,12 @@ def classify_download_error(message: str, resolving: bool) -> WorkerFailure:
         )
     if "unsupported url" in lowered:
         return WorkerFailure("UNSUPPORTED_VIDEO", "B 站视频无法解析。", False)
+    if "requested format is not available" in lowered:
+        return WorkerFailure(
+            "UNSUPPORTED_VIDEO_CODEC",
+            "视频没有可供浏览器处理的 H.264/AAC 格式。",
+            False,
+        )
     if resolving:
         return WorkerFailure("METADATA_FAILED", "无法获取 B 站视频信息，请稍后重试。", True)
     return WorkerFailure("DOWNLOAD_FAILED", "B 站视频下载失败，请稍后重试。", True)
@@ -316,11 +381,13 @@ def run(args: argparse.Namespace) -> None:
         "ignoreconfig": True,
         "noplaylist": True,
         "playlist_items": "1",
-        "format": (
-            "bv*[height<=720][ext=mp4]+ba[ext=m4a]/"
-            "bv*[height<=720]+ba/b[height<=720]"
-        ),
-        "format_sort": ["res:720", "ext:mp4:m4a"],
+        "format": BROWSER_COMPATIBLE_FORMAT,
+        "format_sort": [
+            "res:720",
+            "vcodec:h264",
+            "acodec:aac",
+            "ext:mp4:m4a",
+        ],
         "merge_output_format": "mp4",
         "outtmpl": output_template,
         "paths": {"home": str(job_dir), "temp": str(job_dir)},

@@ -1,6 +1,6 @@
 # FrameNote B 站媒体服务
 
-这是 FrameNote 的独立媒体获取服务。它只接收严格的 12 位 BVID，在服务器端使用 `yt-dlp` 获取 B 站公开视频的最高 720p 音视频流，再由 FFmpeg 合并、`ffprobe` 复核，最终返回短时有效的签名下载 URL。
+这是 FrameNote 的独立媒体获取服务。它只接收严格的 12 位 BVID，在服务器端使用 `yt-dlp` 获取 B 站公开视频最高 720p 的 H.264 视频流与 AAC 音频流，再由 FFmpeg 合并、`ffprobe` 复核，最终返回短时有效的签名下载 URL。
 
 服务不会接收任意 URL，不读取 Cookie，不登录 B 站，也不尝试访问会员、私有、付费或地区受限内容。请只处理你拥有或已获授权使用的公开视频。
 
@@ -8,6 +8,7 @@
 
 - 单视频、禁止播放列表；
 - 最高 720p；
+- 最终媒体固定为 MP4 容器、H.264 视频与 AAC 音频；
 - 最长 60 分钟；
 - 最终文件及下载过程默认最大 150 MB；
 - 2 个并行下载 worker；
@@ -117,7 +118,7 @@ GET /v1/bilibili/jobs/{jobId}
 GET /v1/bilibili/jobs?limit=50
 ```
 
-状态为 `queued | running | succeeded | failed | cancelled | expired`，阶段为 `queued | resolving | downloading | merging | ready`。成功后响应包含：
+状态为 `queued | running | succeeded | failed | cancelled | expired`，阶段为 `queued | resolving | downloading | merging | ready`。失败任务会携带结构化 `error`；成功后响应包含：
 
 ```json
 {
@@ -149,7 +150,7 @@ GET /v1/bilibili/jobs?limit=50
 DELETE /v1/bilibili/jobs/{jobId}
 ```
 
-等待或运行中的任务会被取消，运行中的子进程会先终止后强制回收。已经成功的任务会删除视频文件并转为 `cancelled`。重复删除是幂等的。
+等待或运行中且尚未报告错误的任务会被取消，运行中的子进程会先终止后强制回收。已经报告错误或进入 `failed` 的任务会清理媒体残片，但保持 `failed` 并保留原始 `error`；已经成功的任务会删除视频文件并转为 `cancelled`。重复删除是幂等的。
 
 ### 健康检查
 
@@ -162,21 +163,21 @@ GET /health
 ## 实现原理
 
 1. API 对 BVID、鉴权和队列容量做入口校验，只拼接固定的 `https://www.bilibili.com/video/{BVID}`，因此用户不能利用该服务请求任意站点。
-2. 两个异步消费者各自以参数数组（不经过 shell）启动隔离的 `worker.py` 子进程。worker 的标准输出只发送 JSON Lines 进度，主进程负责状态机、超时和取消。
-3. worker 先用 `yt-dlp` 只解析元数据，拒绝直播、未知时长、超过 60 分钟或预计超过配置大小上限的内容；随后选择不高于 720p 的视频流和最佳音频流。
-4. B 站通常使用 DASH，把画面与声音作为两个流返回。`yt-dlp` 下载后调用 FFmpeg 合并/封装为 MP4，过程中持续检查累计字节数。
-5. 下载结束后用 `ffprobe` 再次核对实际时长、文件大小和视频轨道，并计算 SHA-256。校验失败的文件不会进入成功状态。
+2. 两个异步消费者各自以参数数组（不经过 shell）和 `-I -u -X utf8=1` 启动隔离的 `worker.py` 子进程。worker 使用 UTF-8 JSON Lines 输出进度与错误，主进程负责状态机、超时和取消。
+3. worker 先用 `yt-dlp` 只解析元数据，拒绝直播、未知时长、超过 60 分钟或预计超过配置大小上限的内容；格式选择器的每个 fallback 都硬性要求不高于 720p 的 AVC/H.264 视频与 AAC 音频，不会回退到 AV1、HEVC 或 Opus。
+4. B 站通常使用 DASH，把画面与声音作为两个流返回。`yt-dlp` 下载后调用 FFmpeg 合并/重封装为 MP4，过程中持续检查累计字节数；重封装不负责把不兼容编码转码为 H.264/AAC。
+5. 下载结束后用 `ffprobe` 再次核对实际时长、文件大小、MP4 容器以及全部音视频轨的 H.264/AAC 白名单，并计算 SHA-256。校验失败的文件不会进入成功状态。
 6. API 使用 HMAC-SHA256 为 `jobId + 过期时间` 签名。媒体路由验证签名、有效期和规范化路径后才发送文件，后台清理器按 TTL 删除临时内容。
 
-常见失败会映射为结构化的 `error: {code, message, retryable}`，例如 `VIDEO_TOO_LONG`、`VIDEO_TOO_LARGE`、`ACCESS_RESTRICTED`、`TIMEOUT` 和 `DOWNLOAD_FAILED`。
+常见失败会映射为结构化的 `error: {code, message, retryable}`，例如 `VIDEO_TOO_LONG`、`VIDEO_TOO_LARGE`、`UNSUPPORTED_VIDEO_CODEC`、`UNSUPPORTED_AUDIO_CODEC`、`ACCESS_RESTRICTED`、`TIMEOUT` 和 `DOWNLOAD_FAILED`。
 
 ## 测试
 
 测试不联网，也不下载视频：
 
 ```powershell
-python -m unittest discover -s media_service/tests -v
-python -m compileall -q media_service
+.\.venv\Scripts\python.exe -m unittest discover -s media_service/tests -v
+.\.venv\Scripts\python.exe -m compileall -q media_service
 ```
 
-单元测试覆盖严格 BVID、HMAC 防篡改、loopback 鉴权基础逻辑、路径逃逸防护、精确 CORS、队列上限/取消释放，以及时长与体积校验。真实 B 站端到端测试需要安装 requirements 和 FFmpeg，并使用你有权处理的公开视频单独执行。
+单元测试覆盖严格 BVID、HMAC 防篡改、loopback 鉴权基础逻辑、路径逃逸防护、精确 CORS、队列上限/取消释放、时长与体积校验、yt-dlp 的 H.264/AAC 选择语义，以及 ffprobe 对 AV1、HEVC、Opus、缺失音轨和非 MP4 产物的拒绝。真实 B 站端到端测试需要安装 requirements 和 FFmpeg，并使用你有权处理的公开视频单独执行。

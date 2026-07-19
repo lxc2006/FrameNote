@@ -44,6 +44,13 @@ interface SelectedVideo {
   duration?: number;
 }
 
+interface VideoPreview {
+  kind: "downloaded" | "remote";
+  playbackUrl: string;
+  downloadUrl: string;
+  filename: string;
+}
+
 interface ChatMessage {
   id: string;
   role: "assistant" | "user";
@@ -138,11 +145,14 @@ export default function VideoWorkbench() {
   const [isReplying, setIsReplying] = useState(false);
   const [modelStatus, setModelStatus] = useState<ModelStatusResponse | null>(null);
   const [activeModel, setActiveModel] = useState<string | null>(null);
+  const [videoPreview, setVideoPreview] = useState<VideoPreview | null>(null);
+  const [videoPreviewFailed, setVideoPreviewFailed] = useState(false);
   const fileInputRef = useRef<HTMLInputElement>(null);
   const runTokenRef = useRef(0);
   const messageCounterRef = useRef(0);
   const analyzeAbortRef = useRef<AbortController | null>(null);
   const askAbortRef = useRef<AbortController | null>(null);
+  const downloadedVideoUrlRef = useRef<string | null>(null);
 
   const bvid = useMemo(() => extractBvid(bilibiliInput), [bilibiliInput]);
   const directVideoUrl = useMemo(
@@ -206,6 +216,15 @@ export default function VideoWorkbench() {
   }, [selectedVideo?.objectUrl]);
 
   useEffect(() => {
+    return () => {
+      if (downloadedVideoUrlRef.current) {
+        URL.revokeObjectURL(downloadedVideoUrlRef.current);
+        downloadedVideoUrlRef.current = null;
+      }
+    };
+  }, []);
+
+  useEffect(() => {
     const cancelActiveWork = () => {
       runTokenRef.current += 1;
       analyzeAbortRef.current?.abort();
@@ -223,6 +242,42 @@ export default function VideoWorkbench() {
     return `${role}-${messageCounterRef.current}`;
   }
 
+  function releaseDownloadedVideoUrl() {
+    if (!downloadedVideoUrlRef.current) return;
+    URL.revokeObjectURL(downloadedVideoUrlRef.current);
+    downloadedVideoUrlRef.current = null;
+  }
+
+  function clearVideoPreview() {
+    releaseDownloadedVideoUrl();
+    setVideoPreview(null);
+    setVideoPreviewFailed(false);
+  }
+
+  function showRemoteVideo(url: string) {
+    releaseDownloadedVideoUrl();
+    setVideoPreview({
+      kind: "remote",
+      playbackUrl: url,
+      downloadUrl: url,
+      filename: titleFromUrl(url),
+    });
+    setVideoPreviewFailed(false);
+  }
+
+  function showDownloadedVideo(file: File) {
+    releaseDownloadedVideoUrl();
+    const objectUrl = URL.createObjectURL(file);
+    downloadedVideoUrlRef.current = objectUrl;
+    setVideoPreview({
+      kind: "downloaded",
+      playbackUrl: objectUrl,
+      downloadUrl: objectUrl,
+      filename: file.name || "bilibili-video.mp4",
+    });
+    setVideoPreviewFailed(false);
+  }
+
   function selectMode(nextMode: InputMode) {
     if (phase === "processing") return;
     setMode(nextMode);
@@ -230,6 +285,7 @@ export default function VideoWorkbench() {
   }
 
   function acceptFile(file: File) {
+    if (phase === "processing") return;
     const extension = fileExtension(file.name);
 
     if (!acceptedExtensions.includes(extension)) {
@@ -294,6 +350,11 @@ export default function VideoWorkbench() {
     setStageIndex(0);
     setStageProgress(0.2);
     setPreprocessingResult(null);
+    if (pendingSource.kind === "url" && pendingSource.sourceUrl) {
+      showRemoteVideo(pendingSource.sourceUrl);
+    } else {
+      clearVideoPreview();
+    }
 
     try {
       let context: VideoModelContext;
@@ -332,6 +393,8 @@ export default function VideoWorkbench() {
           },
         });
         if (runTokenRef.current !== runToken) return;
+
+        showDownloadedVideo(downloaded.file);
 
         analysisSource = {
           ...pendingSource,
@@ -425,6 +488,7 @@ export default function VideoWorkbench() {
     setStageIndex(-1);
     setStageProgress(0);
     setPreprocessingResult(null);
+    clearVideoPreview();
     setMessages([]);
     setQuestion("");
     setIsReplying(false);
@@ -551,6 +615,7 @@ export default function VideoWorkbench() {
                 type="button"
                 role="tab"
                 aria-selected={mode === "upload"}
+                disabled={phase === "processing"}
                 onClick={() => selectMode("upload")}
               >
                 <span aria-hidden="true">↥</span>
@@ -561,6 +626,7 @@ export default function VideoWorkbench() {
                 type="button"
                 role="tab"
                 aria-selected={mode === "bilibili"}
+                disabled={phase === "processing"}
                 onClick={() => selectMode("bilibili")}
               >
                 <span aria-hidden="true">BV</span>
@@ -575,6 +641,7 @@ export default function VideoWorkbench() {
                   className="sr-only"
                   type="file"
                   accept="video/mp4,video/webm,video/quicktime,.mkv,.m4v"
+                  disabled={phase === "processing"}
                   onChange={handleFileChange}
                   aria-label="选择视频文件"
                 />
@@ -601,6 +668,7 @@ export default function VideoWorkbench() {
                     </p>
                     <button
                       type="button"
+                      disabled={phase === "processing"}
                       onClick={() => fileInputRef.current?.click()}
                     >
                       选择视频文件
@@ -634,6 +702,7 @@ export default function VideoWorkbench() {
                     <button
                       className="replace-file"
                       type="button"
+                      disabled={phase === "processing"}
                       onClick={() => fileInputRef.current?.click()}
                     >
                       更换
@@ -655,6 +724,7 @@ export default function VideoWorkbench() {
                   <input
                     id="bilibili-source"
                     value={bilibiliInput}
+                    disabled={phase === "processing"}
                     onChange={(event) => {
                       setBilibiliInput(event.target.value);
                       setNotice(null);
@@ -756,6 +826,57 @@ export default function VideoWorkbench() {
           </div>
 
           <div className="conversation-scroll" aria-live="polite">
+            {videoPreview ? (
+              <section className="video-preview-card" aria-label="视频预览与下载">
+                <div className="video-preview-player">
+                  <video
+                    src={videoPreview.playbackUrl}
+                    controls
+                    playsInline
+                    preload="metadata"
+                    onLoadedMetadata={() => setVideoPreviewFailed(false)}
+                    onError={() => setVideoPreviewFailed(true)}
+                  >
+                    当前浏览器无法播放这个视频。
+                  </video>
+                </div>
+                <div className="video-preview-details">
+                  <span className="video-ready-label">
+                    {videoPreview.kind === "downloaded" ? "视频已下载并合并" : "HTTPS 视频直链已就绪"}
+                  </span>
+                  <strong>{videoPreview.filename}</strong>
+                  <p>
+                    {videoPreviewFailed
+                      ? "浏览器无法直接预览，但仍可以尝试打开或保存视频。"
+                      : videoPreview.kind === "downloaded"
+                        ? "总结仍在处理时也可以立即播放；临时视频会保留到当前任务结束。"
+                        : "播放器直接读取源站视频；是否能保存由源站响应设置决定。"}
+                  </p>
+                  <div className="video-preview-actions">
+                    <a
+                      className="video-download-action"
+                      href={videoPreview.downloadUrl}
+                      download={videoPreview.filename}
+                      target={videoPreview.kind === "remote" ? "_blank" : undefined}
+                      rel={videoPreview.kind === "remote" ? "noreferrer" : undefined}
+                    >
+                      {videoPreview.kind === "downloaded" ? "下载视频" : "打开/下载原视频"}
+                    </a>
+                    {videoPreview.kind === "remote" ? (
+                      <a
+                        className="video-source-action"
+                        href={videoPreview.playbackUrl}
+                        target="_blank"
+                        rel="noreferrer"
+                      >
+                        打开源地址 ↗
+                      </a>
+                    ) : null}
+                  </div>
+                </div>
+              </section>
+            ) : null}
+
             {phase === "idle" || phase === "error" ? (
               <div className="empty-state">
                 <div className="empty-orbit" aria-hidden="true">
@@ -818,7 +939,12 @@ export default function VideoWorkbench() {
 
                 <div className="processing-tip">
                   <span aria-hidden="true">i</span>
-                  视频理解可能需要几分钟；处理完成前请保持当前页面打开。
+                  视频理解可能需要几分钟；处理完成前请保持当前页面打开。长时间无进展时可取消后重试。
+                </div>
+                <div className="processing-actions">
+                  <button type="button" onClick={resetWorkspace}>
+                    取消处理
+                  </button>
                 </div>
               </div>
             ) : null}

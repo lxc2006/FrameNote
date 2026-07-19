@@ -24,6 +24,7 @@ PHASE_SEQUENCE = ("queued", "resolving", "downloading", "merging", "ready")
 VALID_PHASES = set(PHASE_SEQUENCE)
 PHASE_ORDER = {name: index for index, name in enumerate(PHASE_SEQUENCE)}
 TERMINAL_STATUSES = {"succeeded", "failed", "cancelled", "expired"}
+WORKER_PYTHON_OPTIONS = ("-I", "-u", "-X", "utf8=1")
 
 
 class QueueCapacityError(RuntimeError):
@@ -117,18 +118,28 @@ class JobManager:
         purge_ids: list[str] = []
         async with self._lock:
             for job in self._jobs.values():
-                if job.process and job.process.returncode is None:
-                    processes.append(job.process)
+                active_process = (
+                    job.process
+                    if job.process and job.process.returncode is None
+                    else None
+                )
+                if active_process:
+                    processes.append(active_process)
                 if job.status in {"queued", "running"}:
                     if job.queue_slot_held:
                         self._queued_slots = max(0, self._queued_slots - 1)
                         job.queue_slot_held = False
                     job.status = "failed"
-                    job.error = JobError(
-                        "SERVICE_STOPPED", "服务正在关闭，请重新提交任务。", True
-                    )
+                    if job.error is None:
+                        job.error = JobError(
+                            "SERVICE_STOPPED", "服务正在关闭，请重新提交任务。", True
+                        )
                     job.updated_at = time.time()
                     self._persist(job)
+                    purge_ids.append(job.job_id)
+                elif active_process and (
+                    job.status == "failed" or job.error is not None
+                ):
                     purge_ids.append(job.job_id)
         await asyncio.gather(
             *(self._terminate_process(process) for process in processes),
@@ -185,14 +196,13 @@ class JobManager:
                 self._queued_slots = max(0, self._queued_slots - 1)
                 job.queue_slot_held = False
             process = job.process
-            job.status = "cancelled"
-            job.error = None
-            job.artifact_file = None
-            job.artifact_filename = None
-            job.artifact_mime_type = None
-            job.artifact_size_bytes = None
-            job.artifact_sha256 = None
-            job.artifact_expires_at = None
+            preserve_failure = job.status == "failed" or (
+                job.status in {"queued", "running"} and job.error is not None
+            )
+            job.status = "failed" if preserve_failure else "cancelled"
+            if not preserve_failure:
+                job.error = None
+            self._clear_artifact(job)
             job.updated_at = time.time()
             self._persist(job)
             should_purge = True
@@ -243,16 +253,10 @@ class JobManager:
             finally:
                 self._queue.task_done()
 
-    async def _run_worker(self, job_id: str) -> None:
-        async with self._lock:
-            job = self._jobs.get(job_id)
-            if not job or job.status != "running":
-                return
-            bvid = job.bvid
-
-        command = [
+    def _worker_command(self, job_id: str, bvid: str) -> list[str]:
+        return [
             sys.executable,
-            "-I",
+            *WORKER_PYTHON_OPTIONS,
             str(self._worker_script),
             "--state-root",
             str(self.settings.state_root),
@@ -265,6 +269,15 @@ class JobManager:
             "--max-bytes",
             str(self.settings.max_bytes),
         ]
+
+    async def _run_worker(self, job_id: str) -> None:
+        async with self._lock:
+            job = self._jobs.get(job_id)
+            if not job or job.status != "running":
+                return
+            bvid = job.bvid
+
+        command = self._worker_command(job_id, bvid)
         environment = self._worker_environment()
         process_options: dict[str, Any] = {}
         if os.name == "nt":
@@ -335,7 +348,13 @@ class JobManager:
                 current.process = None
             if not current or current.status == "cancelled":
                 return
-            if timed_out:
+            if current.error:
+                current.status = "failed"
+                current.updated_at = time.time()
+                self._clear_artifact(current)
+                self._persist(current)
+                purge_failed_files = True
+            elif timed_out:
                 self._set_failed(
                     current,
                     JobError("TIMEOUT", "下载任务超时，请稍后重试。", True),
@@ -351,12 +370,6 @@ class JobManager:
                 )
                 current.updated_at = time.time()
                 self._persist(current)
-            elif current.error:
-                current.status = "failed"
-                current.updated_at = time.time()
-                self._clear_artifact(current)
-                self._persist(current)
-                purge_failed_files = True
             else:
                 self._set_failed(
                     current,
@@ -463,7 +476,9 @@ class JobManager:
                     and isinstance(message, str)
                     and isinstance(retryable, bool)
                 ):
+                    job.status = "failed"
                     job.error = JobError(code, message[:300], retryable)
+                    self._clear_artifact(job)
             job.updated_at = time.time()
             self._persist(job)
 
@@ -479,7 +494,8 @@ class JobManager:
 
     def _set_failed(self, job: JobRecord, error: JobError) -> None:
         job.status = "failed"
-        job.error = error
+        if job.error is None:
+            job.error = error
         job.updated_at = time.time()
         self._clear_artifact(job)
         self._persist(job)
@@ -529,9 +545,10 @@ class JobManager:
                 if job.status in {"queued", "running"}:
                     job.status = "failed"
                     job.queue_slot_held = False
-                    job.error = JobError(
-                        "SERVICE_RESTARTED", "服务重启中断了下载，请重新提交。", True
-                    )
+                    if job.error is None:
+                        job.error = JobError(
+                            "SERVICE_RESTARTED", "服务重启中断了下载，请重新提交。", True
+                        )
                     job.updated_at = now
                 elif job.status == "succeeded" and (
                     not job.artifact_expires_at
@@ -755,6 +772,7 @@ class JobManager:
         }
         environment["PYTHONUNBUFFERED"] = "1"
         environment["PYTHONIOENCODING"] = "utf-8"
+        environment["PYTHONUTF8"] = "1"
         return environment
 
     @staticmethod

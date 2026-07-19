@@ -118,6 +118,7 @@ test("validates and proxies Bilibili download jobs without exposing the service 
   );
 
   const jobId = "11111111-1111-4111-8111-111111111111";
+  const failedJobId = "22222222-2222-4222-8222-222222222222";
   const upstreamRequests = [];
   const mediaService = createServer(async (req, res) => {
     let body = "";
@@ -128,19 +129,27 @@ test("validates and proxies Bilibili download jobs without exposing the service 
       authorization: req.headers.authorization,
       body: body ? JSON.parse(body) : null,
     });
-    const ready = req.method !== "POST";
+    const failed = req.url?.endsWith(failedJobId) ?? false;
+    const ready = req.method !== "POST" && !failed;
     res.writeHead(req.method === "POST" ? 202 : 200, {
       "content-type": "application/json",
     });
     res.end(JSON.stringify({
-      jobId,
-      status: ready ? "succeeded" : "queued",
-      phase: ready ? "ready" : "queued",
-      progress: ready ? 1 : 0,
+      jobId: failed ? failedJobId : jobId,
+      status: failed ? "failed" : ready ? "succeeded" : "queued",
+      phase: failed ? "downloading" : ready ? "ready" : "queued",
+      progress: failed ? 0.08 : ready ? 1 : 0,
       source: {
         bvid: "BV1nx411u79K",
-        ...(ready ? { title: "公开测试视频", durationSeconds: 80 } : {}),
+        ...(ready || failed ? { title: "公开测试视频", durationSeconds: 80 } : {}),
       },
+      ...(failed ? {
+        error: {
+          code: "DOWNLOAD_FAILED",
+          message: "B 站视频下载失败，请稍后重试。",
+          retryable: true,
+        },
+      } : {}),
       ...(ready ? {
         artifact: {
           downloadUrl: `http://127.0.0.1/media/${jobId}`,
@@ -182,13 +191,27 @@ test("validates and proxies Bilibili download jobs without exposing the service 
   assert.equal(statusPayload.artifact.sizeBytes, 1024);
   assert.equal(JSON.stringify(statusPayload).includes("media-service-test-token"), false);
 
+  const failedResponse = await request(
+    `/api/bilibili/jobs/${failedJobId}`,
+    undefined,
+    bindings,
+  );
+  assert.equal(failedResponse.status, 200);
+  const failedPayload = await failedResponse.json();
+  assert.equal(failedPayload.status, "failed");
+  assert.equal(failedPayload.error.code, "DOWNLOAD_FAILED");
+  assert.match(failedPayload.error.message, /下载失败/);
+
   const deleteResponse = await request(
     `/api/bilibili/jobs/${jobId}`,
     { method: "DELETE" },
     bindings,
   );
   assert.equal(deleteResponse.status, 200);
-  assert.deepEqual(upstreamRequests.map(({ method }) => method), ["POST", "GET", "DELETE"]);
+  assert.deepEqual(
+    upstreamRequests.map(({ method }) => method),
+    ["POST", "GET", "GET", "DELETE"],
+  );
   assert.deepEqual(upstreamRequests[0].body, { bvid: "BV1nx411u79K" });
   assert.ok(upstreamRequests.every(
     ({ authorization }) => authorization === "Bearer media-service-test-token",
@@ -384,6 +407,11 @@ test("removes disposable starter assets and keeps model choice decoupled", async
   assert.match(workbench, /analyzeVideo/);
   assert.match(workbench, /askVideo/);
   assert.match(workbench, /downloadBilibiliVideo/);
+  assert.match(workbench, /showDownloadedVideo\(downloaded\.file\)/);
+  assert.match(workbench, /aria-label="视频预览与下载"/);
+  assert.match(workbench, /download=\{videoPreview\.filename\}/);
+  assert.match(workbench, /"下载视频"/);
+  assert.match(workbench, /"打开\/下载原视频"/);
   assert.match(bilibiliClient, /\/api\/bilibili\/jobs/);
   assert.doesNotMatch(workbench, /demoVideoEngine/);
 
