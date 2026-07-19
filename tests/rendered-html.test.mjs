@@ -74,6 +74,7 @@ class FakeD1Database {
   constructor() {
     this.conversations = new Map();
     this.messages = [];
+    this.schemaStatements = [];
   }
 
   prepare(sql) {
@@ -176,6 +177,15 @@ class FakeD1Database {
 
   mutate(sql, parameters) {
     const query = normalizeSql(sql);
+
+    if (
+      query.startsWith("create table if not exists") ||
+      query.startsWith("create index if not exists") ||
+      query.startsWith("create unique index if not exists")
+    ) {
+      this.schemaStatements.push(query);
+      return successfulD1Result(0);
+    }
 
     if (query.startsWith("insert into conversations")) {
       const [
@@ -412,6 +422,12 @@ test("persists owner-scoped video conversations through their D1 lifecycle", asy
   assert.deepEqual(created.summary, summary);
   assert.equal(created.messages.length, 1);
   assert.equal(created.activeModel, "qwen3.5-omni-plus");
+  assert.equal(new Set(database.schemaStatements).size, 4);
+  assert.ok(
+    database.schemaStatements.every((statement) =>
+      statement.includes("if not exists"),
+    ),
+  );
 
   const listResponse = await request(
     "/api/conversations",

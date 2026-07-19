@@ -47,7 +47,7 @@ FrameNote（帧记）是视频 AI 总结与连续问答工作台。网站使用 
 - Python 编译及 31 项媒体服务单元测试通过。
 - 前端生产构建、ESLint、`git diff --check` 与 17 项页面/API/客户端回归测试通过。
 - `.env.local`、`.venv` 和媒体服务临时数据均已排除版本控制；`.env.example` 只保留空占位符。
-- 私有 Sites 项目已绑定在 `.openai/hosting.json`；D1 逻辑绑定为 `DB` 并包含 conversations/messages 迁移，R2 尚未绑定。
+- 私有 Sites 项目已绑定在 `.openai/hosting.json`；D1 逻辑绑定为 `DB` 并包含 conversations/messages 迁移，接口首次访问还会用 `IF NOT EXISTS` 幂等初始化表与索引，R2 尚未绑定。
 - 本轮 B站网站控制面已发布到 owner-only 私有 Sites；该站点未配置媒体服务运行时变量，因此线上 B站下载仍保持不可用状态。
 
 ## 正在进行

@@ -26,6 +26,38 @@ const MAX_CHAPTERS = 256;
 const MAX_EVIDENCE = 24;
 const MAX_AUDIO_CHANGES = 16;
 
+const CONVERSATION_SCHEMA_STATEMENTS = [
+  `CREATE TABLE IF NOT EXISTS conversations (
+     id TEXT PRIMARY KEY NOT NULL,
+     owner_id TEXT NOT NULL,
+     title TEXT NOT NULL,
+     source_kind TEXT NOT NULL,
+     source_json TEXT NOT NULL,
+     summary_json TEXT NOT NULL,
+     active_model TEXT,
+     created_at INTEGER NOT NULL,
+     updated_at INTEGER NOT NULL
+   )`,
+  `CREATE INDEX IF NOT EXISTS conversations_owner_updated_idx
+   ON conversations (owner_id, updated_at)`,
+  `CREATE TABLE IF NOT EXISTS conversation_messages (
+     id TEXT PRIMARY KEY NOT NULL,
+     conversation_id TEXT NOT NULL,
+     sequence INTEGER NOT NULL,
+     role TEXT NOT NULL,
+     content TEXT NOT NULL,
+     created_at INTEGER NOT NULL,
+     FOREIGN KEY (conversation_id) REFERENCES conversations(id) ON DELETE CASCADE
+   )`,
+  `CREATE UNIQUE INDEX IF NOT EXISTS conversation_messages_sequence_idx
+   ON conversation_messages (conversation_id, sequence)`,
+] as const;
+
+const initializedConversationDatabases = new WeakMap<
+  D1Database,
+  Promise<void>
+>();
+
 const SOURCE_KEYS = [
   "kind",
   "title",
@@ -191,13 +223,13 @@ export function parseConversationId(value: string): string {
 export async function listConversations(
   ownerId: string,
 ): Promise<ConversationListItem[]> {
-  const result = await database()
-    .prepare(
-      `SELECT id, title, source_kind, created_at, updated_at
-       FROM conversations
-       WHERE owner_id = ?
-       ORDER BY updated_at DESC, id DESC`,
-    )
+  const databaseBinding = await database();
+  const result = await databaseBinding.prepare(
+    `SELECT id, title, source_kind, created_at, updated_at
+     FROM conversations
+     WHERE owner_id = ?
+     ORDER BY updated_at DESC, id DESC`,
+  )
     .bind(ownerId)
     .all<ConversationListRow>();
 
@@ -208,7 +240,7 @@ export async function createConversation(
   ownerId: string,
   input: CreateConversationInput,
 ): Promise<ConversationDetail> {
-  const databaseBinding = database();
+  const databaseBinding = await database();
   const conversationId = crypto.randomUUID();
   const now = Date.now();
   const updatedAt = now + Math.max(0, input.messages.length - 1);
@@ -278,25 +310,24 @@ export async function getConversation(
   ownerId: string,
   conversationId: string,
 ): Promise<ConversationDetail> {
-  const row = await database()
-    .prepare(
-      `SELECT id, title, source_kind, source_json, summary_json, active_model,
-              created_at, updated_at
-       FROM conversations
-       WHERE id = ? AND owner_id = ?`,
-    )
+  const databaseBinding = await database();
+  const row = await databaseBinding.prepare(
+    `SELECT id, title, source_kind, source_json, summary_json, active_model,
+            created_at, updated_at
+     FROM conversations
+     WHERE id = ? AND owner_id = ?`,
+  )
     .bind(conversationId, ownerId)
     .first<ConversationRow>();
 
   if (!row) throw conversationNotFound();
 
-  const messageResult = await database()
-    .prepare(
-      `SELECT id, role, content, created_at
-       FROM conversation_messages
-       WHERE conversation_id = ?
-       ORDER BY sequence ASC`,
-    )
+  const messageResult = await databaseBinding.prepare(
+    `SELECT id, role, content, created_at
+     FROM conversation_messages
+     WHERE conversation_id = ?
+     ORDER BY sequence ASC`,
+  )
     .bind(conversationId)
     .all<MessageRow>();
 
@@ -325,23 +356,22 @@ export async function renameConversation(
   title: string,
 ): Promise<ConversationListItem> {
   await requireOwnedConversation(ownerId, conversationId);
+  const databaseBinding = await database();
   const updatedAt = Date.now();
-  const result = await database()
-    .prepare(
-      `UPDATE conversations
-       SET title = ?, updated_at = ?
-       WHERE id = ? AND owner_id = ?`,
-    )
+  const result = await databaseBinding.prepare(
+    `UPDATE conversations
+     SET title = ?, updated_at = ?
+     WHERE id = ? AND owner_id = ?`,
+  )
     .bind(title, updatedAt, conversationId, ownerId)
     .run();
   assertStatementSucceeded(result);
 
-  const row = await database()
-    .prepare(
-      `SELECT id, title, source_kind, created_at, updated_at
-       FROM conversations
-       WHERE id = ? AND owner_id = ?`,
-    )
+  const row = await databaseBinding.prepare(
+    `SELECT id, title, source_kind, created_at, updated_at
+     FROM conversations
+     WHERE id = ? AND owner_id = ?`,
+  )
     .bind(conversationId, ownerId)
     .first<ConversationListRow>();
   if (!row) throw conversationNotFound();
@@ -353,7 +383,7 @@ export async function deleteConversation(
   conversationId: string,
 ): Promise<void> {
   await requireOwnedConversation(ownerId, conversationId);
-  const databaseBinding = database();
+  const databaseBinding = await database();
   const results = await databaseBinding.batch([
     databaseBinding
       .prepare(
@@ -376,7 +406,7 @@ export async function appendConversationMessages(
   input: AppendMessagesInput,
 ): Promise<ConversationMessage[]> {
   await requireOwnedConversation(ownerId, conversationId);
-  const databaseBinding = database();
+  const databaseBinding = await database();
   const now = Date.now();
   const createdMessages = input.messages.map((message, index) => ({
     id: crypto.randomUUID(),
@@ -458,18 +488,37 @@ export function conversationJson(data: unknown, init?: ResponseInit): Response {
   return noStoreJson(data, init);
 }
 
-function database(): D1Database {
+async function database(): Promise<D1Database> {
   const binding = runtimeBinding<D1Database>("DB");
   if (!binding) {
     throw new Error(
       "Cloudflare D1 binding `DB` is unavailable. Set .openai/hosting.json d1 to `DB`.",
     );
   }
+
+  let initialization = initializedConversationDatabases.get(binding);
+  if (!initialization) {
+    initialization = binding
+      .batch(
+        CONVERSATION_SCHEMA_STATEMENTS.map((statement) =>
+          binding.prepare(statement),
+        ),
+      )
+      .then(assertBatchSucceeded)
+      .catch((error: unknown) => {
+        initializedConversationDatabases.delete(binding);
+        throw error;
+      });
+    initializedConversationDatabases.set(binding, initialization);
+  }
+
+  await initialization;
   return binding;
 }
 
 async function requireOwnedConversation(ownerId: string, conversationId: string) {
-  const row = await database()
+  const databaseBinding = await database();
+  const row = await databaseBinding
     .prepare("SELECT id FROM conversations WHERE id = ? AND owner_id = ?")
     .bind(conversationId, ownerId)
     .first<{ id: string }>();
