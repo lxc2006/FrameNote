@@ -19,11 +19,10 @@ export interface BilibiliJobSource {
   durationSeconds?: number;
 }
 
-export type BilibiliVideoQuality = 720 | 1080;
+export type BilibiliDownloadVariant = "preview" | "analysis";
 
-export const BILIBILI_VIDEO_QUALITIES = [720, 1080] as const;
-
-export const DEFAULT_BILIBILI_VIDEO_QUALITY: BilibiliVideoQuality = 720;
+export const DEFAULT_BILIBILI_DOWNLOAD_VARIANT: BilibiliDownloadVariant = "preview";
+export const BILIBILI_ANALYSIS_DOWNLOAD_VARIANT: BilibiliDownloadVariant = "analysis";
 
 export interface BilibiliArtifact {
   downloadUrl: string;
@@ -32,6 +31,7 @@ export interface BilibiliArtifact {
   sizeBytes: number;
   sha256: string;
   expiresAt: string;
+  width?: number;
   height?: number;
 }
 
@@ -53,7 +53,7 @@ export interface BilibiliJobSnapshot {
 
 export interface CreateBilibiliJobRequest {
   bvid: string;
-  maxHeight: BilibiliVideoQuality;
+  variant: BilibiliDownloadVariant;
 }
 
 export interface BilibiliApiErrorBody {

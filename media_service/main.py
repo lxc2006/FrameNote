@@ -180,6 +180,7 @@ def job_response(request: Request, job: JobRecord) -> JobResponse:
             sizeBytes=job.artifact_size_bytes,
             sha256=job.artifact_sha256,
             expiresAt=utc_iso(link_expires),
+            width=job.artifact_width,
             height=job.artifact_height,
         )
     error_response = (
@@ -253,7 +254,7 @@ async def create_job(
 ) -> JobResponse:
     manager = manager_from_request(request)
     try:
-        job = await manager.create(body.bvid, body.maxHeight)
+        job = await manager.create(body.bvid, body.variant)
     except QueueCapacityError as exc:
         raise api_error(
             status.HTTP_429_TOO_MANY_REQUESTS,

@@ -613,58 +613,6 @@ textarea:focus-visible {
   color: #b64343;
 }
 
-.quality-selector {
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  margin: 12px 2px 0;
-  padding: 10px;
-  border: 1px solid var(--line);
-  border-radius: 12px;
-  background: var(--paper-soft);
-  gap: 12px;
-}
-
-.quality-selector > span {
-  color: var(--muted);
-  font-size: max(11px, calc(var(--ui-font-size) - 3px));
-  font-weight: 720;
-}
-
-.quality-selector > div {
-  display: inline-flex;
-  padding: 3px;
-  border-radius: 10px;
-  background: var(--paper);
-  gap: 3px;
-}
-
-.quality-selector button {
-  min-height: 30px;
-  padding: 0 10px;
-  border-radius: 8px;
-  background: transparent;
-  color: var(--muted);
-  cursor: pointer;
-  font-size: max(11px, calc(var(--ui-font-size) - 3px));
-  font-weight: 760;
-}
-
-.quality-selector button.active {
-  background: var(--accent);
-  color: white;
-}
-
-.quality-selector button:hover:not(:disabled):not(.active) {
-  background: var(--accent-soft);
-  color: var(--accent-deep);
-}
-
-.quality-selector button:disabled {
-  cursor: not-allowed;
-  opacity: 0.55;
-}
-
 .inline-notice {
   display: flex;
   align-items: flex-start;
@@ -2066,15 +2014,8 @@ html[data-theme="dark"] .fetch-video-action:hover:not(:disabled) {
   color: #ffffff;
 }
 
-html[data-theme="dark"] .quality-selector,
-html[data-theme="dark"] .quality-selector > div,
 html[data-theme="dark"] .video-preview-meta span {
   background: #111112;
-}
-
-html[data-theme="dark"] .quality-selector button.active {
-  background: #e7f4ff;
-  color: #080d12;
 }
 
 html[data-theme="dark"] .video-download-action {

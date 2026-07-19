@@ -1,12 +1,10 @@
 import type {
   BilibiliApiErrorBody,
+  BilibiliDownloadVariant,
   BilibiliJobSnapshot,
   CreateBilibiliJobRequest,
 } from "../bilibili-api";
-import {
-  DEFAULT_BILIBILI_VIDEO_QUALITY,
-  BILIBILI_VIDEO_QUALITIES,
-} from "../bilibili-api";
+import { DEFAULT_BILIBILI_DOWNLOAD_VARIANT } from "../bilibili-api";
 import {
   BilibiliConfigurationError,
   getBilibiliServiceConfig,
@@ -30,7 +28,10 @@ const JOB_PHASES = new Set([
   "merging",
   "ready",
 ]);
-const SUPPORTED_MAX_HEIGHTS = new Set<number>(BILIBILI_VIDEO_QUALITIES);
+const SUPPORTED_DOWNLOAD_VARIANTS = new Set<BilibiliDownloadVariant>([
+  "preview",
+  "analysis",
+]);
 
 export class BilibiliInputError extends Error {
   constructor(message: string) {
@@ -72,18 +73,21 @@ export async function readCreateBilibiliJobRequest(
     throw new BilibiliInputError("bvid 必须是有效的 BV 号。");
   }
 
-  const maxHeightValue = (value as Record<string, unknown>).maxHeight;
-  const maxHeight =
-    maxHeightValue === undefined
-      ? DEFAULT_BILIBILI_VIDEO_QUALITY
-      : Number(maxHeightValue);
-  if (!Number.isInteger(maxHeight) || !SUPPORTED_MAX_HEIGHTS.has(maxHeight)) {
-    throw new BilibiliInputError("maxHeight 只支持 720 或 1080。");
+  const variantValue = (value as Record<string, unknown>).variant;
+  const variant =
+    variantValue === undefined
+      ? DEFAULT_BILIBILI_DOWNLOAD_VARIANT
+      : variantValue;
+  if (
+    typeof variant !== "string" ||
+    !SUPPORTED_DOWNLOAD_VARIANTS.has(variant as BilibiliDownloadVariant)
+  ) {
+    throw new BilibiliInputError("variant 只支持 preview 或 analysis。");
   }
 
   return {
     bvid: `BV${bvid.trim().slice(2)}`,
-    maxHeight: maxHeight as CreateBilibiliJobRequest["maxHeight"],
+    variant: variant as CreateBilibiliJobRequest["variant"],
   };
 }
 
@@ -264,11 +268,20 @@ function isArtifact(value: unknown) {
   if (!value || typeof value !== "object" || Array.isArray(value)) return false;
   const artifact = value as Record<string, unknown>;
   if (
+    artifact.width !== undefined &&
+    (typeof artifact.width !== "number" ||
+      !Number.isSafeInteger(artifact.width) ||
+      artifact.width <= 0 ||
+      artifact.width > 4320)
+  ) {
+    return false;
+  }
+  if (
     artifact.height !== undefined &&
     (typeof artifact.height !== "number" ||
       !Number.isSafeInteger(artifact.height) ||
       artifact.height <= 0 ||
-      artifact.height > 2160)
+      artifact.height > 4320)
   ) {
     return false;
   }

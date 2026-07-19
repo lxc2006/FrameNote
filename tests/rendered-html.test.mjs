@@ -651,7 +651,7 @@ test("validates and proxies Bilibili download jobs without exposing the service 
     {
       method: "POST",
       headers: { "content-type": "application/json" },
-      body: JSON.stringify({ bvid: "BV1nx411u79K", maxHeight: 1080 }),
+      body: JSON.stringify({ bvid: "BV1nx411u79K", variant: "preview" }),
     },
     {
       BILIBILI_MEDIA_SERVICE_URL: "http://media.example.com",
@@ -724,7 +724,7 @@ test("validates and proxies Bilibili download jobs without exposing the service 
     {
       method: "POST",
       headers: { "content-type": "application/json" },
-      body: JSON.stringify({ bvid: "BV1nx411u79K", maxHeight: 1080 }),
+      body: JSON.stringify({ bvid: "BV1nx411u79K", variant: "analysis" }),
     },
     bindings,
   );
@@ -761,7 +761,7 @@ test("validates and proxies Bilibili download jobs without exposing the service 
   );
   assert.deepEqual(upstreamRequests[0].body, {
     bvid: "BV1nx411u79K",
-    maxHeight: 1080,
+    variant: "analysis",
   });
   assert.ok(upstreamRequests.every(
     ({ authorization }) => authorization === "Bearer media-service-test-token",
@@ -1124,8 +1124,9 @@ test("removes disposable starter assets and keeps model choice decoupled", async
   assert.match(workbench, /aria-label="视频预览与下载"/);
   assert.match(workbench, /handleFetchVideo/);
   assert.match(workbench, /获取视频/);
-  assert.match(workbench, /BILIBILI_VIDEO_QUALITIES/);
-  assert.match(workbench, /最高 \{height\}p/);
+  assert.match(workbench, /BILIBILI_ANALYSIS_DOWNLOAD_VARIANT/);
+  assert.match(workbench, /最高兼容清晰度/);
+  assert.doesNotMatch(workbench, /BILIBILI_VIDEO_QUALITIES|最高 \{height\}p/);
   assert.match(workbench, /download=\{videoPreview\.filename\}/);
   assert.match(workbench, /"下载视频"/);
   assert.match(workbench, /"打开\/下载原视频"/);

@@ -65,7 +65,7 @@ test("surfaces a Bilibili job error instead of rejecting its snapshot", async (t
     assert.deepEqual(requests.map(({ method }) => method), ["POST", "DELETE"]);
     assert.deepEqual(requests[0].body, {
       bvid: "BV1nx411u79K",
-      maxHeight: 720,
+      variant: "preview",
     });
   }
 });
@@ -101,7 +101,8 @@ test("returns a complete File that can back preview and manual download", async 
       sizeBytes: mediaBytes.byteLength,
       sha256: "0".repeat(64),
       expiresAt: "2099-01-01T00:00:00Z",
-      height: 1080,
+      width: 720,
+      height: 1280,
     },
   };
 
@@ -138,15 +139,16 @@ test("returns a complete File that can back preview and manual download", async 
     `/lib/client/bilibili-client.ts?successful-job=${Date.now()}`,
   );
   const result = await downloadBilibiliVideo("BV1nx411u79K", {
-    maxHeight: 1080,
+    variant: "analysis",
     onProgress: (update) => progressUpdates.push(update),
   });
 
   assert.equal(result.title, snapshot.source.title);
   assert.equal(result.durationSeconds, snapshot.source.durationSeconds);
   assert.equal(result.sizeBytes, mediaBytes.byteLength);
-  assert.equal(result.requestedHeight, 1080);
-  assert.equal(result.height, 1080);
+  assert.equal(result.variant, "analysis");
+  assert.equal(result.width, 720);
+  assert.equal(result.height, 1280);
   assert.equal(result.file.name, snapshot.artifact.filename);
   assert.equal(result.file.type, snapshot.artifact.mimeType);
   assert.deepEqual(
@@ -161,6 +163,6 @@ test("returns a complete File that can back preview and manual download", async 
   );
   assert.deepEqual(requests[0].body, {
     bvid: "BV1nx411u79K",
-    maxHeight: 1080,
+    variant: "analysis",
   });
 });

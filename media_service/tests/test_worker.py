@@ -39,6 +39,7 @@ class WorkerValidationTests(unittest.TestCase):
                 {
                     "codec_type": "video",
                     "codec_name": "h264",
+                    "width": 1280,
                     "height": 720,
                 },
                 {"codec_type": "audio", "codec_name": "aac"},
@@ -53,7 +54,8 @@ class WorkerValidationTests(unittest.TestCase):
         for branch in branches:
             with self.subTest(branch=branch):
                 self.assertIn("[ext=mp4]", branch)
-                self.assertIn("[height<=720]", branch)
+                self.assertIn("[width<=1280]", branch)
+                self.assertIn("[height<=1280]", branch)
                 self.assertIn(
                     "[vcodec~='^(?:h264|avc[13](?:\\.|$))']", branch
                 )
@@ -61,19 +63,45 @@ class WorkerValidationTests(unittest.TestCase):
                     "[acodec~='^(?:aac|mp4a\\.40\\.)']", branch
                 )
 
-    def test_browser_format_can_raise_height_cap_to_1080(self) -> None:
-        format_selector = browser_compatible_format(1080)
+    def test_preview_format_uses_highest_compatible_resolution(self) -> None:
+        format_selector = browser_compatible_format("preview")
         branches = format_selector.split("/")
         self.assertEqual(len(branches), 2)
         for branch in branches:
             with self.subTest(branch=branch):
-                self.assertIn("[height<=1080]", branch)
+                self.assertNotIn("[width<=", branch)
+                self.assertNotIn("[height<=", branch)
                 self.assertIn(
                     "[vcodec~='^(?:h264|avc[13](?:\\.|$))']", branch
                 )
                 self.assertIn(
                     "[acodec~='^(?:aac|mp4a\\.40\\.)']", branch
                 )
+
+    def test_analysis_format_keeps_portrait_720_by_1280_streams(self) -> None:
+        formats = [
+            self.format_info(
+                "portrait-852", "mp4", 852, "avc1.640033", "none", width=480
+            ),
+            self.format_info(
+                "portrait-1280", "mp4", 1280, "avc1.640033", "none", width=720
+            ),
+            self.format_info(
+                "portrait-1920", "mp4", 1920, "avc1.640033", "none", width=1080
+            ),
+            self.format_info("aac", "m4a", None, "none", "mp4a.40.2"),
+        ]
+        downloader = YoutubeDL({"quiet": True, "no_warnings": True})
+        selected = downloader._select_formats(
+            formats,
+            downloader.build_format_selector(BROWSER_COMPATIBLE_FORMAT),
+        )
+
+        self.assertEqual(len(selected), 1)
+        self.assertEqual(
+            [item["format_id"] for item in selected[0]["requested_formats"]],
+            ["portrait-1280", "aac"],
+        )
 
     def test_browser_format_semantically_prefers_avc_and_aac(self) -> None:
         formats = [
@@ -213,7 +241,7 @@ class WorkerValidationTests(unittest.TestCase):
                 stderr="",
             )
             with patch("media_service.worker.subprocess.run", return_value=probe_result) as run:
-                size, sha256, height = verify_artifact(
+                size, sha256, width, height = verify_artifact(
                     "ffprobe",
                     artifact,
                     max_duration=60,
@@ -224,9 +252,11 @@ class WorkerValidationTests(unittest.TestCase):
             entries = command[command.index("-show_entries") + 1]
             self.assertIn("format_name", entries)
             self.assertIn("codec_name", entries)
+            self.assertIn("width", entries)
             self.assertIn("height", entries)
             self.assertEqual(size, artifact.stat().st_size)
             self.assertEqual(len(sha256), 64)
+            self.assertEqual(width, 1280)
             self.assertEqual(height, 720)
 
     def test_verify_artifact_rejects_av1_from_ffprobe(self) -> None:
@@ -284,10 +314,11 @@ class WorkerValidationTests(unittest.TestCase):
                 self.assertFalse(error.retryable)
 
     @staticmethod
-    def format_info(format_id, ext, height, vcodec, acodec):
+    def format_info(format_id, ext, height, vcodec, acodec, width=None):
         return {
             "format_id": format_id,
             "ext": ext,
+            "width": width if width is not None else (round(height * 16 / 9) if height else None),
             "height": height,
             "vcodec": vcodec,
             "acodec": acodec,

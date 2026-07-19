@@ -12,6 +12,7 @@ JobStatus = Literal[
     "queued", "running", "succeeded", "failed", "cancelled", "expired"
 ]
 JobPhase = Literal["queued", "resolving", "downloading", "merging", "ready"]
+BilibiliDownloadVariant = Literal["preview", "analysis"]
 
 
 def utc_iso(timestamp: float) -> str:
@@ -26,20 +27,13 @@ class CreateJobRequest(BaseModel):
     model_config = ConfigDict(extra="forbid", str_strip_whitespace=False)
 
     bvid: str = Field(min_length=12, max_length=12)
-    maxHeight: int = Field(default=720)
+    variant: BilibiliDownloadVariant = "preview"
 
     @field_validator("bvid")
     @classmethod
     def validate_bvid(cls, value: str) -> str:
         if not is_valid_bvid(value):
             raise ValueError("bvid must be a 12-character BVID such as BV1xx411c7mD")
-        return value
-
-    @field_validator("maxHeight")
-    @classmethod
-    def validate_max_height(cls, value: int) -> int:
-        if value not in {720, 1080}:
-            raise ValueError("maxHeight must be 720 or 1080")
         return value
 
 
@@ -56,6 +50,7 @@ class ArtifactResponse(BaseModel):
     sizeBytes: int
     sha256: str
     expiresAt: str
+    width: int | None = None
     height: int | None = None
 
 

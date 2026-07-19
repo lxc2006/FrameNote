@@ -64,7 +64,7 @@ class JobRecordTests(unittest.TestCase):
                 command[:5],
                 [sys.executable, "-I", "-u", "-X", "utf8=1"],
             )
-            self.assertEqual(command[command.index("--max-height") + 1], "720")
+            self.assertEqual(command[command.index("--variant") + 1], "preview")
             environment = manager._worker_environment()
             self.assertEqual(environment["PYTHONIOENCODING"], "utf-8")
             self.assertEqual(environment["PYTHONUTF8"], "1")
