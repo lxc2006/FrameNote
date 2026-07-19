@@ -13,7 +13,6 @@ import {
   extractBvid,
   formatDuration,
   formatFileSize,
-  type SummaryAudioStatus,
   type VideoModelContext,
   type VideoSourceDescriptor,
   type VideoSummary,
@@ -74,12 +73,6 @@ const preprocessingStageIndexes: Record<VideoPreprocessingStage, number> = {
 
 const suggestions = ["这个视频的核心观点是什么？", "按时间线梳理章节", "给我三个行动建议"];
 
-const audioStatusLabels: Record<SummaryAudioStatus, string> = {
-  analyzed: "已分析音轨",
-  silent: "音轨无可辨声音",
-  unavailable: "音轨不可用",
-};
-
 function fileExtension(filename: string) {
   return filename.split(".").pop()?.toLowerCase() ?? "";
 }
@@ -124,6 +117,31 @@ function formatConversationDate(timestamp: number) {
     hour: "2-digit",
     minute: "2-digit",
   }).format(date);
+}
+
+function summaryParagraphs(value: string) {
+  return value
+    .split(/\r?\n+/)
+    .map((paragraph) => paragraph.trim())
+    .filter(Boolean);
+}
+
+function summaryTimeline(summary: VideoSummary) {
+  if (summary.keyPoints.length > 0) {
+    return summary.keyPoints.map((point, index) => ({
+      key: `point-${index}-${point.title}`,
+      time: point.time ?? summary.chapters[index]?.time ?? "时间未知",
+      title: point.title,
+      detail: point.detail,
+    }));
+  }
+
+  return summary.chapters.map((chapter, index) => ({
+    key: `chapter-${index}-${chapter.time}-${chapter.title}`,
+    time: chapter.time,
+    title: chapter.title,
+    detail: chapter.description,
+  }));
 }
 
 function stagesFor(source: VideoSourceDescriptor) {
@@ -197,6 +215,14 @@ export default function VideoWorkbench() {
   const directVideoUrl = useMemo(
     () => publicVideoUrl(bilibiliInput),
     [bilibiliInput],
+  );
+  const overviewParagraphs = useMemo(
+    () => (summary ? summaryParagraphs(summary.overview) : []),
+    [summary],
+  );
+  const timelineItems = useMemo(
+    () => (summary ? summaryTimeline(summary) : []),
+    [summary],
   );
 
   const pendingSource = useMemo<VideoSourceDescriptor | null>(() => {
@@ -1214,8 +1240,8 @@ export default function VideoWorkbench() {
                 <h3>视频内容，会在这里沉淀下来。</h3>
                 <div className="empty-capabilities" aria-label="可生成的内容">
                   <span>内容概览</span>
-                  <span>关键观点</span>
-                  <span>时间章节</span>
+                  <span>时间线</span>
+                  <span>要点分析</span>
                   <span>后续问答</span>
                 </div>
               </div>
@@ -1314,10 +1340,7 @@ export default function VideoWorkbench() {
                       </span>
                     ) : null}
                     <span>
-                      <strong>{summary.keyPoints.length}</strong> 个要点
-                    </span>
-                    <span>
-                      <strong>{summary.chapters.length}</strong> 个章节
+                      <strong>{timelineItems.length}</strong> 个时间点
                     </span>
                     <span>
                       <strong>{activeModel ?? "Qwen"}</strong> 分析引擎
@@ -1326,103 +1349,27 @@ export default function VideoWorkbench() {
 
                   <section className="summary-section">
                     <h4>内容概览</h4>
-                    <p className="overview-copy">{summary.overview}</p>
-                  </section>
-
-                  {summary.audioAnalysis ? (
-                    <section className="summary-section">
-                      <h4>声音与音乐</h4>
-                      <div
-                        className={`audio-analysis audio-analysis-${summary.audioAnalysis.status}`}
-                      >
-                        <div className="audio-analysis-heading">
-                          <span>{audioStatusLabels[summary.audioAnalysis.status]}</span>
-                        </div>
-                        <p className="audio-analysis-summary">
-                          {summary.audioAnalysis.summary}
-                        </p>
-
-                        {summary.audioAnalysis.status === "analyzed" ? (
-                          <dl className="audio-detail-list">
-                            {summary.audioAnalysis.speech ? (
-                              <div>
-                                <dt>讲话 / 人声</dt>
-                                <dd>{summary.audioAnalysis.speech}</dd>
-                              </div>
-                            ) : null}
-                            {summary.audioAnalysis.music ? (
-                              <div>
-                                <dt>音乐</dt>
-                                <dd>{summary.audioAnalysis.music}</dd>
-                              </div>
-                            ) : null}
-                            {summary.audioAnalysis.soundscape ? (
-                              <div>
-                                <dt>环境声</dt>
-                                <dd>{summary.audioAnalysis.soundscape}</dd>
-                              </div>
-                            ) : null}
-                          </dl>
-                        ) : null}
-
-                        {summary.audioAnalysis.temporalChanges.length > 0 ? (
-                          <div className="audio-change-list">
-                            <strong>声音变化</strong>
-                            {summary.audioAnalysis.temporalChanges.map((change) => (
-                              <div
-                                className="audio-change-row"
-                                key={`${change.time}-${change.description}`}
-                              >
-                                <time>{change.time}</time>
-                                <p>{change.description}</p>
-                              </div>
-                            ))}
-                          </div>
-                        ) : null}
-
-                        {summary.audioAnalysis.uncertainty ? (
-                          <p className="audio-uncertainty">
-                            不确定性：{summary.audioAnalysis.uncertainty}
-                          </p>
-                        ) : null}
-                      </div>
-                    </section>
-                  ) : null}
-
-                  <section className="summary-section">
-                    <h4>关键观点</h4>
-                    <ol className="key-point-list">
-                      {summary.keyPoints.map((point, index) => (
-                        <li key={point.title}>
-                          <span>{String(index + 1).padStart(2, "0")}</span>
-                          <div>
-                            <strong>{point.title}</strong>
-                            <p>{point.detail}</p>
-                          </div>
-                        </li>
+                    <div className="overview-copy">
+                      {overviewParagraphs.map((paragraph) => (
+                        <p key={paragraph}>{paragraph}</p>
                       ))}
-                    </ol>
+                    </div>
                   </section>
 
                   <section className="summary-section">
-                    <h4>章节时间线</h4>
-                    <div className="chapter-list">
-                      {summary.chapters.map((chapter) => (
-                        <div className="chapter-row" key={`${chapter.time}-${chapter.title}`}>
-                          <time>{chapter.time}</time>
+                    <h4>时间线</h4>
+                    <div className="timeline-list">
+                      {timelineItems.map((item) => (
+                        <div className="timeline-row" key={item.key}>
+                          <time>{item.time}</time>
                           <div>
-                            <strong>{chapter.title}</strong>
-                            <p>{chapter.description}</p>
+                            <strong>{item.title}</strong>
+                            <p>{item.detail}</p>
                           </div>
                         </div>
                       ))}
                     </div>
                   </section>
-
-                  <blockquote className="takeaway-block">
-                    <span>一句话结论</span>
-                    <p>{summary.takeaway}</p>
-                  </blockquote>
                 </article>
 
                 <div className="chat-divider">

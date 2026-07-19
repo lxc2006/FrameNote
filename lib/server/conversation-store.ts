@@ -657,14 +657,17 @@ function parseSummary(value: unknown, fallbackTitle: string): VideoSummary {
   );
   stringValue(object.title, "summary.title", 300);
   stringValue(object.overview, "summary.overview", 40_000);
-  stringValue(object.takeaway, "summary.takeaway", 10_000);
+  if (object.takeaway !== undefined) {
+    stringValue(object.takeaway, "summary.takeaway", 10_000);
+  }
   validateObjectArray(
     object.keyPoints,
     "summary.keyPoints",
     1,
     MAX_KEY_POINTS,
-    ["title", "detail"],
+    ["time", "title", "detail"],
     (item, field) => {
+      if (item.time !== undefined) stringValue(item.time, `${field}.time`, 64);
       stringValue(item.title, `${field}.title`, 1_000);
       stringValue(item.detail, `${field}.detail`, 20_000);
     },

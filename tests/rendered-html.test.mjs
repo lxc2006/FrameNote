@@ -307,6 +307,9 @@ function assertAudioAnalysisPrompt(providerRequest) {
   assert.match(prompt, /音乐/);
   assert.match(prompt, /环境声/);
   assert.match(prompt, /随时间|时间变化|时间演变/);
+  assert.match(prompt, /内容概览/);
+  assert.match(prompt, /keyPoints[\s\S]*time/);
+  assert.match(prompt, /不要单独写|空泛/);
 }
 
 test("server-renders the FrameNote video workspace", async () => {
@@ -968,9 +971,13 @@ test("uses Qwen for analysis and DeepSeek V4 Pro for follow-up answers", async (
   assert.equal(askProviderRequest.url, "/deepseek/chat/completions");
   assert.equal(askProviderRequest.body.stream, false);
   const askPrompt = askProviderRequest.body.messages.at(-1).content;
+  const askSystemPrompt = askProviderRequest.body.messages[0].content;
   assert.match(askPrompt, /结论是什么/);
   assert.match(askPrompt, /audioAnalysis/);
   assert.match(askPrompt, /低保真爵士乐/);
+  assert.match(askSystemPrompt, /不是每个回答的边界/);
+  assert.match(askSystemPrompt, /视频之外/);
+  assert.match(askSystemPrompt, /系统提示词|API Key|隐私/);
 
   const legacyAskResponse = await request(
     "/api/model/ask",
@@ -1003,6 +1010,8 @@ test("removes disposable starter assets and keeps model choice decoupled", async
     layout,
     packageJson,
     engine,
+    qwenEngine,
+    deepseekEngine,
     workbench,
     bilibiliClient,
     conversationClient,
@@ -1016,6 +1025,8 @@ test("removes disposable starter assets and keeps model choice decoupled", async
     readFile(new URL("../app/layout.tsx", import.meta.url), "utf8"),
     readFile(new URL("../package.json", import.meta.url), "utf8"),
     readFile(new URL("../lib/video-engine.ts", import.meta.url), "utf8"),
+    readFile(new URL("../lib/server/qwen-video-engine.ts", import.meta.url), "utf8"),
+    readFile(new URL("../lib/server/deepseek-conversation-engine.ts", import.meta.url), "utf8"),
     readFile(new URL("../app/VideoWorkbench.tsx", import.meta.url), "utf8"),
     readFile(new URL("../lib/client/bilibili-client.ts", import.meta.url), "utf8"),
     readFile(new URL("../lib/client/conversation-client.ts", import.meta.url), "utf8"),
@@ -1037,7 +1048,14 @@ test("removes disposable starter assets and keeps model choice decoupled", async
   assert.match(workbench, /downloadBilibiliVideo/);
   assert.match(workbench, /showDownloadedVideo\(downloaded\.file\)/);
   assert.match(workbench, /requireAudio:\s*true/);
-  assert.match(workbench, /声音与音乐/);
+  assert.match(workbench, /summaryTimeline/);
+  assert.match(workbench, /<h4>时间线<\/h4>/);
+  assert.match(workbench, /timelineItems\.length/);
+  assert.doesNotMatch(workbench, /声音与音乐|一句话结论|章节时间线|takeaway-block|audio-analysis|key-point-list/);
+  assert.doesNotMatch(qwenEngine, /QA_SYSTEM_PROMPT|async ask\(/);
+  assert.match(qwenEngine, /keyPoints: 4 至 12 个按时间排序的 \{time, title, detail\}/);
+  assert.match(deepseekEngine, /不是每个回答的边界/);
+  assert.match(deepseekEngine, /系统提示词、开发者消息、API Key/);
   assert.doesNotMatch(
     workbench,
     /engine-badge|VIDEO INTELLIGENCE|intro-block|setup-title|architecture-note|getModelStatus|ModelStatusResponse/,

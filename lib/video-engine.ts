@@ -11,6 +11,7 @@ export interface VideoSourceDescriptor {
 }
 
 export interface SummaryPoint {
+  time?: string;
   title: string;
   detail: string;
 }
@@ -49,6 +50,7 @@ export interface VideoSummary {
   overview: string;
   keyPoints: SummaryPoint[];
   chapters: SummaryChapter[];
+  /** Kept for older saved summaries; new UI no longer presents this separately. */
   takeaway: string;
   /**
    * 新生成的总结会包含独立声音分析；保持可选以兼容旧的已保存总结。
@@ -89,13 +91,6 @@ export interface VideoEngine {
     source: VideoSourceDescriptor,
     context?: VideoModelContext,
   ): Promise<VideoSummary>;
-  ask(
-    question: string,
-    source: VideoSourceDescriptor,
-    summary: VideoSummary,
-    context?: VideoModelContext,
-    history?: VideoConversationMessage[],
-  ): Promise<string>;
 }
 
 const wait = (milliseconds: number) =>
@@ -166,42 +161,11 @@ function createDemoSummary(source: VideoSourceDescriptor): VideoSummary {
   };
 }
 
-function answerFromDemoSummary(
-  question: string,
-  source: VideoSourceDescriptor,
-  summary: VideoSummary,
-) {
-  const normalized = question.trim().toLowerCase();
-
-  if (/核心|重点|观点|讲了什么|主要/.test(normalized)) {
-    return `当前演示总结提炼了 ${summary.keyPoints.length} 个重点：${summary.keyPoints
-      .slice(0, 3)
-      .map((point) => point.title)
-      .join("、")}。接入真实模型后，我会基于《${source.title}》的转写和关键帧逐条给出证据。`;
-  }
-
-  if (/章节|时间|时间线|结构/.test(normalized)) {
-    return `演示章节包括：${summary.chapters
-      .map((chapter) => `${chapter.time} ${chapter.title}`)
-      .join("；")}。真实处理时，时间点会由分段转写结果生成，并可直接跳转回视频。`;
-  }
-
-  if (/结论|行动|下一步|建议/.test(normalized)) {
-    return `当前结论是：${summary.takeaway} 这是演示适配器的回答，连接真实视频 AI 后会替换为基于原视频内容的建议。`;
-  }
-
-  return `我已经记录了你关于“${question.trim()}”的问题。当前会话运行在演示适配器上，还没有读取视频的真实语义；接入模型后，这个问题会连同《${source.title}》的分段转写、关键帧和总结上下文一起发送给视频问答服务。`;
-}
-
 export const demoVideoEngine: VideoEngine = {
   mode: "demo",
   async analyze(source) {
     await wait(260);
     return createDemoSummary(source);
-  },
-  async ask(question, source, summary) {
-    await wait(520);
-    return answerFromDemoSummary(question, source, summary);
   },
 };
 
