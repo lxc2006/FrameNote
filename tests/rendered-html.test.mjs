@@ -28,6 +28,268 @@ async function request(pathname, init, bindings = {}) {
   );
 }
 
+function normalizeSql(sql) {
+  return sql.replace(/\s+/g, " ").trim().toLowerCase();
+}
+
+function successfulD1Result(changes = 1) {
+  return {
+    success: true,
+    meta: { changes },
+    results: [],
+  };
+}
+
+class FakeD1PreparedStatement {
+  constructor(database, sql, parameters = []) {
+    this.database = database;
+    this.sql = sql;
+    this.parameters = parameters;
+  }
+
+  bind(...parameters) {
+    return new FakeD1PreparedStatement(this.database, this.sql, parameters);
+  }
+
+  async all() {
+    return {
+      success: true,
+      meta: {},
+      results: this.database.select(this.sql, this.parameters),
+    };
+  }
+
+  async first(column) {
+    const row = this.database.select(this.sql, this.parameters)[0] ?? null;
+    if (column === undefined || row === null) return row;
+    return row[column] ?? null;
+  }
+
+  async run() {
+    return this.database.mutate(this.sql, this.parameters);
+  }
+}
+
+class FakeD1Database {
+  constructor() {
+    this.conversations = new Map();
+    this.messages = [];
+  }
+
+  prepare(sql) {
+    return new FakeD1PreparedStatement(this, sql);
+  }
+
+  async batch(statements) {
+    const results = [];
+    for (const statement of statements) results.push(await statement.run());
+    return results;
+  }
+
+  select(sql, parameters) {
+    const query = normalizeSql(sql);
+
+    if (
+      query.startsWith(
+        "select id, title, source_kind, created_at, updated_at from conversations where owner_id = ? order by",
+      )
+    ) {
+      const [ownerId] = parameters;
+      return [...this.conversations.values()]
+        .filter((conversation) => conversation.owner_id === ownerId)
+        .sort(
+          (left, right) =>
+            right.updated_at - left.updated_at || right.id.localeCompare(left.id),
+        )
+        .map(({ id, title, source_kind, created_at, updated_at }) => ({
+          id,
+          title,
+          source_kind,
+          created_at,
+          updated_at,
+        }));
+    }
+
+    if (
+      query.startsWith(
+        "select id, title, source_kind, source_json, summary_json, active_model, created_at, updated_at from conversations where id = ? and owner_id = ?",
+      )
+    ) {
+      const [id, ownerId] = parameters;
+      const conversation = this.conversations.get(id);
+      return conversation?.owner_id === ownerId ? [{ ...conversation }] : [];
+    }
+
+    if (
+      query.startsWith(
+        "select id, role, content, created_at from conversation_messages where conversation_id = ? order by sequence asc",
+      )
+    ) {
+      const [conversationId] = parameters;
+      return this.messages
+        .filter((message) => message.conversation_id === conversationId)
+        .sort((left, right) => left.sequence - right.sequence)
+        .map(({ id, role, content, created_at }) => ({
+          id,
+          role,
+          content,
+          created_at,
+        }));
+    }
+
+    if (
+      query.startsWith(
+        "select coalesce(max(sequence), -1) + 1 as next_sequence from conversation_messages where conversation_id = ?",
+      )
+    ) {
+      const [conversationId] = parameters;
+      const next_sequence =
+        this.messages
+          .filter((message) => message.conversation_id === conversationId)
+          .reduce((maximum, message) => Math.max(maximum, message.sequence), -1) + 1;
+      return [{ next_sequence }];
+    }
+
+    if (
+      query ===
+      "select id from conversations where id = ? and owner_id = ?"
+    ) {
+      const [id, ownerId] = parameters;
+      const conversation = this.conversations.get(id);
+      return conversation?.owner_id === ownerId ? [{ id }] : [];
+    }
+
+    if (
+      query.startsWith(
+        "select id, title, source_kind, created_at, updated_at from conversations where id = ? and owner_id = ?",
+      )
+    ) {
+      const [id, ownerId] = parameters;
+      const conversation = this.conversations.get(id);
+      if (conversation?.owner_id !== ownerId) return [];
+      const { title, source_kind, created_at, updated_at } = conversation;
+      return [{ id, title, source_kind, created_at, updated_at }];
+    }
+
+    throw new Error(`Fake D1 does not support SELECT: ${query}`);
+  }
+
+  mutate(sql, parameters) {
+    const query = normalizeSql(sql);
+
+    if (query.startsWith("insert into conversations")) {
+      const [
+        id,
+        owner_id,
+        title,
+        source_kind,
+        source_json,
+        summary_json,
+        active_model,
+        created_at,
+        updated_at,
+      ] = parameters;
+      this.conversations.set(id, {
+        id,
+        owner_id,
+        title,
+        source_kind,
+        source_json,
+        summary_json,
+        active_model,
+        created_at,
+        updated_at,
+      });
+      return successfulD1Result();
+    }
+
+    if (
+      query.startsWith("insert into conversation_messages") &&
+      query.includes("values (?, ?, ?, ?, ?, ?)")
+    ) {
+      const [id, conversation_id, sequence, role, content, created_at] = parameters;
+      this.messages.push({
+        id,
+        conversation_id,
+        sequence,
+        role,
+        content,
+        created_at,
+      });
+      return successfulD1Result();
+    }
+
+    if (
+      query.startsWith("insert into conversation_messages") &&
+      query.includes("coalesce(max(sequence), -1) + 1")
+    ) {
+      const [id, conversation_id, role, content, created_at, scopedConversationId] =
+        parameters;
+      assert.equal(conversation_id, scopedConversationId);
+      const sequence = this.messages
+        .filter((message) => message.conversation_id === conversation_id)
+        .reduce((maximum, message) => Math.max(maximum, message.sequence), -1) + 1;
+      this.messages.push({
+        id,
+        conversation_id,
+        sequence,
+        role,
+        content,
+        created_at,
+      });
+      return successfulD1Result();
+    }
+
+    if (
+      query.startsWith(
+        "update conversations set title = ?, updated_at = ? where id = ? and owner_id = ?",
+      )
+    ) {
+      const [title, updatedAt, id, ownerId] = parameters;
+      const conversation = this.conversations.get(id);
+      if (conversation?.owner_id !== ownerId) return successfulD1Result(0);
+      conversation.title = title;
+      conversation.updated_at = updatedAt;
+      return successfulD1Result();
+    }
+
+    if (
+      query.startsWith(
+        "update conversations set updated_at = ? where id = ? and owner_id = ?",
+      )
+    ) {
+      const [updatedAt, id, ownerId] = parameters;
+      const conversation = this.conversations.get(id);
+      if (conversation?.owner_id !== ownerId) return successfulD1Result(0);
+      conversation.updated_at = updatedAt;
+      return successfulD1Result();
+    }
+
+    if (query.startsWith("delete from conversation_messages where conversation_id in")) {
+      const [id, ownerId] = parameters;
+      const conversation = this.conversations.get(id);
+      if (conversation?.owner_id !== ownerId) return successfulD1Result(0);
+      const before = this.messages.length;
+      this.messages = this.messages.filter(
+        (message) => message.conversation_id !== id,
+      );
+      return successfulD1Result(before - this.messages.length);
+    }
+
+    if (
+      query === "delete from conversations where id = ? and owner_id = ?"
+    ) {
+      const [id, ownerId] = parameters;
+      const conversation = this.conversations.get(id);
+      if (conversation?.owner_id !== ownerId) return successfulD1Result(0);
+      this.conversations.delete(id);
+      return successfulD1Result();
+    }
+
+    throw new Error(`Fake D1 does not support mutation: ${query}`);
+  }
+}
+
 function assertAudioAnalysisPrompt(providerRequest) {
   const prompt = JSON.stringify(providerRequest.body.messages);
   assert.match(prompt, /audioAnalysis/);
@@ -52,13 +314,208 @@ test("server-renders the FrameNote video workspace", async () => {
   assert.equal((html.match(/<h1\b/gi) ?? []).length, 1);
   assert.match(html, /上传视频/);
   assert.match(html, /B站链接/);
+  assert.match(html, /设置/);
+  assert.match(html, /视频对话/);
+  assert.match(html, /新建/);
   assert.match(html, /视频总结对话/);
+  assert.doesNotMatch(html, /architecture-note/);
+  assert.doesNotMatch(html, /Qwen 视频理解 \+ DeepSeek V4 Pro 对话/);
+  assert.doesNotMatch(
+    html,
+    /完成左侧设置后，你会先得到一份带章节的总结，然后可以像聊天一样继续追问。/,
+  );
   assert.doesNotMatch(html, /VIDEO INTELLIGENCE|正在检查模型/);
   assert.doesNotMatch(
     html,
     /上传本地视频、粘贴 B站公开视频或 HTTPS 视频直链/,
   );
   assert.doesNotMatch(html, /codex-preview|Your site is taking shape/i);
+});
+
+test("persists owner-scoped video conversations through their D1 lifecycle", async () => {
+  const database = new FakeD1Database();
+  const ownerHeaders = {
+    "content-type": "application/json",
+    "oai-authenticated-user-email": "Viewer@Example.com",
+  };
+  const otherOwnerHeaders = {
+    "oai-authenticated-user-email": "someone-else@example.com",
+  };
+  const source = {
+    kind: "upload",
+    title: "站台 Lofi",
+    subtitle: "station-lofi.mp4 · 7:00",
+    durationLabel: "07:00",
+    downloadFirst: false,
+  };
+  const summary = {
+    title: "站台 Lofi 总结",
+    overview: "画面与舒缓音乐共同营造出安静的站台氛围。",
+    keyPoints: [
+      {
+        title: "稳定氛围",
+        detail: "视觉主体与低保真音乐共同保持平静节奏。",
+      },
+    ],
+    chapters: [
+      {
+        time: "00:00",
+        title: "开场",
+        description: "站台画面与音乐同步出现。",
+      },
+    ],
+    takeaway: "这是一段以画面和音乐共同塑造氛围的视频。",
+    evidence: [],
+    audioAnalysis: {
+      status: "analyzed",
+      summary: "舒缓的低保真音乐贯穿全片。",
+      speech: null,
+      music: "节奏平稳的低保真爵士乐。",
+      soundscape: "轻微的站台环境声。",
+      temporalChanges: [
+        {
+          time: "03:30",
+          description: "中段鼓点略微增强。",
+        },
+      ],
+    },
+  };
+
+  const createResponse = await request(
+    "/api/conversations",
+    {
+      method: "POST",
+      headers: ownerHeaders,
+      body: JSON.stringify({
+        source,
+        summary,
+        messages: [
+          {
+            role: "assistant",
+            content: "总结已经生成，可以继续追问。",
+          },
+        ],
+        activeModel: "qwen3.5-omni-plus",
+      }),
+    },
+    { DB: database },
+  );
+  assert.equal(createResponse.status, 201);
+  assert.match(createResponse.headers.get("cache-control") ?? "", /no-store/i);
+  const created = (await createResponse.json()).conversation;
+  assert.match(
+    created.id,
+    /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i,
+  );
+  assert.equal(created.title, source.title);
+  assert.deepEqual(created.source, source);
+  assert.deepEqual(created.summary, summary);
+  assert.equal(created.messages.length, 1);
+  assert.equal(created.activeModel, "qwen3.5-omni-plus");
+
+  const listResponse = await request(
+    "/api/conversations",
+    { headers: { "oai-authenticated-user-email": "viewer@example.com" } },
+    { DB: database },
+  );
+  assert.equal(listResponse.status, 200);
+  const listed = (await listResponse.json()).conversations;
+  assert.equal(listed.length, 1);
+  assert.equal(listed[0].id, created.id);
+  assert.equal(listed[0].sourceKind, "upload");
+
+  const detailResponse = await request(
+    `/api/conversations/${created.id}`,
+    { headers: { "oai-authenticated-user-email": "viewer@example.com" } },
+    { DB: database },
+  );
+  assert.equal(detailResponse.status, 200);
+  const detail = (await detailResponse.json()).conversation;
+  assert.deepEqual(detail.source, source);
+  assert.deepEqual(detail.summary, summary);
+  assert.deepEqual(
+    detail.messages.map(({ role, content }) => ({ role, content })),
+    [{ role: "assistant", content: "总结已经生成，可以继续追问。" }],
+  );
+
+  const appendResponse = await request(
+    `/api/conversations/${created.id}/messages`,
+    {
+      method: "POST",
+      headers: ownerHeaders,
+      body: JSON.stringify({
+        messages: [
+          { role: "user", content: "音乐在中段有什么变化？" },
+          { role: "assistant", content: "中段鼓点略微增强，但整体仍然舒缓。" },
+        ],
+      }),
+    },
+    { DB: database },
+  );
+  assert.equal(appendResponse.status, 201);
+  assert.equal((await appendResponse.json()).messages.length, 2);
+
+  const detailAfterAppendResponse = await request(
+    `/api/conversations/${created.id}`,
+    { headers: { "oai-authenticated-user-email": "viewer@example.com" } },
+    { DB: database },
+  );
+  const detailAfterAppend = (await detailAfterAppendResponse.json()).conversation;
+  assert.deepEqual(
+    detailAfterAppend.messages.map(({ role, content }) => ({ role, content })),
+    [
+      { role: "assistant", content: "总结已经生成，可以继续追问。" },
+      { role: "user", content: "音乐在中段有什么变化？" },
+      { role: "assistant", content: "中段鼓点略微增强，但整体仍然舒缓。" },
+    ],
+  );
+
+  const renameResponse = await request(
+    `/api/conversations/${created.id}`,
+    {
+      method: "PATCH",
+      headers: ownerHeaders,
+      body: JSON.stringify({ title: "夜间站台音乐分析" }),
+    },
+    { DB: database },
+  );
+  assert.equal(renameResponse.status, 200);
+  assert.equal((await renameResponse.json()).conversation.title, "夜间站台音乐分析");
+
+  const crossOwnerResponse = await request(
+    `/api/conversations/${created.id}`,
+    { headers: otherOwnerHeaders },
+    { DB: database },
+  );
+  assert.equal(crossOwnerResponse.status, 404);
+  assert.equal(
+    (await crossOwnerResponse.json()).error.code,
+    "CONVERSATION_NOT_FOUND",
+  );
+
+  const deleteResponse = await request(
+    `/api/conversations/${created.id}`,
+    {
+      method: "DELETE",
+      headers: { "oai-authenticated-user-email": "viewer@example.com" },
+    },
+    { DB: database },
+  );
+  assert.equal(deleteResponse.status, 204);
+
+  const missingResponse = await request(
+    `/api/conversations/${created.id}`,
+    { headers: { "oai-authenticated-user-email": "viewer@example.com" } },
+    { DB: database },
+  );
+  assert.equal(missingResponse.status, 404);
+
+  const emptyListResponse = await request(
+    "/api/conversations",
+    { headers: { "oai-authenticated-user-email": "viewer@example.com" } },
+    { DB: database },
+  );
+  assert.deepEqual((await emptyListResponse.json()).conversations, []);
 });
 
 test("exposes Qwen and DeepSeek model status without leaking credentials", async () => {
@@ -524,13 +981,32 @@ test("uses Qwen for analysis and DeepSeek V4 Pro for follow-up answers", async (
 });
 
 test("removes disposable starter assets and keeps model choice decoupled", async () => {
-  const [page, layout, packageJson, engine, workbench, bilibiliClient] = await Promise.all([
+  const [
+    page,
+    layout,
+    packageJson,
+    engine,
+    workbench,
+    bilibiliClient,
+    conversationClient,
+    settingsMenu,
+    styles,
+    hostingJson,
+    databaseSchema,
+    databaseMigration,
+  ] = await Promise.all([
     readFile(new URL("../app/page.tsx", import.meta.url), "utf8"),
     readFile(new URL("../app/layout.tsx", import.meta.url), "utf8"),
     readFile(new URL("../package.json", import.meta.url), "utf8"),
     readFile(new URL("../lib/video-engine.ts", import.meta.url), "utf8"),
     readFile(new URL("../app/VideoWorkbench.tsx", import.meta.url), "utf8"),
     readFile(new URL("../lib/client/bilibili-client.ts", import.meta.url), "utf8"),
+    readFile(new URL("../lib/client/conversation-client.ts", import.meta.url), "utf8"),
+    readFile(new URL("../app/UserSettingsMenu.tsx", import.meta.url), "utf8"),
+    readFile(new URL("../app/globals.css", import.meta.url), "utf8"),
+    readFile(new URL("../.openai/hosting.json", import.meta.url), "utf8"),
+    readFile(new URL("../db/schema.ts", import.meta.url), "utf8"),
+    readFile(new URL("../drizzle/0000_first_darkhawk.sql", import.meta.url), "utf8"),
   ]);
 
   assert.match(page, /<VideoWorkbench \/>/);
@@ -547,13 +1023,45 @@ test("removes disposable starter assets and keeps model choice decoupled", async
   assert.match(workbench, /声音与音乐/);
   assert.doesNotMatch(
     workbench,
-    /engine-badge|VIDEO INTELLIGENCE|intro-block|setup-title|getModelStatus|ModelStatusResponse/,
+    /engine-badge|VIDEO INTELLIGENCE|intro-block|setup-title|architecture-note|getModelStatus|ModelStatusResponse/,
+  );
+  assert.doesNotMatch(workbench, /Qwen 视频理解 \+ DeepSeek V4 Pro 对话/);
+  assert.doesNotMatch(
+    workbench,
+    /完成左侧设置后，你会先得到一份带章节的总结，然后可以像聊天一样继续追问。/,
   );
   assert.match(workbench, /aria-label="视频预览与下载"/);
   assert.match(workbench, /download=\{videoPreview\.filename\}/);
   assert.match(workbench, /"下载视频"/);
   assert.match(workbench, /"打开\/下载原视频"/);
   assert.match(bilibiliClient, /\/api\/bilibili\/jobs/);
+  for (const clientOperation of [
+    "listConversations",
+    "createConversation",
+    "getConversation",
+    "renameConversation",
+    "deleteConversation",
+    "appendConversationMessages",
+  ]) {
+    assert.match(conversationClient, new RegExp(`function ${clientOperation}\\b`));
+    assert.match(workbench, new RegExp(`\\b${clientOperation}\\b`));
+  }
+  assert.match(settingsMenu, /localStorage\.getItem/);
+  assert.match(settingsMenu, /localStorage\.setItem/);
+  assert.match(settingsMenu, /root\.dataset\.theme/);
+  assert.match(settingsMenu, /root\.dataset\.fontSize/);
+  assert.match(settingsMenu, /fontSize:\s*"comfortable"/);
+  assert.match(styles, /html\[data-theme="dark"\]/);
+  assert.match(styles, /html\[data-font-size="comfortable"\]/);
+  assert.match(styles, /--font-zh:/);
+  assert.match(styles, /--font-en:/);
+  assert.equal(JSON.parse(hostingJson).d1, "DB");
+  assert.match(databaseSchema, /sqliteTable\(\s*"conversations"/);
+  assert.match(databaseSchema, /sqliteTable\(\s*"conversation_messages"/);
+  assert.match(databaseSchema, /conversations_owner_updated_idx/);
+  assert.match(databaseSchema, /conversation_messages_sequence_idx/);
+  assert.match(databaseMigration, /CREATE TABLE `conversations`/);
+  assert.match(databaseMigration, /CREATE TABLE `conversation_messages`/);
   assert.doesNotMatch(workbench, /demoVideoEngine/);
 
   await assert.rejects(

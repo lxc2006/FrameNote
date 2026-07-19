@@ -12,7 +12,8 @@
 - HTTPS 视频直链可直接预览并提供打开/下载入口；跨域直链是否强制保存仍由源站的响应头与浏览器策略决定。
 - 展示素材校验、媒体读取、音轨与画面理解、总结生成等处理阶段。
 - 生成结构化 AI 总结：概览、独立“声音与音乐”分析、关键观点、章节时间线和一句话结论。
-- 在独立会话区围绕视频继续追问。
+- 在独立会话区围绕视频继续追问；每个视频对应一条 D1 对话，可在左栏新建、切换、重命名和删除。
+- 支持浅色/深色界面、独立中英文字体和四档字号；显示偏好保存在当前浏览器。
 - 响应式桌面与移动端布局，并支持键盘操作和减少动画偏好。
 
 > 当前使用 **Qwen + DeepSeek 双模型适配器**：Qwen 负责视频理解和结构化总结，DeepSeek V4 Pro 负责基于总结、证据与历史消息继续对话。本地与 B站视频会先在浏览器中压缩为音轨与关键帧证据；本地文件上限为 300 MB，B站浏览器下载上限为 150 MB，时长均不超过 60 分钟。带正确媒体响应头的 HTTPS 视频直链仍可由 Qwen 直接读取。
@@ -70,6 +71,7 @@ pnpm lint
 ## 代码结构
 
 - `app/VideoWorkbench.tsx`：上传、B站输入、处理进度、总结与追问的完整交互。
+- `app/api/conversations`、`lib/server/conversation-store.ts`：按登录用户隔离的 D1 对话、总结与消息持久化。
 - `lib/client/video-preprocessor.ts`：浏览器端 FFmpeg 加载、音轨压缩、关键帧抽取和输入体积控制。
 - `lib/client/bilibili-client.ts`：创建/轮询下载任务、直取媒体和下载进度。
 - `lib/bilibili-api.ts`：网站与媒体任务共用的状态和产物类型。
@@ -80,16 +82,15 @@ pnpm lint
 - `lib/video-engine.ts`：共享视频来源、总结类型及未被当前 UI 使用的 Demo 引擎。
 - `lib/server/qwen-video-engine.ts`、`lib/server/deepseek-conversation-engine.ts`：真实总结与追问模型入口。
 - `worker/index.ts`：Cloudflare Worker 入口。
-- `.openai/hosting.json`：已绑定 Sites 项目；D1 与 R2 当前均为 `null`。
+- `.openai/hosting.json`：已绑定 Sites 项目和逻辑 D1 绑定 `DB`；R2 当前未启用。
 - `docs/architecture.md`：生产化架构、API 契约、模型与部署选择建议。
 
 ## 下一阶段
 
-1. 增加 D1/R2，保存上传会话、任务状态、总结和对话。
-2. 实现浏览器直传 R2 multipart，避免大视频穿过普通 Worker 请求体。
-3. 将本机媒体服务部署为 HTTPS 容器，并把临时产物迁移到 R2/S3。
-4. 将单实例本地任务状态迁移到 D1/Redis，并把轮询升级为 SSE。
-5. 给总结与回答增加更细粒度的时间戳引用和证据检索。
+1. 实现浏览器直传 R2 multipart，避免大视频穿过普通 Worker 请求体。
+2. 将本机媒体服务部署为 HTTPS 容器，并把临时产物迁移到 R2/S3。
+3. 将单实例本地任务状态迁移到 D1/Redis，并把轮询升级为 SSE。
+4. 给总结与回答增加更细粒度的时间戳引用和证据检索。
 
 ## B站能力边界
 

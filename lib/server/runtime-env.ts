@@ -11,6 +11,10 @@ export function setRuntimeBindings(bindings: Record<string, unknown>) {
   (globalThis as unknown as Record<string, unknown>)[RUNTIME_ENV_KEY] = bindings;
 }
 
+export function runtimeBinding<T>(name: string): T | undefined {
+  return runtimeBindings()?.[name] as T | undefined;
+}
+
 export function runtimeValue(name: string): string | undefined {
   const binding = runtimeBindings()?.[name];
   if (typeof binding === "string" && binding.trim()) return binding.trim();

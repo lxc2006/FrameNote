@@ -33,6 +33,19 @@ import {
   MAX_BILIBILI_BROWSER_BYTES,
   downloadBilibiliVideo,
 } from "@/lib/client/bilibili-client";
+import {
+  appendConversationMessages,
+  createConversation,
+  deleteConversation,
+  getConversation,
+  listConversations,
+  renameConversation,
+} from "@/lib/client/conversation-client";
+import type {
+  ConversationListItem,
+  ConversationMessage,
+} from "@/lib/conversation";
+import UserSettingsMenu from "@/app/UserSettingsMenu";
 
 type InputMode = "upload" | "bilibili";
 type Phase = "idle" | "processing" | "ready" | "error";
@@ -50,11 +63,7 @@ interface VideoPreview {
   filename: string;
 }
 
-interface ChatMessage {
-  id: string;
-  role: "assistant" | "user";
-  content: string;
-}
+type ChatMessage = Pick<ConversationMessage, "id" | "role" | "content">;
 
 const acceptedExtensions = ["mp4", "mov", "webm", "mkv", "m4v"];
 const preprocessingStageIndexes: Record<VideoPreprocessingStage, number> = {
@@ -98,6 +107,23 @@ function titleFromUrl(value: string) {
   } catch {
     return "在线视频";
   }
+}
+
+function sourceKindLabel(kind: ConversationListItem["sourceKind"]) {
+  if (kind === "bilibili") return "B站";
+  if (kind === "url") return "直链";
+  return "上传";
+}
+
+function formatConversationDate(timestamp: number) {
+  const date = new Date(timestamp);
+  if (Number.isNaN(date.getTime())) return "刚刚";
+  return new Intl.DateTimeFormat("zh-CN", {
+    month: "numeric",
+    day: "numeric",
+    hour: "2-digit",
+    minute: "2-digit",
+  }).format(date);
 }
 
 function stagesFor(source: VideoSourceDescriptor) {
@@ -151,11 +177,20 @@ export default function VideoWorkbench() {
   const [activeModel, setActiveModel] = useState<string | null>(null);
   const [videoPreview, setVideoPreview] = useState<VideoPreview | null>(null);
   const [videoPreviewFailed, setVideoPreviewFailed] = useState(false);
+  const [conversationItems, setConversationItems] = useState<ConversationListItem[]>([]);
+  const [activeConversationId, setActiveConversationId] = useState<string | null>(null);
+  const [isConversationListLoading, setIsConversationListLoading] = useState(true);
+  const [conversationListError, setConversationListError] = useState<string | null>(null);
+  const [loadingConversationId, setLoadingConversationId] = useState<string | null>(null);
+  const [busyConversationId, setBusyConversationId] = useState<string | null>(null);
+  const [renamingConversationId, setRenamingConversationId] = useState<string | null>(null);
+  const [renameDraft, setRenameDraft] = useState("");
   const fileInputRef = useRef<HTMLInputElement>(null);
   const runTokenRef = useRef(0);
   const messageCounterRef = useRef(0);
   const analyzeAbortRef = useRef<AbortController | null>(null);
   const askAbortRef = useRef<AbortController | null>(null);
+  const conversationLoadAbortRef = useRef<AbortController | null>(null);
   const downloadedVideoUrlRef = useRef<string | null>(null);
 
   const bvid = useMemo(() => extractBvid(bilibiliInput), [bilibiliInput]);
@@ -221,10 +256,32 @@ export default function VideoWorkbench() {
   }, []);
 
   useEffect(() => {
+    const controller = new AbortController();
+    setIsConversationListLoading(true);
+    void listConversations(controller.signal)
+      .then((items) => {
+        setConversationItems(items);
+        setConversationListError(null);
+      })
+      .catch((error: unknown) => {
+        if (error instanceof DOMException && error.name === "AbortError") return;
+        setConversationListError(
+          error instanceof Error ? error.message : "无法读取对话列表。",
+        );
+      })
+      .finally(() => {
+        if (!controller.signal.aborted) setIsConversationListLoading(false);
+      });
+
+    return () => controller.abort();
+  }, []);
+
+  useEffect(() => {
     const cancelActiveWork = () => {
       runTokenRef.current += 1;
       analyzeAbortRef.current?.abort();
       askAbortRef.current?.abort();
+      conversationLoadAbortRef.current?.abort();
     };
     globalThis.addEventListener("pagehide", cancelActiveWork);
     return () => {
@@ -236,6 +293,14 @@ export default function VideoWorkbench() {
   function nextMessageId(role: ChatMessage["role"]) {
     messageCounterRef.current += 1;
     return `${role}-${messageCounterRef.current}`;
+  }
+
+  function upsertConversationItem(item: ConversationListItem) {
+    setConversationItems((current) =>
+      [item, ...current.filter((conversation) => conversation.id !== item.id)].sort(
+        (left, right) => right.updatedAt - left.updatedAt,
+      ),
+    );
   }
 
   function releaseDownloadedVideoUrl() {
@@ -341,6 +406,7 @@ export default function VideoWorkbench() {
     setSummary(null);
     setActiveModel(null);
     setMessages([]);
+    setActiveConversationId(null);
     setActiveSource(pendingSource);
     setProcessingStages(stages);
     setStageIndex(0);
@@ -446,18 +512,38 @@ export default function VideoWorkbench() {
       setStageProgress(1);
       setSummary(result.summary);
       setActiveModel(result.model);
-      setMessages([
-        {
-          id: nextMessageId("assistant"),
-          role: "assistant",
-          content:
-            analysisSource.kind === "url"
-              ? "Qwen 已同时读取视频直链中的画面与内嵌音轨并生成结构化总结。接下来由 DeepSeek V4 Pro 回答核心观点、声音变化、章节结构或行动建议。"
-              : context.audioUrl
-                ? "Qwen 已融合抽取的音轨、关键帧与时间索引并生成结构化总结。接下来由 DeepSeek V4 Pro 回答核心观点、声音变化、章节结构或行动建议。"
-                : "Qwen 已使用关键帧生成结构化总结；该素材没有可用音轨，因此不会推测音乐或环境声。接下来可由 DeepSeek V4 Pro 继续追问。",
-        },
-      ]);
+      const initialMessage: ChatMessage = {
+        id: nextMessageId("assistant"),
+        role: "assistant",
+        content:
+          analysisSource.kind === "url"
+            ? "Qwen 已同时读取视频直链中的画面与内嵌音轨并生成结构化总结。接下来由 DeepSeek V4 Pro 回答核心观点、声音变化、章节结构或行动建议。"
+            : context.audioUrl
+              ? "Qwen 已融合抽取的音轨、关键帧与时间索引并生成结构化总结。接下来由 DeepSeek V4 Pro 回答核心观点、声音变化、章节结构或行动建议。"
+              : "Qwen 已使用关键帧生成结构化总结；该素材没有可用音轨，因此不会推测音乐或环境声。接下来可由 DeepSeek V4 Pro 继续追问。",
+      };
+      setMessages([initialMessage]);
+
+      try {
+        const saved = await createConversation({
+          source: analysisSource,
+          summary: result.summary,
+          activeModel: result.model,
+          messages: [{ role: initialMessage.role, content: initialMessage.content }],
+        });
+        if (runTokenRef.current !== runToken) return;
+        setActiveConversationId(saved.id);
+        upsertConversationItem(saved);
+        setConversationListError(null);
+      } catch (saveError) {
+        if (runTokenRef.current !== runToken) return;
+        setConversationListError(
+          saveError instanceof Error
+            ? `总结已生成，但保存对话失败：${saveError.message}`
+            : "总结已生成，但保存对话失败。",
+        );
+      }
+      if (runTokenRef.current !== runToken) return;
       setPhase("ready");
     } catch (error) {
       if (runTokenRef.current !== runToken) return;
@@ -479,6 +565,8 @@ export default function VideoWorkbench() {
     analyzeAbortRef.current = null;
     askAbortRef.current?.abort();
     askAbortRef.current = null;
+    conversationLoadAbortRef.current?.abort();
+    conversationLoadAbortRef.current = null;
     setPhase("idle");
     setSummary(null);
     setActiveModel(null);
@@ -489,9 +577,136 @@ export default function VideoWorkbench() {
     setPreprocessingResult(null);
     clearVideoPreview();
     setMessages([]);
+    setActiveConversationId(null);
+    setLoadingConversationId(null);
+    setRenamingConversationId(null);
+    setSelectedVideo(null);
+    setBilibiliInput("");
+    setMode("upload");
     setQuestion("");
     setIsReplying(false);
     setNotice(null);
+  }
+
+  async function handleSelectConversation(id: string) {
+    if (phase === "processing" || busyConversationId || loadingConversationId === id) {
+      return;
+    }
+
+    conversationLoadAbortRef.current?.abort();
+    const controller = new AbortController();
+    conversationLoadAbortRef.current = controller;
+    setLoadingConversationId(id);
+    setConversationListError(null);
+
+    try {
+      const conversation = await getConversation(id, controller.signal);
+      if (conversationLoadAbortRef.current !== controller) return;
+
+      runTokenRef.current += 1;
+      analyzeAbortRef.current?.abort();
+      analyzeAbortRef.current = null;
+      askAbortRef.current?.abort();
+      askAbortRef.current = null;
+      setPhase("ready");
+      setSummary(conversation.summary);
+      setActiveModel(conversation.activeModel);
+      setActiveSource(conversation.source);
+      setActiveConversationId(conversation.id);
+      setMessages(
+        conversation.messages.map(({ id: messageId, role, content }) => ({
+          id: messageId,
+          role,
+          content,
+        })),
+      );
+      setProcessingStages([]);
+      setStageIndex(-1);
+      setStageProgress(0);
+      setPreprocessingResult(null);
+      setSelectedVideo(null);
+      setQuestion("");
+      setIsReplying(false);
+      upsertConversationItem(conversation);
+
+      if (conversation.source.kind === "url" && conversation.source.sourceUrl) {
+        setMode("bilibili");
+        setBilibiliInput(conversation.source.sourceUrl);
+        showRemoteVideo(conversation.source.sourceUrl);
+        setNotice(null);
+      } else if (conversation.source.kind === "bilibili") {
+        setMode("bilibili");
+        setBilibiliInput(
+          conversation.source.bvid ?? conversation.source.sourceUrl ?? "",
+        );
+        clearVideoPreview();
+        setNotice("总结和对话已恢复；如需预览或下载，请重新获取这个 B站视频。");
+      } else {
+        setMode("upload");
+        setBilibiliInput("");
+        clearVideoPreview();
+        setNotice("总结和对话已恢复；本地原视频不会存入 D1，预览时请重新选择文件。");
+      }
+    } catch (error) {
+      if (error instanceof DOMException && error.name === "AbortError") return;
+      setConversationListError(
+        error instanceof Error ? error.message : "无法打开这个对话。",
+      );
+    } finally {
+      if (conversationLoadAbortRef.current === controller) {
+        conversationLoadAbortRef.current = null;
+        setLoadingConversationId(null);
+      }
+    }
+  }
+
+  function beginRenameConversation(item: ConversationListItem) {
+    setRenamingConversationId(item.id);
+    setRenameDraft(item.title);
+    setConversationListError(null);
+  }
+
+  async function saveConversationRename(id: string) {
+    const title = renameDraft.trim();
+    if (!title) {
+      setConversationListError("对话名称不能为空。");
+      return;
+    }
+
+    setBusyConversationId(id);
+    try {
+      const renamed = await renameConversation(id, title);
+      upsertConversationItem(renamed);
+      setRenamingConversationId(null);
+      setRenameDraft("");
+      setConversationListError(null);
+    } catch (error) {
+      setConversationListError(
+        error instanceof Error ? error.message : "重命名失败，请稍后重试。",
+      );
+    } finally {
+      setBusyConversationId(null);
+    }
+  }
+
+  async function handleDeleteConversation(item: ConversationListItem) {
+    if (!globalThis.confirm(`删除对话“${item.title}”？此操作不可撤销。`)) return;
+
+    setBusyConversationId(item.id);
+    setConversationListError(null);
+    try {
+      await deleteConversation(item.id);
+      setConversationItems((current) =>
+        current.filter((conversation) => conversation.id !== item.id),
+      );
+      if (activeConversationId === item.id) resetWorkspace();
+    } catch (error) {
+      setConversationListError(
+        error instanceof Error ? error.message : "删除失败，请稍后重试。",
+      );
+    } finally {
+      setBusyConversationId(null);
+    }
   }
 
   async function askQuestion(rawQuestion: string) {
@@ -521,14 +736,41 @@ export default function VideoWorkbench() {
         controller.signal,
       );
       if (askAbortRef.current !== controller) return;
+      const assistantMessage: ChatMessage = {
+        id: nextMessageId("assistant"),
+        role: "assistant",
+        content: result.answer,
+      };
       setMessages((current) => [
         ...current,
-        {
-          id: nextMessageId("assistant"),
-          role: "assistant",
-          content: result.answer,
-        },
+        assistantMessage,
       ]);
+
+      if (activeConversationId) {
+        const conversationId = activeConversationId;
+        void appendConversationMessages(conversationId, [
+          { role: userMessage.role, content: userMessage.content },
+          { role: assistantMessage.role, content: assistantMessage.content },
+        ])
+          .then(() => {
+            setConversationItems((current) =>
+              current
+                .map((item) =>
+                  item.id === conversationId
+                    ? { ...item, updatedAt: Date.now() }
+                    : item,
+                )
+                .sort((left, right) => right.updatedAt - left.updatedAt),
+            );
+          })
+          .catch((error: unknown) => {
+            setConversationListError(
+              error instanceof Error
+                ? `回答已生成，但未保存：${error.message}`
+                : "回答已生成，但未能保存到对话历史。",
+            );
+          });
+      }
     } catch (error) {
       if (error instanceof DOMException && error.name === "AbortError") return;
       if (askAbortRef.current !== controller) return;
@@ -563,6 +805,9 @@ export default function VideoWorkbench() {
       : 0;
 
   const shownSource = activeSource ?? pendingSource;
+  const activeConversationTitle = activeConversationId
+    ? conversationItems.find((item) => item.id === activeConversationId)?.title
+    : null;
 
   return (
     <main className="app-shell">
@@ -580,6 +825,7 @@ export default function VideoWorkbench() {
         <h1 className="topbar-title">让一段视频，变成一次可继续的对话。</h1>
 
         <div className="topbar-actions">
+          <UserSettingsMenu />
           <button className="new-task-button" type="button" onClick={resetWorkspace}>
             <span aria-hidden="true">＋</span>
             新建任务
@@ -775,15 +1021,135 @@ export default function VideoWorkbench() {
             </button>
           </div>
 
-          <div className="architecture-note">
-            <span aria-hidden="true">◎</span>
-            <div>
-              <strong>Qwen 视频理解 + DeepSeek V4 Pro 对话</strong>
-              <p>
-                本地与 B站视频会先在浏览器中压缩音轨并提取关键帧，再由 Qwen 生成总结；DeepSeek 基于总结、证据和会话历史继续回答。
-              </p>
+          <aside className="conversation-library" aria-label="视频对话列表">
+            <div className="conversation-library-header">
+              <div>
+                <span>历史记录</span>
+                <h2>视频对话</h2>
+              </div>
+              <button
+                className="conversation-new-button"
+                type="button"
+                onClick={resetWorkspace}
+                disabled={phase === "processing"}
+              >
+                <span aria-hidden="true">＋</span>
+                新建
+              </button>
             </div>
-          </div>
+
+            {conversationListError ? (
+              <p className="conversation-library-error" role="status">
+                {conversationListError}
+              </p>
+            ) : null}
+
+            <div className="conversation-list">
+              {isConversationListLoading ? (
+                <div className="conversation-list-state">
+                  <span className="button-spinner" aria-hidden="true" />
+                  正在读取对话…
+                </div>
+              ) : conversationItems.length === 0 ? (
+                <div className="conversation-list-state empty">
+                  <strong>还没有视频对话</strong>
+                  <span>完成一次总结后，会自动保存在这里。</span>
+                </div>
+              ) : (
+                conversationItems.map((item) => (
+                  <div
+                    className={`conversation-list-item ${
+                      item.id === activeConversationId ? "active" : ""
+                    }`}
+                    key={item.id}
+                  >
+                    {renamingConversationId === item.id ? (
+                      <form
+                        className="conversation-rename-form"
+                        onSubmit={(event) => {
+                          event.preventDefault();
+                          void saveConversationRename(item.id);
+                        }}
+                      >
+                        <label className="sr-only" htmlFor={`rename-${item.id}`}>
+                          重命名对话
+                        </label>
+                        <input
+                          id={`rename-${item.id}`}
+                          value={renameDraft}
+                          maxLength={120}
+                          autoFocus
+                          disabled={busyConversationId === item.id}
+                          onChange={(event) => setRenameDraft(event.target.value)}
+                          onKeyDown={(event) => {
+                            if (event.key === "Escape") {
+                              setRenamingConversationId(null);
+                              setRenameDraft("");
+                            }
+                          }}
+                        />
+                        <button type="submit" disabled={busyConversationId === item.id}>
+                          保存
+                        </button>
+                        <button
+                          type="button"
+                          disabled={busyConversationId === item.id}
+                          onClick={() => {
+                            setRenamingConversationId(null);
+                            setRenameDraft("");
+                          }}
+                        >
+                          取消
+                        </button>
+                      </form>
+                    ) : (
+                      <>
+                        <button
+                          className="conversation-select-button"
+                          type="button"
+                          disabled={
+                            phase === "processing" ||
+                            busyConversationId === item.id ||
+                            loadingConversationId === item.id
+                          }
+                          onClick={() => void handleSelectConversation(item.id)}
+                        >
+                          <span className="conversation-item-title">{item.title}</span>
+                          <span className="conversation-item-meta">
+                            <b>{sourceKindLabel(item.sourceKind)}</b>
+                            <time dateTime={new Date(item.updatedAt).toISOString()}>
+                              {formatConversationDate(item.updatedAt)}
+                            </time>
+                          </span>
+                        </button>
+                        <div className="conversation-item-actions">
+                          <button
+                            type="button"
+                            aria-label={`重命名“${item.title}”`}
+                            title="重命名"
+                            disabled={phase === "processing" || busyConversationId === item.id}
+                            onClick={() => beginRenameConversation(item)}
+                          >
+                            ✎
+                          </button>
+                          <button
+                            className="delete"
+                            type="button"
+                            aria-label={`删除“${item.title}”`}
+                            title="删除"
+                            disabled={phase === "processing" || busyConversationId === item.id}
+                            onClick={() => void handleDeleteConversation(item)}
+                          >
+                            ×
+                          </button>
+                        </div>
+                      </>
+                    )}
+                  </div>
+                ))
+              )}
+            </div>
+          </aside>
         </section>
 
         <section className="conversation-panel" aria-labelledby="conversation-title">
@@ -791,7 +1157,7 @@ export default function VideoWorkbench() {
             <div>
               <span className="panel-kicker">视频总结对话</span>
               <h2 id="conversation-title">
-                {shownSource?.title ?? "等待添加视频"}
+                {activeConversationTitle ?? shownSource?.title ?? "等待添加视频"}
               </h2>
               <p>{shownSource?.subtitle ?? "总结生成后，可在这里围绕视频继续提问"}</p>
             </div>
@@ -865,9 +1231,6 @@ export default function VideoWorkbench() {
                 </div>
                 <span className="empty-label">SUMMARY SPACE</span>
                 <h3>视频内容，会在这里沉淀下来。</h3>
-                <p>
-                  完成左侧设置后，你会先得到一份带章节的总结，然后可以像聊天一样继续追问。
-                </p>
                 <div className="empty-capabilities" aria-label="可生成的内容">
                   <span>内容概览</span>
                   <span>关键观点</span>
