@@ -4,6 +4,10 @@ import type {
   CreateBilibiliJobRequest,
 } from "../bilibili-api";
 import {
+  DEFAULT_BILIBILI_VIDEO_QUALITY,
+  BILIBILI_VIDEO_QUALITIES,
+} from "../bilibili-api";
+import {
   BilibiliConfigurationError,
   getBilibiliServiceConfig,
 } from "./bilibili-config";
@@ -26,6 +30,7 @@ const JOB_PHASES = new Set([
   "merging",
   "ready",
 ]);
+const SUPPORTED_MAX_HEIGHTS = new Set<number>(BILIBILI_VIDEO_QUALITIES);
 
 export class BilibiliInputError extends Error {
   constructor(message: string) {
@@ -66,7 +71,20 @@ export async function readCreateBilibiliJobRequest(
   if (typeof bvid !== "string" || !BVID_PATTERN.test(bvid.trim())) {
     throw new BilibiliInputError("bvid 必须是有效的 BV 号。");
   }
-  return { bvid: `BV${bvid.trim().slice(2)}` };
+
+  const maxHeightValue = (value as Record<string, unknown>).maxHeight;
+  const maxHeight =
+    maxHeightValue === undefined
+      ? DEFAULT_BILIBILI_VIDEO_QUALITY
+      : Number(maxHeightValue);
+  if (!Number.isInteger(maxHeight) || !SUPPORTED_MAX_HEIGHTS.has(maxHeight)) {
+    throw new BilibiliInputError("maxHeight 只支持 720 或 1080。");
+  }
+
+  return {
+    bvid: `BV${bvid.trim().slice(2)}`,
+    maxHeight: maxHeight as CreateBilibiliJobRequest["maxHeight"],
+  };
 }
 
 export function validateBilibiliJobId(value: string) {
@@ -245,6 +263,15 @@ function isJobSnapshot(value: unknown): value is BilibiliJobSnapshot {
 function isArtifact(value: unknown) {
   if (!value || typeof value !== "object" || Array.isArray(value)) return false;
   const artifact = value as Record<string, unknown>;
+  if (
+    artifact.height !== undefined &&
+    (typeof artifact.height !== "number" ||
+      !Number.isSafeInteger(artifact.height) ||
+      artifact.height <= 0 ||
+      artifact.height > 2160)
+  ) {
+    return false;
+  }
   return (
     typeof artifact.downloadUrl === "string" &&
     /^https?:\/\//i.test(artifact.downloadUrl) &&

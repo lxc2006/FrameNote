@@ -42,6 +42,7 @@ class JobError:
 class JobRecord:
     job_id: str
     bvid: str
+    max_height: int = 720
     status: str = "queued"
     phase: str = "queued"
     progress: float = 0.0
@@ -54,6 +55,7 @@ class JobRecord:
     artifact_mime_type: str | None = None
     artifact_size_bytes: int | None = None
     artifact_sha256: str | None = None
+    artifact_height: int | None = None
     artifact_expires_at: float | None = None
     error: JobError | None = None
     queue_slot_held: bool = True
@@ -155,14 +157,14 @@ class JobManager:
         for job_id in purge_ids:
             self._purge_work_files(job_id)
 
-    async def create(self, bvid: str) -> JobRecord:
+    async def create(self, bvid: str, max_height: int = 720) -> JobRecord:
         async with self._lock:
             if self._stopping:
                 raise RuntimeError("service is stopping")
             if self._queued_slots >= self.settings.max_queued:
                 raise QueueCapacityError("job queue is full")
             job_id = str(uuid.uuid4())
-            job = JobRecord(job_id=job_id, bvid=bvid)
+            job = JobRecord(job_id=job_id, bvid=bvid, max_height=max_height)
             job_dir = safe_job_dir(self.settings.state_root, job_id)
             job_dir.mkdir(parents=False, exist_ok=False)
             self._jobs[job_id] = job
@@ -253,7 +255,9 @@ class JobManager:
             finally:
                 self._queue.task_done()
 
-    def _worker_command(self, job_id: str, bvid: str) -> list[str]:
+    def _worker_command(
+        self, job_id: str, bvid: str, max_height: int = 720
+    ) -> list[str]:
         return [
             sys.executable,
             *WORKER_PYTHON_OPTIONS,
@@ -264,6 +268,8 @@ class JobManager:
             job_id,
             "--bvid",
             bvid,
+            "--max-height",
+            str(max_height),
             "--max-duration",
             str(self.settings.max_duration_seconds),
             "--max-bytes",
@@ -276,8 +282,9 @@ class JobManager:
             if not job or job.status != "running":
                 return
             bvid = job.bvid
+            max_height = job.max_height
 
-        command = self._worker_command(job_id, bvid)
+        command = self._worker_command(job_id, bvid, max_height)
         environment = self._worker_environment()
         process_options: dict[str, Any] = {}
         if os.name == "nt":
@@ -445,6 +452,7 @@ class JobManager:
                 mime_type = payload.get("mimeType")
                 size = payload.get("sizeBytes")
                 sha256 = payload.get("sha256")
+                height = payload.get("height")
                 if (
                     isinstance(artifact_file, str)
                     and artifact_file == Path(artifact_file).name
@@ -463,6 +471,11 @@ class JobManager:
                     job.artifact_mime_type = mime_type
                     job.artifact_size_bytes = size
                     job.artifact_sha256 = sha256
+                    job.artifact_height = (
+                        int(height)
+                        if isinstance(height, int) and 0 < height <= 2160
+                        else None
+                    )
                     job.phase = "ready"
                     job.progress = 0.99
             elif event == "error":
@@ -787,4 +800,5 @@ class JobManager:
         job.artifact_mime_type = None
         job.artifact_size_bytes = None
         job.artifact_sha256 = None
+        job.artifact_height = None
         job.artifact_expires_at = None

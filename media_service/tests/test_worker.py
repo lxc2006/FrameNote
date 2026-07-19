@@ -12,6 +12,7 @@ from yt_dlp import YoutubeDL
 from media_service.worker import (
     BROWSER_COMPATIBLE_FORMAT,
     WorkerFailure,
+    browser_compatible_format,
     classify_download_error,
     estimate_download_bytes,
     safe_download_filename,
@@ -38,6 +39,7 @@ class WorkerValidationTests(unittest.TestCase):
                 {
                     "codec_type": "video",
                     "codec_name": "h264",
+                    "height": 720,
                 },
                 {"codec_type": "audio", "codec_name": "aac"},
             ],
@@ -52,6 +54,20 @@ class WorkerValidationTests(unittest.TestCase):
             with self.subTest(branch=branch):
                 self.assertIn("[ext=mp4]", branch)
                 self.assertIn("[height<=720]", branch)
+                self.assertIn(
+                    "[vcodec~='^(?:h264|avc[13](?:\\.|$))']", branch
+                )
+                self.assertIn(
+                    "[acodec~='^(?:aac|mp4a\\.40\\.)']", branch
+                )
+
+    def test_browser_format_can_raise_height_cap_to_1080(self) -> None:
+        format_selector = browser_compatible_format(1080)
+        branches = format_selector.split("/")
+        self.assertEqual(len(branches), 2)
+        for branch in branches:
+            with self.subTest(branch=branch):
+                self.assertIn("[height<=1080]", branch)
                 self.assertIn(
                     "[vcodec~='^(?:h264|avc[13](?:\\.|$))']", branch
                 )
@@ -197,7 +213,7 @@ class WorkerValidationTests(unittest.TestCase):
                 stderr="",
             )
             with patch("media_service.worker.subprocess.run", return_value=probe_result) as run:
-                size, sha256 = verify_artifact(
+                size, sha256, height = verify_artifact(
                     "ffprobe",
                     artifact,
                     max_duration=60,
@@ -208,8 +224,10 @@ class WorkerValidationTests(unittest.TestCase):
             entries = command[command.index("-show_entries") + 1]
             self.assertIn("format_name", entries)
             self.assertIn("codec_name", entries)
+            self.assertIn("height", entries)
             self.assertEqual(size, artifact.stat().st_size)
             self.assertEqual(len(sha256), 64)
+            self.assertEqual(height, 720)
 
     def test_verify_artifact_rejects_av1_from_ffprobe(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:

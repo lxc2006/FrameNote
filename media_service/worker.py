@@ -22,12 +22,7 @@ JOB_ID_RE = re.compile(
     re.ASCII,
 )
 FINAL_ARTIFACT_RE = re.compile(r"^artifact\.mp4$", re.IGNORECASE)
-BROWSER_COMPATIBLE_FORMAT = (
-    r"bv[height<=720][ext=mp4][vcodec~='^(?:h264|avc[13](?:\.|$))']"
-    r"+ba[ext=m4a][acodec~='^(?:aac|mp4a\.40\.)']/"
-    r"b[height<=720][ext=mp4][vcodec~='^(?:h264|avc[13](?:\.|$))']"
-    r"[acodec~='^(?:aac|mp4a\.40\.)']"
-)
+SUPPORTED_MAX_HEIGHTS = frozenset({720, 1080})
 BROWSER_VIDEO_CODECS = frozenset({"h264"})
 BROWSER_AUDIO_CODECS = frozenset({"aac"})
 
@@ -45,6 +40,18 @@ def emit(event: str, **values: Any) -> None:
     sys.stdout.write(json.dumps(payload, ensure_ascii=False, separators=(",", ":")))
     sys.stdout.write("\n")
     sys.stdout.flush()
+
+
+def browser_compatible_format(max_height: int) -> str:
+    return (
+        rf"bv[height<={max_height}][ext=mp4][vcodec~='^(?:h264|avc[13](?:\.|$))']"
+        r"+ba[ext=m4a][acodec~='^(?:aac|mp4a\.40\.)']/"
+        rf"b[height<={max_height}][ext=mp4][vcodec~='^(?:h264|avc[13](?:\.|$))']"
+        r"[acodec~='^(?:aac|mp4a\.40\.)']"
+    )
+
+
+BROWSER_COMPATIBLE_FORMAT = browser_compatible_format(720)
 
 
 def resolve_job_dir(state_root: Path, job_id: str) -> Path:
@@ -217,7 +224,7 @@ def find_artifact(job_dir: Path) -> Path:
     return artifact
 
 
-def validate_artifact_probe(payload: dict[str, Any], max_duration: int) -> None:
+def validate_artifact_probe(payload: dict[str, Any], max_duration: int) -> int | None:
     try:
         format_name = payload["format"]["format_name"]
         duration = float(payload["format"]["duration"])
@@ -251,6 +258,11 @@ def validate_artifact_probe(payload: dict[str, Any], max_duration: int) -> None:
             "下载结果不是浏览器可处理的 H.264 视频。",
             False,
         )
+    heights = [
+        int(stream["height"])
+        for stream in video_streams
+        if isinstance(stream.get("height"), int) and stream["height"] > 0
+    ]
 
     audio_streams = [
         stream
@@ -268,11 +280,12 @@ def validate_artifact_probe(payload: dict[str, Any], max_duration: int) -> None:
             "下载结果不是浏览器可处理的 AAC 音频。",
             False,
         )
+    return max(heights) if heights else None
 
 
 def verify_artifact(
     ffprobe: str, artifact: Path, max_duration: int, max_bytes: int
-) -> tuple[int, str]:
+) -> tuple[int, str, int | None]:
     if artifact.suffix.lower() != ".mp4":
         raise WorkerFailure(
             "UNSUPPORTED_CONTAINER",
@@ -290,7 +303,7 @@ def verify_artifact(
         "-v",
         "error",
         "-show_entries",
-        "format=format_name,duration,size:stream=codec_type,codec_name",
+        "format=format_name,duration,size:stream=codec_type,codec_name,height",
         "-of",
         "json",
         str(artifact),
@@ -316,12 +329,12 @@ def verify_artifact(
         payload = json.loads(result.stdout)
     except json.JSONDecodeError as exc:
         raise WorkerFailure("PROBE_FAILED", "视频媒体信息无效。", True) from exc
-    validate_artifact_probe(payload, max_duration)
+    height = validate_artifact_probe(payload, max_duration)
     digest = hashlib.sha256()
     with artifact.open("rb") as handle:
         for chunk in iter(lambda: handle.read(1024 * 1024), b""):
             digest.update(chunk)
-    return stat.st_size, digest.hexdigest()
+    return stat.st_size, digest.hexdigest(), height
 
 
 def classify_download_error(message: str, resolving: bool) -> WorkerFailure:
@@ -362,6 +375,8 @@ def run(args: argparse.Namespace) -> None:
         raise WorkerFailure("INVALID_LIMIT", "时长限制无效。", False)
     if not 1 <= args.max_bytes <= 300 * 1024 * 1024:
         raise WorkerFailure("INVALID_LIMIT", "文件限制无效。", False)
+    if args.max_height not in SUPPORTED_MAX_HEIGHTS:
+        raise WorkerFailure("INVALID_LIMIT", "清晰度上限只支持 720p 或 1080p。", False)
     state_root = Path(args.state_root)
     job_dir = resolve_job_dir(state_root, args.job_id)
     ffmpeg_location, ffprobe = locate_ffmpeg()
@@ -381,9 +396,9 @@ def run(args: argparse.Namespace) -> None:
         "ignoreconfig": True,
         "noplaylist": True,
         "playlist_items": "1",
-        "format": BROWSER_COMPATIBLE_FORMAT,
+        "format": browser_compatible_format(args.max_height),
         "format_sort": [
-            "res:720",
+            f"res:{args.max_height}",
             "vcodec:h264",
             "acodec:aac",
             "ext:mp4:m4a",
@@ -451,7 +466,7 @@ def run(args: argparse.Namespace) -> None:
 
     emit("progress", phase="merging", progress=0.94)
     artifact = find_artifact(job_dir)
-    size, sha256 = verify_artifact(
+    size, sha256, height = verify_artifact(
         ffprobe, artifact, args.max_duration, args.max_bytes
     )
     mime_type = mimetypes.guess_type(artifact.name)[0] or "video/mp4"
@@ -465,6 +480,7 @@ def run(args: argparse.Namespace) -> None:
         mimeType=mime_type,
         sizeBytes=size,
         sha256=sha256,
+        height=height,
     )
 
 
@@ -473,6 +489,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--state-root", required=True)
     parser.add_argument("--job-id", required=True)
     parser.add_argument("--bvid", required=True)
+    parser.add_argument("--max-height", required=True, type=int)
     parser.add_argument("--max-duration", required=True, type=int)
     parser.add_argument("--max-bytes", required=True, type=int)
     return parser.parse_args()

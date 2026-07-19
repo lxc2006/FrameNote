@@ -651,7 +651,7 @@ test("validates and proxies Bilibili download jobs without exposing the service 
     {
       method: "POST",
       headers: { "content-type": "application/json" },
-      body: JSON.stringify({ bvid: "BV1nx411u79K" }),
+      body: JSON.stringify({ bvid: "BV1nx411u79K", maxHeight: 1080 }),
     },
     {
       BILIBILI_MEDIA_SERVICE_URL: "http://media.example.com",
@@ -724,7 +724,7 @@ test("validates and proxies Bilibili download jobs without exposing the service 
     {
       method: "POST",
       headers: { "content-type": "application/json" },
-      body: JSON.stringify({ bvid: "BV1nx411u79K" }),
+      body: JSON.stringify({ bvid: "BV1nx411u79K", maxHeight: 1080 }),
     },
     bindings,
   );
@@ -759,7 +759,10 @@ test("validates and proxies Bilibili download jobs without exposing the service 
     upstreamRequests.map(({ method }) => method),
     ["POST", "GET", "GET", "DELETE"],
   );
-  assert.deepEqual(upstreamRequests[0].body, { bvid: "BV1nx411u79K" });
+  assert.deepEqual(upstreamRequests[0].body, {
+    bvid: "BV1nx411u79K",
+    maxHeight: 1080,
+  });
   assert.ok(upstreamRequests.every(
     ({ authorization }) => authorization === "Bearer media-service-test-token",
   ));
@@ -1099,7 +1102,7 @@ test("removes disposable starter assets and keeps model choice decoupled", async
   assert.match(workbench, /analyzeVideo/);
   assert.match(workbench, /askVideo/);
   assert.match(workbench, /downloadBilibiliVideo/);
-  assert.match(workbench, /showDownloadedVideo\(downloaded\.file\)/);
+  assert.match(workbench, /showDownloadedVideo\(downloaded\)/);
   assert.match(workbench, /requireAudio:\s*true/);
   assert.match(workbench, /summaryTimeline/);
   assert.match(workbench, /<h4>时间线<\/h4>/);
@@ -1119,6 +1122,10 @@ test("removes disposable starter assets and keeps model choice decoupled", async
     /完成左侧设置后，你会先得到一份带章节的总结，然后可以像聊天一样继续追问。/,
   );
   assert.match(workbench, /aria-label="视频预览与下载"/);
+  assert.match(workbench, /handleFetchVideo/);
+  assert.match(workbench, /获取视频/);
+  assert.match(workbench, /BILIBILI_VIDEO_QUALITIES/);
+  assert.match(workbench, /最高 \{height\}p/);
   assert.match(workbench, /download=\{videoPreview\.filename\}/);
   assert.match(workbench, /"下载视频"/);
   assert.match(workbench, /"打开\/下载原视频"/);
@@ -1147,12 +1154,16 @@ test("removes disposable starter assets and keeps model choice decoupled", async
   assert.match(settingsMenu, /type="number"/);
   assert.match(settingsMenu, /--ui-font-size/);
   assert.match(settingsMenu, /--text-font-size/);
+  assert.match(settingsMenu, /<option value="dark">深色<\/option>/);
+  assert.doesNotMatch(settingsMenu, /深色（黑灰）/);
   assert.match(styles, /html\[data-theme="dark"\]/);
   assert.match(styles, /--ui-font-zh:/);
   assert.match(styles, /--ui-font-en:/);
   assert.match(styles, /--text-font-zh:/);
   assert.match(styles, /--text-font-en:/);
   assert.match(styles, /html\[data-theme="dark"\] \.primary-action/);
+  assert.match(styles, /html\[data-theme="dark"\] \.video-download-action/);
+  assert.match(styles, /html\[data-theme="dark"\] \.message\.assistant \.message-avatar/);
   assert.doesNotMatch(workbench, /new-task-button|新建任务/);
   assert.doesNotMatch(workbench, /download-option|switch-wrap|下载公开视频，再进行总结/);
   assert.match(styles, /\.conversation-library\s*\{[^}]*display:\s*flex/s);

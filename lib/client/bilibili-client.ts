@@ -2,7 +2,9 @@ import type {
   BilibiliApiErrorBody,
   BilibiliArtifact,
   BilibiliJobSnapshot,
+  BilibiliVideoQuality,
 } from "../bilibili-api";
+import { DEFAULT_BILIBILI_VIDEO_QUALITY } from "../bilibili-api";
 import { LOCAL_VIDEO_PREPROCESSING_LIMITS } from "./video-preprocessor";
 
 const POLL_INTERVAL_MS = 1_000;
@@ -24,11 +26,14 @@ export interface BilibiliDownloadResult {
   title: string;
   durationSeconds: number;
   sizeBytes: number;
+  requestedHeight: BilibiliVideoQuality;
+  height?: number;
 }
 
 export interface BilibiliDownloadOptions {
   signal?: AbortSignal;
   onProgress?: (progress: BilibiliDownloadProgress) => void;
+  maxHeight?: BilibiliVideoQuality;
 }
 
 export class BilibiliClientError extends Error {
@@ -52,13 +57,14 @@ export async function downloadBilibiliVideo(
 
   let jobId: string | undefined;
   const deadline = Date.now() + MAX_JOB_WAIT_MS;
+  const maxHeight = options.maxHeight ?? DEFAULT_BILIBILI_VIDEO_QUALITY;
   try {
     let snapshot = await requestJob(
       "/api/bilibili/jobs",
       {
         method: "POST",
         headers: { "content-type": "application/json" },
-        body: JSON.stringify({ bvid }),
+        body: JSON.stringify({ bvid, maxHeight }),
         signal: options.signal,
       },
     );
@@ -113,6 +119,8 @@ export async function downloadBilibiliVideo(
       title: snapshot.source.title?.trim() || `B站视频 ${snapshot.source.bvid}`,
       durationSeconds,
       sizeBytes: file.size,
+      requestedHeight: maxHeight,
+      height: snapshot.artifact.height,
     };
   } catch (error) {
     if (isAbortError(error) || options.signal?.aborted) {

@@ -452,7 +452,7 @@ export default function UserSettingsMenu() {
               }
             >
               <option value="light">浅色</option>
-              <option value="dark">深色（黑灰）</option>
+              <option value="dark">深色</option>
             </select>
           </label>
 
