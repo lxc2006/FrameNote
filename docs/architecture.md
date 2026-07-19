@@ -29,7 +29,7 @@ interface AskVideoRequest {
 
 当前本地上传提供一条浏览器快速路径：FFmpeg WebAssembly 直接读取用户文件，将单声道 MP3 音轨压缩到目标体积，并按原视频时长均匀抽取最多 24 张 JPEG 关键帧；服务端只接收这些模型证据，不接收完整原视频。该路径适合不超过 300 MB、60 分钟的个人处理，不承担生产环境的大文件持久化、断点续传和后台恢复。
 
-当前 B站来源也已接入这条快速路径：Sites Worker 只代理创建、查询与取消任务的小型 JSON；独立 FastAPI 服务以受控子进程运行 yt-dlp，并调用原生 FFmpeg 合并 B站 DASH 音视频。由于浏览器 FFmpeg WebAssembly 不包含 AV1 解码能力，媒体边界契约固定为 MP4 容器、H.264 视频与 AAC 音频：yt-dlp 从源头硬筛选兼容流，合并后再由 ffprobe 校验全部音视频轨，不能依赖重封装改变编码。任务成功后，浏览器通过短期 HMAC 签名 URL 直接下载临时媒体，再复用同一套 FFmpeg WebAssembly 证据抽取。媒体字节不会经过 Sites Worker。由于网络响应需要先形成浏览器 `File`，首版 B站上限收紧为 150 MB；更大来源应改为媒体服务直接抽取证据或写入对象存储。
+当前 B站来源也已接入这条快速路径：Sites Worker 只代理创建、查询与取消任务的小型 JSON；独立 FastAPI 服务以受控子进程运行 yt-dlp，并调用原生 FFmpeg 合并 B站 DASH 音视频。由于浏览器 FFmpeg WebAssembly 不包含 AV1 解码能力，媒体边界契约固定为 MP4 容器、H.264 视频与 AAC 音频：yt-dlp 从源头硬筛选兼容流，合并后再由 ffprobe 校验全部音视频轨，不能依赖重封装改变编码。任务成功后，浏览器通过短期 HMAC 签名 URL 直接下载临时媒体，再复用同一套 FFmpeg WebAssembly 证据抽取。B站分析把音轨作为必需证据：FFmpeg WASM 音频提取非零退出、读取失败或产生零字节文件时立即终止，API 也拒绝只有关键帧而没有 `audioUrl` 的 B站分析请求，避免静默产出纯画面总结。媒体字节不会经过 Sites Worker。由于网络响应需要先形成浏览器 `File`，首版 B站上限收紧为 150 MB；更大来源应改为媒体服务直接抽取证据或写入对象存储。
 
 浏览器收到完整 B站 `File` 后会立即创建任务级 Blob URL，播放器与下载按钮复用该 URL，因此可以在证据抽取和模型总结尚未完成时预览或保存合并视频。媒体服务任务随后仍可按原策略清理；Blob URL 在新任务、重置或页面卸载时释放。HTTPS 视频直链当前不经过应用下载：浏览器直接用源 URL 流式预览，并提供打开/下载入口；跨域 `download` 是否生效由源站响应头与浏览器策略决定，不能视为持久化产物。
 
@@ -105,9 +105,21 @@ interface AskVideoRequest {
     }
   ],
   "takeaway": "一句话结论",
+  "audioAnalysis": {
+    "status": "analyzed",
+    "summary": "声音整体概述",
+    "speech": null,
+    "music": "可听见的音乐风格、节奏、音色和氛围",
+    "soundscape": "可辨的环境声，若不存在则为 null",
+    "temporalChanges": [
+      { "time": "00:30", "description": "声音出现可靠变化" }
+    ]
+  },
   "evidence": [{ "time": "00:12", "fact": "可核验事实" }]
 }
 ```
+
+`audioAnalysis.status` 取值为 `analyzed | silent | unavailable`。新分析必须返回该字段；旧的已保存总结仍可在问答接口中省略。Qwen 提示词会显式区分独立音轨、视频内嵌音轨和无音频证据三种情况，并禁止从标题或画面猜测音乐、讲话与环境声。
 
 ## 5. 存储边界
 

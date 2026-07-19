@@ -26,12 +26,34 @@ export interface SummaryEvidence {
   fact: string;
 }
 
+export type SummaryAudioStatus = "analyzed" | "silent" | "unavailable";
+
+export interface SummaryAudioChange {
+  time: string;
+  description: string;
+}
+
+export interface SummaryAudioAnalysis {
+  /** analyzed=已听取并分析；silent=已检查但没有可辨声音；unavailable=没有可靠音频证据。 */
+  status: SummaryAudioStatus;
+  summary: string;
+  speech: string | null;
+  music: string | null;
+  soundscape: string | null;
+  temporalChanges: SummaryAudioChange[];
+  uncertainty?: string;
+}
+
 export interface VideoSummary {
   title: string;
   overview: string;
   keyPoints: SummaryPoint[];
   chapters: SummaryChapter[];
   takeaway: string;
+  /**
+   * 新生成的总结会包含独立声音分析；保持可选以兼容旧的已保存总结。
+   */
+  audioAnalysis?: SummaryAudioAnalysis;
   /**
    * 给后续问答使用的事实索引。界面可以不展示，但服务端会用它减少
    * 再次发送整段视频的次数。

@@ -49,9 +49,16 @@ export async function readJsonRequest(request: Request): Promise<unknown> {
 
 export function parseAnalyzeVideoRequest(value: unknown): AnalyzeVideoRequest {
   const object = recordValue(value, "请求体");
+  const source = parseSource(object.source);
+  const context = parseContext(object.context, true);
+  if (source.kind === "bilibili" && !context.audioUrl) {
+    throw new QwenInputError(
+      "B站视频总结必须包含已提取的音轨，不能仅用关键帧生成纯画面总结。",
+    );
+  }
   return {
-    source: parseSource(object.source),
-    context: parseContext(object.context, true),
+    source,
+    context,
   };
 }
 

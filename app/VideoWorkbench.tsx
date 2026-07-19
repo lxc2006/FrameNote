@@ -13,6 +13,7 @@ import {
   extractBvid,
   formatDuration,
   formatFileSize,
+  type SummaryAudioStatus,
   type VideoModelContext,
   type VideoSourceDescriptor,
   type VideoSummary,
@@ -65,6 +66,12 @@ const preprocessingStageIndexes: Record<VideoPreprocessingStage, number> = {
 };
 
 const suggestions = ["这个视频的核心观点是什么？", "按时间线梳理章节", "给我三个行动建议"];
+
+const audioStatusLabels: Record<SummaryAudioStatus, string> = {
+  analyzed: "已分析音轨",
+  silent: "音轨无可辨声音",
+  unavailable: "音轨不可用",
+};
 
 function fileExtension(filename: string) {
   return filename.split(".").pop()?.toLowerCase() ?? "";
@@ -409,6 +416,7 @@ export default function VideoWorkbench() {
         setStageProgress(0);
         const extracted = await extractVideoEvidence(downloaded.file, {
           durationSeconds: downloaded.durationSeconds,
+          requireAudio: true,
           signal: controller.signal,
           onProgress: ({ stage, progress }) => {
             if (runTokenRef.current !== runToken) return;
@@ -455,8 +463,10 @@ export default function VideoWorkbench() {
           role: "assistant",
           content:
             analysisSource.kind === "url"
-              ? "Qwen 已读取视频直链并生成结构化总结。接下来由 DeepSeek V4 Pro 回答核心观点、章节结构、术语解释或行动建议。"
-              : "Qwen 已融合抽取的音轨、关键帧与时间索引并生成结构化总结。接下来由 DeepSeek V4 Pro 回答核心观点、章节结构、术语解释或行动建议。",
+              ? "Qwen 已同时读取视频直链中的画面与内嵌音轨并生成结构化总结。接下来由 DeepSeek V4 Pro 回答核心观点、声音变化、章节结构或行动建议。"
+              : context.audioUrl
+                ? "Qwen 已融合抽取的音轨、关键帧与时间索引并生成结构化总结。接下来由 DeepSeek V4 Pro 回答核心观点、声音变化、章节结构或行动建议。"
+                : "Qwen 已使用关键帧生成结构化总结；该素材没有可用音轨，因此不会推测音乐或环境声。接下来可由 DeepSeek V4 Pro 继续追问。",
         },
       ]);
       setPhase("ready");
@@ -978,6 +988,16 @@ export default function VideoWorkbench() {
                         <strong>{preprocessingResult.frameCount}</strong> 张关键帧
                       </span>
                     ) : null}
+                    {preprocessingResult ? (
+                      <span>
+                        <strong>
+                          {preprocessingResult.audioBytes > 0
+                            ? formatFileSize(preprocessingResult.audioBytes)
+                            : "未提取"}
+                        </strong>{" "}
+                        音轨
+                      </span>
+                    ) : null}
                     <span>
                       <strong>{summary.keyPoints.length}</strong> 个要点
                     </span>
@@ -993,6 +1013,66 @@ export default function VideoWorkbench() {
                     <h4>内容概览</h4>
                     <p className="overview-copy">{summary.overview}</p>
                   </section>
+
+                  {summary.audioAnalysis ? (
+                    <section className="summary-section">
+                      <h4>声音与音乐</h4>
+                      <div
+                        className={`audio-analysis audio-analysis-${summary.audioAnalysis.status}`}
+                      >
+                        <div className="audio-analysis-heading">
+                          <span>{audioStatusLabels[summary.audioAnalysis.status]}</span>
+                        </div>
+                        <p className="audio-analysis-summary">
+                          {summary.audioAnalysis.summary}
+                        </p>
+
+                        {summary.audioAnalysis.status === "analyzed" ? (
+                          <dl className="audio-detail-list">
+                            {summary.audioAnalysis.speech ? (
+                              <div>
+                                <dt>讲话 / 人声</dt>
+                                <dd>{summary.audioAnalysis.speech}</dd>
+                              </div>
+                            ) : null}
+                            {summary.audioAnalysis.music ? (
+                              <div>
+                                <dt>音乐</dt>
+                                <dd>{summary.audioAnalysis.music}</dd>
+                              </div>
+                            ) : null}
+                            {summary.audioAnalysis.soundscape ? (
+                              <div>
+                                <dt>环境声</dt>
+                                <dd>{summary.audioAnalysis.soundscape}</dd>
+                              </div>
+                            ) : null}
+                          </dl>
+                        ) : null}
+
+                        {summary.audioAnalysis.temporalChanges.length > 0 ? (
+                          <div className="audio-change-list">
+                            <strong>声音变化</strong>
+                            {summary.audioAnalysis.temporalChanges.map((change) => (
+                              <div
+                                className="audio-change-row"
+                                key={`${change.time}-${change.description}`}
+                              >
+                                <time>{change.time}</time>
+                                <p>{change.description}</p>
+                              </div>
+                            ))}
+                          </div>
+                        ) : null}
+
+                        {summary.audioAnalysis.uncertainty ? (
+                          <p className="audio-uncertainty">
+                            不确定性：{summary.audioAnalysis.uncertainty}
+                          </p>
+                        ) : null}
+                      </div>
+                    </section>
+                  ) : null}
 
                   <section className="summary-section">
                     <h4>关键观点</h4>

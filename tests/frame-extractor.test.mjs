@@ -29,6 +29,27 @@ test("extracts sampled frames without scanning the full video", async (t) => {
     ));
   });
 
+  await t.test("requires non-empty audio evidence when the source promises audio", () => {
+    assert.throws(
+      () => preprocessor.assertRequiredAudioEvidence(undefined, true),
+      (error) =>
+        error instanceof preprocessor.VideoPreprocessingError &&
+        /音轨|音频/.test(error.message),
+    );
+    assert.throws(
+      () => preprocessor.assertRequiredAudioEvidence(new Uint8Array(), true),
+      (error) =>
+        error instanceof preprocessor.VideoPreprocessingError &&
+        /音轨|音频/.test(error.message),
+    );
+    assert.doesNotThrow(() =>
+      preprocessor.assertRequiredAudioEvidence(undefined, false),
+    );
+    assert.doesNotThrow(() =>
+      preprocessor.assertRequiredAudioEvidence(new Uint8Array([1]), true),
+    );
+  });
+
   await t.test("uses native extraction without invoking the fallback", async () => {
     const nativeFrames = [{ data: new Uint8Array([1]), timestamp: 0 }];
     let fallbackCalls = 0;

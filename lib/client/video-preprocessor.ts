@@ -44,6 +44,8 @@ export interface VideoPreprocessingResult {
 
 export interface VideoPreprocessingOptions {
   durationSeconds: number;
+  /** 为 true 时，缺失或提取失败的音轨会终止处理，禁止静默退化为纯画面分析。 */
+  requireAudio?: boolean;
   signal?: AbortSignal;
   onProgress?: (progress: VideoPreprocessingProgress) => void;
 }
@@ -121,9 +123,15 @@ export async function extractVideoEvidence(
       selectAudioTimeout(options.durationSeconds),
       { signal: options.signal },
     );
-    const audioData = audioExitCode === 0
+    let audioData = audioExitCode === 0
       ? await readBinaryFile(ffmpeg, "audio.mp3", options.signal)
       : undefined;
+    assertRequiredAudioEvidence(
+      audioData,
+      options.requireAudio ?? false,
+      audioExitCode,
+    );
+    if (audioData?.byteLength === 0) audioData = undefined;
     options.onProgress?.({ stage: activeStage, progress: 1 });
 
     activeStage = "extracting-frames";
@@ -210,6 +218,22 @@ export async function extractVideoEvidence(
     if (coreURL?.startsWith("blob:")) URL.revokeObjectURL(coreURL);
     if (wasmURL?.startsWith("blob:")) URL.revokeObjectURL(wasmURL);
   }
+}
+
+export function assertRequiredAudioEvidence(
+  audioData: Uint8Array | undefined,
+  required: boolean,
+  exitCode?: number,
+) {
+  if (!required || (audioData && audioData.byteLength > 0)) return;
+
+  const exitDetail =
+    typeof exitCode === "number" && exitCode !== 0
+      ? `（FFmpeg 退出码 ${exitCode}）`
+      : "";
+  throw new VideoPreprocessingError(
+    `没有提取到有效音轨${exitDetail}。请重试；系统不会在缺少声音证据时生成仅画面的 B站视频总结。`,
+  );
 }
 
 function validateInput(file: File, durationSeconds: number) {

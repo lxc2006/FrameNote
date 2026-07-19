@@ -28,6 +28,15 @@ async function request(pathname, init, bindings = {}) {
   );
 }
 
+function assertAudioAnalysisPrompt(providerRequest) {
+  const prompt = JSON.stringify(providerRequest.body.messages);
+  assert.match(prompt, /audioAnalysis/);
+  assert.match(prompt, /声音|音轨/);
+  assert.match(prompt, /音乐/);
+  assert.match(prompt, /环境声/);
+  assert.match(prompt, /随时间|时间变化|时间演变/);
+}
+
 test("server-renders the FrameNote video workspace", async () => {
   const response = await render();
   assert.equal(response.status, 200);
@@ -227,7 +236,21 @@ test("uses Qwen for analysis and DeepSeek V4 Pro for follow-up answers", async (
     chapters: [{ time: "00:00", title: "开始", description: "介绍测试。" }],
     takeaway: "模型调用链路可用。",
     evidence: [{ time: "00:01", fact: "画面展示了接口测试。" }],
+    audioAnalysis: {
+      status: "analyzed",
+      summary: "低保真爵士乐与站台环境声共同营造出安静的夜间氛围。",
+      speech: null,
+      music: "持续的低保真爵士乐，节奏舒缓。",
+      soundscape: "能够听到轻微的列车站台环境声。",
+      temporalChanges: [{
+        time: "00:12",
+        description: "鼓点逐渐清晰，整体音量略有提升。",
+      }],
+      uncertainty: "无法仅凭当前素材确认具体曲名或艺人。",
+    },
   };
+  const summaryWithoutAudioAnalysis = { ...summary };
+  delete summaryWithoutAudioAnalysis.audioAnalysis;
   const provider = createServer(async (req, res) => {
     let body = "";
     for await (const chunk of req) body += chunk;
@@ -256,7 +279,12 @@ test("uses Qwen for analysis and DeepSeek V4 Pro for follow-up answers", async (
       return;
     }
 
-    const content = `${JSON.stringify(summary)}\n\`\`\``;
+    const responseSummary = JSON.stringify(providerRequest.body.messages).includes(
+      "缺少声音分析字段",
+    )
+      ? summaryWithoutAudioAnalysis
+      : summary;
+    const content = `${JSON.stringify(responseSummary)}\n\`\`\``;
     res.writeHead(200, { "content-type": "text/event-stream" });
     res.write(`data: ${JSON.stringify({
       id: "chatcmpl-qwen-test",
@@ -284,9 +312,10 @@ test("uses Qwen for analysis and DeepSeek V4 Pro for follow-up answers", async (
       headers: { "content-type": "application/json" },
       body: JSON.stringify({
         source: {
-          kind: "upload",
+          kind: "url",
           title: "测试视频",
-          subtitle: "test.mp4",
+          subtitle: "HTTPS 视频直链",
+          sourceUrl: "https://media.example.com/test.mp4",
           downloadFirst: false,
         },
         context: {
@@ -314,6 +343,7 @@ test("uses Qwen for analysis and DeepSeek V4 Pro for follow-up answers", async (
   assert.equal(videoPart.type, "video_url");
   assert.equal(videoPart.video_url.url, "https://media.example.com/test.mp4");
   assert.equal(videoPart.fps, 0.5);
+  assertAudioAnalysisPrompt(providerRequest);
 
   const extractedMediaResponse = await request(
     "/api/model/analyze",
@@ -322,10 +352,12 @@ test("uses Qwen for analysis and DeepSeek V4 Pro for follow-up answers", async (
       headers: { "content-type": "application/json" },
       body: JSON.stringify({
         source: {
-          kind: "upload",
-          title: "本地预处理视频",
-          subtitle: "local.mp4",
-          downloadFirst: false,
+          kind: "bilibili",
+          title: "B站预处理视频",
+          subtitle: "BV1nx411u79K",
+          bvid: "BV1nx411u79K",
+          sourceUrl: "https://www.bilibili.com/video/BV1nx411u79K",
+          downloadFirst: true,
         },
         context: {
           frameUrls: [
@@ -345,6 +377,8 @@ test("uses Qwen for analysis and DeepSeek V4 Pro for follow-up answers", async (
     },
   );
   assert.equal(extractedMediaResponse.status, 200);
+  const extractedMediaPayload = await extractedMediaResponse.json();
+  assert.deepEqual(extractedMediaPayload.summary.audioAnalysis, summary.audioAnalysis);
   const extractedMediaRequest = providerRequests[1];
   const extractedParts = extractedMediaRequest.body.messages[1].content;
   assert.equal(extractedParts[0].type, "video");
@@ -353,7 +387,72 @@ test("uses Qwen for analysis and DeepSeek V4 Pro for follow-up answers", async (
   assert.equal(extractedParts[1].input_audio.format, "mp3");
   assert.equal(extractedParts[1].input_audio.data, "data:audio/mpeg;base64,CCCC");
   assert.match(extractedParts[2].text, /第2帧=12\.50秒/);
+  assertAudioAnalysisPrompt(extractedMediaRequest);
 
+  const providerRequestCountBeforeMissingBvAudio = providerRequests.length;
+  const missingBvAudioResponse = await request(
+    "/api/model/analyze",
+    {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        source: {
+          kind: "bilibili",
+          title: "缺少音轨的 B 站视频",
+          subtitle: "BV1nx411u79K",
+          bvid: "BV1nx411u79K",
+          downloadFirst: true,
+        },
+        context: {
+          frameUrls: ["data:image/jpeg;base64,AAAA"],
+          frameTimestamps: [0],
+        },
+      }),
+    },
+    {
+      DASHSCOPE_API_KEY: "local-test-key",
+      DASHSCOPE_BASE_URL: `http://127.0.0.1:${address.port}/compatible-mode/v1`,
+      QWEN_VIDEO_MODEL: "qwen3.5-omni-plus",
+    },
+  );
+  assert.equal(missingBvAudioResponse.status, 400);
+  const missingBvAudioPayload = await missingBvAudioResponse.json();
+  assert.equal(missingBvAudioPayload.error.code, "INVALID_MODEL_INPUT");
+  assert.match(missingBvAudioPayload.error.message, /音轨|音频|audioUrl/i);
+  assert.equal(providerRequests.length, providerRequestCountBeforeMissingBvAudio);
+
+  const incompleteSummaryResponse = await request(
+    "/api/model/analyze",
+    {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        source: {
+          kind: "url",
+          title: "缺少声音分析字段",
+          subtitle: "HTTPS 视频直链",
+          sourceUrl: "https://media.example.com/incomplete.mp4",
+          downloadFirst: false,
+        },
+        context: {
+          videoUrl: "https://media.example.com/incomplete.mp4",
+          fps: 0.5,
+        },
+      }),
+    },
+    {
+      DASHSCOPE_API_KEY: "local-test-key",
+      DASHSCOPE_BASE_URL: `http://127.0.0.1:${address.port}/compatible-mode/v1`,
+      QWEN_VIDEO_MODEL: "qwen3.5-omni-plus",
+    },
+  );
+  assert.equal(incompleteSummaryResponse.status, 502);
+  assert.equal(
+    (await incompleteSummaryResponse.json()).error.code,
+    "INVALID_MODEL_RESPONSE",
+  );
+
+  const askProviderRequestIndex = providerRequests.length;
   const askResponse = await request(
     "/api/model/ask",
     {
@@ -382,10 +481,38 @@ test("uses Qwen for analysis and DeepSeek V4 Pro for follow-up answers", async (
   assert.equal(askPayload.provider, "deepseek");
   assert.equal(askPayload.model, "deepseek-v4-pro");
   assert.equal(askPayload.answer, "结论：模型调用链路可用。依据见 00:01。");
-  assert.equal(providerRequests[2].authorization, "Bearer deepseek-test-key");
-  assert.equal(providerRequests[2].url, "/deepseek/chat/completions");
-  assert.equal(providerRequests[2].body.stream, false);
-  assert.match(providerRequests[2].body.messages.at(-1).content, /结论是什么/);
+  const askProviderRequest = providerRequests[askProviderRequestIndex];
+  assert.equal(askProviderRequest.authorization, "Bearer deepseek-test-key");
+  assert.equal(askProviderRequest.url, "/deepseek/chat/completions");
+  assert.equal(askProviderRequest.body.stream, false);
+  const askPrompt = askProviderRequest.body.messages.at(-1).content;
+  assert.match(askPrompt, /结论是什么/);
+  assert.match(askPrompt, /audioAnalysis/);
+  assert.match(askPrompt, /低保真爵士乐/);
+
+  const legacyAskResponse = await request(
+    "/api/model/ask",
+    {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        question: "旧总结还能继续问吗？",
+        source: {
+          kind: "upload",
+          title: "旧版测试视频",
+          subtitle: "legacy.mp4",
+          downloadFirst: false,
+        },
+        summary: summaryWithoutAudioAnalysis,
+      }),
+    },
+    {
+      DEEPSEEK_API_KEY: "deepseek-test-key",
+      DEEPSEEK_BASE_URL: `http://127.0.0.1:${address.port}/deepseek`,
+      DEEPSEEK_CHAT_MODEL: "deepseek-v4-pro",
+    },
+  );
+  assert.equal(legacyAskResponse.status, 200);
 });
 
 test("removes disposable starter assets and keeps model choice decoupled", async () => {
@@ -408,6 +535,8 @@ test("removes disposable starter assets and keeps model choice decoupled", async
   assert.match(workbench, /askVideo/);
   assert.match(workbench, /downloadBilibiliVideo/);
   assert.match(workbench, /showDownloadedVideo\(downloaded\.file\)/);
+  assert.match(workbench, /requireAudio:\s*true/);
+  assert.match(workbench, /声音与音乐/);
   assert.match(workbench, /aria-label="视频预览与下载"/);
   assert.match(workbench, /download=\{videoPreview\.filename\}/);
   assert.match(workbench, /"下载视频"/);
