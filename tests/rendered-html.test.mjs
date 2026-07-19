@@ -538,6 +538,59 @@ test("persists owner-scoped video conversations through their D1 lifecycle", asy
   assert.deepEqual((await emptyListResponse.json()).conversations, []);
 });
 
+test("persists new summaries without a legacy takeaway", async () => {
+  const database = new FakeD1Database();
+  const source = {
+    kind: "upload",
+    title: "无一句话总结测试",
+    subtitle: "summary.mp4",
+    downloadFirst: false,
+  };
+  const summary = {
+    title: "无一句话总结测试",
+    overview: "视频依次说明了问题背景、主要步骤和后续建议。",
+    keyPoints: [
+      {
+        time: "00:00",
+        title: "问题背景",
+        detail: "开头交代问题背景，并通过旁白说明分析目标。",
+      },
+    ],
+    chapters: [
+      {
+        time: "00:00",
+        title: "开场",
+        description: "介绍问题和分析目标。",
+      },
+    ],
+    takeaway: "",
+    evidence: [],
+  };
+
+  const response = await request(
+    "/api/conversations",
+    {
+      method: "POST",
+      headers: {
+        "content-type": "application/json",
+        "oai-authenticated-user-email": "viewer@example.com",
+      },
+      body: JSON.stringify({
+        source,
+        summary,
+        messages: [{ role: "assistant", content: "总结已经生成。" }],
+        activeModel: "qwen3.5-omni-plus",
+      }),
+    },
+    { DB: database },
+  );
+
+  assert.equal(response.status, 201);
+  const created = (await response.json()).conversation;
+  assert.equal("takeaway" in created.summary, false);
+  assert.equal(database.conversations.size, 1);
+});
+
 test("exposes Qwen and DeepSeek model status without leaking credentials", async () => {
   const response = await request("/api/model/status");
   assert.equal(response.status, 200);

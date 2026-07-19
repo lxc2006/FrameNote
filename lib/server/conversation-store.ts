@@ -657,8 +657,8 @@ function parseSummary(value: unknown, fallbackTitle: string): VideoSummary {
   );
   stringValue(object.title, "summary.title", 300);
   stringValue(object.overview, "summary.overview", 40_000);
-  if (object.takeaway !== undefined) {
-    stringValue(object.takeaway, "summary.takeaway", 10_000);
+  if (optionalString(object.takeaway, "summary.takeaway", 10_000) === undefined) {
+    delete object.takeaway;
   }
   validateObjectArray(
     object.keyPoints,

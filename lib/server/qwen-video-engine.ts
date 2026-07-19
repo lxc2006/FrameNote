@@ -300,12 +300,14 @@ export function parseVideoSummary(
     throw new QwenResponseError("没有音频证据时，audioAnalysis.status 必须为 unavailable。");
   }
 
+  const takeaway = optionalString(object.takeaway);
+
   return {
     title: optionalString(object.title) ?? fallbackTitle,
     overview: requiredString(object.overview, "overview"),
     keyPoints,
     chapters,
-    takeaway: optionalString(object.takeaway) ?? "",
+    ...(takeaway ? { takeaway } : {}),
     ...(audioAnalysis ? { audioAnalysis } : {}),
     evidence,
   };

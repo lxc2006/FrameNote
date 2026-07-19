@@ -51,7 +51,7 @@ export interface VideoSummary {
   keyPoints: SummaryPoint[];
   chapters: SummaryChapter[];
   /** Kept for older saved summaries; new UI no longer presents this separately. */
-  takeaway: string;
+  takeaway?: string;
   /**
    * 新生成的总结会包含独立声音分析；保持可选以兼容旧的已保存总结。
    */
