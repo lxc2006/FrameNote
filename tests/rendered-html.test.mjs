@@ -1342,6 +1342,18 @@ test("removes disposable starter assets and keeps model choice decoupled", async
   assert.match(styles, /--text-font:/);
   assert.match(styles, /html\[data-theme="dark"\] \.primary-action/);
   assert.doesNotMatch(styles, /video-download-action/);
+  assert.match(
+    styles,
+    /html\[data-theme="dark"\] \.timeline-seek\s*\{[^}]*background:\s*transparent;[^}]*color:\s*#43adf5;/s,
+  );
+  assert.match(
+    styles,
+    /\.video-preview-details > strong\s*\{[^}]*var\(--ui-font-size\)/s,
+  );
+  assert.match(
+    styles,
+    /\.video-preview-meta\s*\{[^}]*var\(--ui-font-size\)/s,
+  );
   assert.match(styles, /html\[data-theme="dark"\] \.message\.assistant \.message-avatar/);
   assert.doesNotMatch(workbench, /new-task-button|新建任务/);
   assert.doesNotMatch(workbench, /download-option|switch-wrap|下载公开视频，再进行总结/);
