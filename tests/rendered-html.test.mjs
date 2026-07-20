@@ -122,6 +122,17 @@ class FakeD1Database {
     }
 
     if (
+      query ===
+      "select source_json from conversations where id = ? and owner_id = ?"
+    ) {
+      const [id, ownerId] = parameters;
+      const conversation = this.conversations.get(id);
+      return conversation?.owner_id === ownerId
+        ? [{ source_json: conversation.source_json }]
+        : [];
+    }
+
+    if (
       query.startsWith(
         "select id, role, content, created_at from conversation_messages where conversation_id = ? order by sequence asc",
       )
@@ -275,6 +286,20 @@ class FakeD1Database {
       return successfulD1Result();
     }
 
+
+    if (
+      query.startsWith(
+        "update conversations set source_json = ?, updated_at = ? where id = ? and owner_id = ?",
+      )
+    ) {
+      const [sourceJson, updatedAt, id, ownerId] = parameters;
+      const conversation = this.conversations.get(id);
+      if (conversation?.owner_id !== ownerId) return successfulD1Result(0);
+      conversation.source_json = sourceJson;
+      conversation.updated_at = updatedAt;
+      return successfulD1Result();
+    }
+
     if (query.startsWith("delete from conversation_messages where conversation_id in")) {
       const [id, ownerId] = parameters;
       const conversation = this.conversations.get(id);
@@ -297,6 +322,73 @@ class FakeD1Database {
     }
 
     throw new Error(`Fake D1 does not support mutation: ${query}`);
+  }
+}
+
+class FakeR2Bucket {
+  constructor() {
+    this.objects = new Map();
+    this.uploads = new Map();
+    this.counter = 0;
+  }
+
+  async createMultipartUpload(key, options = {}) {
+    const uploadId = `upload-${++this.counter}`;
+    this.uploads.set(uploadId, { key, options, parts: new Map() });
+    return this.resumeMultipartUpload(key, uploadId);
+  }
+
+  resumeMultipartUpload(key, uploadId) {
+    const uploads = this.uploads;
+    const objects = this.objects;
+    return {
+      key,
+      uploadId,
+      async uploadPart(partNumber, value) {
+        const upload = uploads.get(uploadId);
+        assert.equal(upload?.key, key);
+        const bytes = new Uint8Array(await new Response(value).arrayBuffer());
+        upload.parts.set(partNumber, bytes);
+        return { partNumber, etag: `etag-${partNumber}-${bytes.byteLength}` };
+      },
+      async complete(parts) {
+        const upload = uploads.get(uploadId);
+        assert.ok(upload);
+        const chunks = parts.map(({ partNumber }) => upload.parts.get(partNumber));
+        assert.ok(chunks.every(Boolean));
+        const size = chunks.reduce((total, chunk) => total + chunk.byteLength, 0);
+        const bytes = new Uint8Array(size);
+        let offset = 0;
+        for (const chunk of chunks) {
+          bytes.set(chunk, offset);
+          offset += chunk.byteLength;
+        }
+        objects.set(key, { bytes, options: upload.options });
+        uploads.delete(uploadId);
+      },
+      async abort() {
+        uploads.delete(uploadId);
+      },
+    };
+  }
+
+  async get(key, options = {}) {
+    const object = this.objects.get(key);
+    if (!object) return null;
+    const range = options.range;
+    const bytes = range
+      ? object.bytes.slice(range.offset, range.offset + range.length)
+      : object.bytes;
+    return {
+      body: new Response(bytes).body,
+      size: object.bytes.byteLength,
+      etag: "stored-etag",
+      httpMetadata: object.options.httpMetadata,
+    };
+  }
+
+  async delete(key) {
+    this.objects.delete(key);
   }
 }
 
@@ -490,6 +582,77 @@ test("persists owner-scoped video conversations through their D1 lifecycle", asy
     ],
   );
 
+  const media = new FakeR2Bucket();
+  const videoBytes = new Uint8Array([0, 1, 2, 3, 4, 5]);
+  const storedVideo = {
+    filename: "station-lofi.mp4",
+    mimeType: "video/mp4",
+    sizeBytes: videoBytes.byteLength,
+    title: "站台 Lofi",
+    description: "已随对话保存的视频。",
+    durationLabel: "07:00",
+    qualityLabel: "实际 1280×720",
+    sourceLabel: "本地上传",
+  };
+  const initializeVideoResponse = await request(
+    `/api/conversations/${created.id}/video`,
+    {
+      method: "POST",
+      headers: ownerHeaders,
+      body: JSON.stringify({ video: storedVideo }),
+    },
+    { DB: database, MEDIA: media },
+  );
+  assert.equal(initializeVideoResponse.status, 201);
+  const initializedVideo = await initializeVideoResponse.json();
+  const uploadPartResponse = await request(
+    `/api/conversations/${created.id}/video?uploadId=${initializedVideo.uploadId}&partNumber=1`,
+    {
+      method: "PUT",
+      headers: {
+        "oai-authenticated-user-email": "viewer@example.com",
+        "content-type": "application/octet-stream",
+        "x-video-part-bytes": String(videoBytes.byteLength),
+      },
+      body: videoBytes,
+    },
+    { DB: database, MEDIA: media },
+  );
+  assert.equal(uploadPartResponse.status, 201);
+  const uploadedPart = await uploadPartResponse.json();
+  const completeVideoResponse = await request(
+    `/api/conversations/${created.id}/video`,
+    {
+      method: "PATCH",
+      headers: ownerHeaders,
+      body: JSON.stringify({
+        uploadId: initializedVideo.uploadId,
+        parts: [uploadedPart],
+        video: storedVideo,
+      }),
+    },
+    { DB: database, MEDIA: media },
+  );
+  assert.equal(completeVideoResponse.status, 200);
+  assert.deepEqual((await completeVideoResponse.json()).source.persistedVideo, storedVideo);
+
+  const rangedVideoResponse = await request(
+    `/api/conversations/${created.id}/video`,
+    {
+      headers: {
+        "oai-authenticated-user-email": "viewer@example.com",
+        range: "bytes=2-4",
+      },
+    },
+    { DB: database, MEDIA: media },
+  );
+  assert.equal(rangedVideoResponse.status, 206);
+  assert.equal(rangedVideoResponse.headers.get("content-range"), "bytes 2-4/6");
+  assert.deepEqual(
+    [...new Uint8Array(await rangedVideoResponse.arrayBuffer())],
+    [2, 3, 4],
+  );
+
   const renameResponse = await request(
     `/api/conversations/${created.id}`,
     {
@@ -519,9 +682,10 @@ test("persists owner-scoped video conversations through their D1 lifecycle", asy
       method: "DELETE",
       headers: { "oai-authenticated-user-email": "viewer@example.com" },
     },
-    { DB: database },
+    { DB: database, MEDIA: media },
   );
   assert.equal(deleteResponse.status, 204);
+  assert.equal(media.objects.size, 0);
 
   const missingResponse = await request(
     `/api/conversations/${created.id}`,
@@ -1076,6 +1240,8 @@ test("removes disposable starter assets and keeps model choice decoupled", async
     hostingJson,
     databaseSchema,
     databaseMigration,
+    conversationVideoStore,
+    conversationVideoRoute,
   ] = await Promise.all([
     readFile(new URL("../app/page.tsx", import.meta.url), "utf8"),
     readFile(new URL("../app/layout.tsx", import.meta.url), "utf8"),
@@ -1091,6 +1257,11 @@ test("removes disposable starter assets and keeps model choice decoupled", async
     readFile(new URL("../.openai/hosting.json", import.meta.url), "utf8"),
     readFile(new URL("../db/schema.ts", import.meta.url), "utf8"),
     readFile(new URL("../drizzle/0000_first_darkhawk.sql", import.meta.url), "utf8"),
+    readFile(new URL("../lib/server/conversation-video-store.ts", import.meta.url), "utf8"),
+    readFile(
+      new URL("../app/api/conversations/[conversationId]/video/route.ts", import.meta.url),
+      "utf8",
+    ),
   ]);
 
   assert.match(page, /<VideoWorkbench \/>/);
@@ -1128,6 +1299,11 @@ test("removes disposable starter assets and keeps model choice decoupled", async
   assert.match(workbench, /最高兼容清晰度/);
   assert.doesNotMatch(workbench, /BILIBILI_VIDEO_QUALITIES|最高 \{height\}p/);
   assert.match(workbench, /download=\{videoPreview\.filename\}/);
+  assert.match(workbench, /MarkdownMessage/);
+  assert.match(workbench, /timeline-seek/);
+  assert.match(workbench, /seekToTimeline/);
+  assert.match(workbench, /showStoredVideo/);
+  assert.doesNotMatch(workbench, /summary-mode|>结构化</);
   assert.match(workbench, /"下载视频"/);
   assert.match(workbench, /"打开\/下载原视频"/);
   assert.match(bilibiliClient, /\/api\/bilibili\/jobs/);
@@ -1138,6 +1314,8 @@ test("removes disposable starter assets and keeps model choice decoupled", async
     "renameConversation",
     "deleteConversation",
     "appendConversationMessages",
+    "storeConversationVideo",
+    "conversationVideoUrl",
   ]) {
     assert.match(conversationClient, new RegExp(`function ${clientOperation}\\b`));
     assert.match(workbench, new RegExp(`\\b${clientOperation}\\b`));
@@ -1155,13 +1333,14 @@ test("removes disposable starter assets and keeps model choice decoupled", async
   assert.match(settingsMenu, /type="number"/);
   assert.match(settingsMenu, /--ui-font-size/);
   assert.match(settingsMenu, /--text-font-size/);
+  assert.match(settingsMenu, /--ui-font/);
+  assert.match(settingsMenu, /--text-font/);
+  assert.doesNotMatch(settingsMenu, />中文字体<|>英文字体</);
   assert.match(settingsMenu, /<option value="dark">深色<\/option>/);
   assert.doesNotMatch(settingsMenu, /深色（黑灰）/);
   assert.match(styles, /html\[data-theme="dark"\]/);
-  assert.match(styles, /--ui-font-zh:/);
-  assert.match(styles, /--ui-font-en:/);
-  assert.match(styles, /--text-font-zh:/);
-  assert.match(styles, /--text-font-en:/);
+  assert.match(styles, /--ui-font:/);
+  assert.match(styles, /--text-font:/);
   assert.match(styles, /html\[data-theme="dark"\] \.primary-action/);
   assert.match(styles, /html\[data-theme="dark"\] \.video-download-action/);
   assert.match(styles, /html\[data-theme="dark"\] \.message\.assistant \.message-avatar/);
@@ -1170,6 +1349,12 @@ test("removes disposable starter assets and keeps model choice decoupled", async
   assert.match(styles, /\.conversation-library\s*\{[^}]*display:\s*flex/s);
   assert.match(styles, /\.conversation-list\s*\{[^}]*flex:\s*1/s);
   assert.equal(JSON.parse(hostingJson).d1, "DB");
+  assert.equal(JSON.parse(hostingJson).r2, "MEDIA");
+  assert.match(conversationVideoStore, /createMultipartUpload/);
+  assert.match(conversationVideoStore, /resumeMultipartUpload/);
+  assert.match(conversationVideoStore, /content-range/);
+  assert.match(conversationVideoRoute, /export async function GET/);
+  assert.match(conversationVideoRoute, /export async function PATCH/);
   assert.match(databaseSchema, /sqliteTable\(\s*"conversations"/);
   assert.match(databaseSchema, /sqliteTable\(\s*"conversation_messages"/);
   assert.match(databaseSchema, /conversations_owner_updated_idx/);

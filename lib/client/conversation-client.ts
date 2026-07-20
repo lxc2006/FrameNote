@@ -4,6 +4,12 @@ import type {
   ConversationMessage,
   CreateConversationInput,
 } from "@/lib/conversation";
+import type {
+  PersistedVideoDescriptor,
+  VideoSourceDescriptor,
+} from "@/lib/video-engine";
+
+const VIDEO_UPLOAD_CHUNK_BYTES = 8 * 1024 * 1024;
 
 interface ConversationErrorPayload {
   error?: {
@@ -93,4 +99,71 @@ export async function appendConversationMessages(
     },
   );
   return payload.messages;
+}
+
+export async function storeConversationVideo(
+  id: string,
+  file: File,
+  video: PersistedVideoDescriptor,
+  signal?: AbortSignal,
+): Promise<VideoSourceDescriptor> {
+  const path = `/api/conversations/${encodeURIComponent(id)}/video`;
+  const initialized = await conversationRequest<{
+    uploadId: string;
+    chunkBytes: number;
+  }>(path, {
+    method: "POST",
+    body: JSON.stringify({ video }),
+    signal,
+  });
+  const chunkBytes = initialized.chunkBytes || VIDEO_UPLOAD_CHUNK_BYTES;
+  const parts: Array<{ partNumber: number; etag: string }> = [];
+
+  try {
+    for (let offset = 0, partNumber = 1; offset < file.size; partNumber += 1) {
+      const chunk = file.slice(offset, Math.min(file.size, offset + chunkBytes));
+      const query = new URLSearchParams({
+        uploadId: initialized.uploadId,
+        partNumber: String(partNumber),
+      });
+      const response = await conversationRequest<{
+        partNumber: number;
+        etag: string;
+      }>(`${path}?${query}`, {
+        method: "PUT",
+        headers: {
+          "content-type": "application/octet-stream",
+          "x-video-part-bytes": String(chunk.size),
+        },
+        body: chunk,
+        signal,
+      });
+      parts.push(response);
+      offset += chunk.size;
+    }
+
+    const completed = await conversationRequest<{ source: VideoSourceDescriptor }>(
+      path,
+      {
+        method: "PATCH",
+        body: JSON.stringify({
+          uploadId: initialized.uploadId,
+          parts,
+          video,
+        }),
+        signal,
+      },
+    );
+    return completed.source;
+  } catch (error) {
+    const query = new URLSearchParams({ uploadId: initialized.uploadId });
+    void fetch(`${path}?${query}`, { method: "DELETE", keepalive: true }).catch(
+      () => undefined,
+    );
+    throw error;
+  }
+}
+
+export function conversationVideoUrl(id: string) {
+  return `/api/conversations/${encodeURIComponent(id)}/video`;
 }

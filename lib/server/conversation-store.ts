@@ -5,6 +5,7 @@ import type {
   CreateConversationInput,
 } from "../conversation";
 import type {
+  PersistedVideoDescriptor,
   SourceKind,
   VideoSourceDescriptor,
   VideoSummary,
@@ -66,6 +67,18 @@ const SOURCE_KEYS = [
   "bvid",
   "sourceUrl",
   "downloadFirst",
+  "persistedVideo",
+] as const;
+
+const PERSISTED_VIDEO_KEYS = [
+  "filename",
+  "mimeType",
+  "sizeBytes",
+  "title",
+  "description",
+  "durationLabel",
+  "qualityLabel",
+  "sourceLabel",
 ] as const;
 
 interface ConversationRow {
@@ -378,6 +391,37 @@ export async function renameConversation(
   return listItemFromRow(row);
 }
 
+export async function saveConversationVideoMetadata(
+  ownerId: string,
+  conversationId: string,
+  video: PersistedVideoDescriptor,
+): Promise<VideoSourceDescriptor> {
+  const databaseBinding = await database();
+  const row = await databaseBinding
+    .prepare(
+      `SELECT source_json
+       FROM conversations
+       WHERE id = ? AND owner_id = ?`,
+    )
+    .bind(conversationId, ownerId)
+    .first<{ source_json: string }>();
+  if (!row) throw conversationNotFound();
+
+  const source = parseSource(JSON.parse(row.source_json));
+  const persistedVideo = parsePersistedVideo(video, "source.persistedVideo");
+  const nextSource: VideoSourceDescriptor = { ...source, persistedVideo };
+  const result = await databaseBinding
+    .prepare(
+      `UPDATE conversations
+       SET source_json = ?, updated_at = ?
+       WHERE id = ? AND owner_id = ?`,
+    )
+    .bind(JSON.stringify(nextSource), Date.now(), conversationId, ownerId)
+    .run();
+  assertStatementSucceeded(result);
+  return nextSource;
+}
+
 export async function deleteConversation(
   ownerId: string,
   conversationId: string,
@@ -516,7 +560,10 @@ async function database(): Promise<D1Database> {
   return binding;
 }
 
-async function requireOwnedConversation(ownerId: string, conversationId: string) {
+export async function requireOwnedConversation(
+  ownerId: string,
+  conversationId: string,
+) {
   const databaseBinding = await database();
   const row = await databaseBinding
     .prepare("SELECT id FROM conversations WHERE id = ? AND owner_id = ?")
@@ -544,6 +591,9 @@ function parseSource(value: unknown): VideoSourceDescriptor {
     object.downloadFirst,
     "source.downloadFirst",
   );
+  const persistedVideo = object.persistedVideo === undefined
+    ? undefined
+    : parsePersistedVideo(object.persistedVideo, "source.persistedVideo");
 
   if (kind === "upload") {
     if (object.bvid !== undefined || object.sourceUrl !== undefined) {
@@ -558,6 +608,7 @@ function parseSource(value: unknown): VideoSourceDescriptor {
       subtitle,
       downloadFirst,
       ...(durationLabel ? { durationLabel } : {}),
+      ...(persistedVideo ? { persistedVideo } : {}),
     };
   }
 
@@ -590,6 +641,7 @@ function parseSource(value: unknown): VideoSourceDescriptor {
       sourceUrl: `https://www.bilibili.com/video/${bvid}`,
       downloadFirst,
       ...(durationLabel ? { durationLabel } : {}),
+      ...(persistedVideo ? { persistedVideo } : {}),
     };
   }
 
@@ -610,6 +662,59 @@ function parseSource(value: unknown): VideoSourceDescriptor {
     sourceUrl,
     downloadFirst,
     ...(durationLabel ? { durationLabel } : {}),
+    ...(persistedVideo ? { persistedVideo } : {}),
+  };
+}
+
+function parsePersistedVideo(
+  value: unknown,
+  field: string,
+): PersistedVideoDescriptor {
+  const object = recordValue(value, field);
+  assertOnlyKeys(object, [...PERSISTED_VIDEO_KEYS], field);
+  const mimeType = stringValue(object.mimeType, `${field}.mimeType`, 100);
+  if (!/^video\/[a-z0-9.+-]+$/i.test(mimeType)) {
+    throw invalidInput(`${field}.mimeType 必须是视频 MIME 类型。`);
+  }
+  const sizeBytes = object.sizeBytes;
+  if (
+    typeof sizeBytes !== "number" ||
+    !Number.isSafeInteger(sizeBytes) ||
+    sizeBytes <= 0 ||
+    sizeBytes > 150 * 1024 * 1024
+  ) {
+    throw invalidInput(`${field}.sizeBytes 超出视频存储限制。`);
+  }
+
+  const title = optionalString(object.title, `${field}.title`, 300);
+  const durationLabel = optionalString(
+    object.durationLabel,
+    `${field}.durationLabel`,
+    100,
+  );
+  const qualityLabel = optionalString(
+    object.qualityLabel,
+    `${field}.qualityLabel`,
+    200,
+  );
+  const sourceLabel = optionalString(
+    object.sourceLabel,
+    `${field}.sourceLabel`,
+    200,
+  );
+  return {
+    filename: stringValue(object.filename, `${field}.filename`, 255),
+    mimeType,
+    sizeBytes,
+    description: stringValue(
+      object.description,
+      `${field}.description`,
+      1_000,
+    ),
+    ...(title ? { title } : {}),
+    ...(durationLabel ? { durationLabel } : {}),
+    ...(qualityLabel ? { qualityLabel } : {}),
+    ...(sourceLabel ? { sourceLabel } : {}),
   };
 }
 

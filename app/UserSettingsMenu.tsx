@@ -10,26 +10,30 @@ import {
 } from "react";
 
 type ThemePreference = "light" | "dark";
-type ChineseFontPreference =
+type FontPreference =
   | "system"
   | "microsoft-yahei"
   | "youyuan"
   | "kaiti"
   | "source-han-sans"
-  | "songti";
-type EnglishFontPreference = "system" | "humanist" | "serif" | "consolas";
+  | "songti"
+  | "humanist"
+  | "serif"
+  | "consolas";
 
 interface UserPreferences {
   theme: ThemePreference;
-  uiChineseFont: ChineseFontPreference;
-  uiEnglishFont: EnglishFontPreference;
+  uiFont: FontPreference;
   uiFontSize: number;
-  textChineseFont: ChineseFontPreference;
-  textEnglishFont: EnglishFontPreference;
+  textFont: FontPreference;
   textFontSize: number;
 }
 
 interface LegacyUserPreferences {
+  uiChineseFont?: FontPreference;
+  uiEnglishFont?: FontPreference;
+  textChineseFont?: FontPreference;
+  textEnglishFont?: FontPreference;
   chineseFont?: "system" | "source-han-sans" | "serif";
   englishFont?: "system" | "humanist" | "serif";
   fontSize?: "small" | "standard" | "comfortable" | "large";
@@ -43,31 +47,27 @@ const DEFAULT_FONT_SIZE = 16;
 
 const DEFAULT_PREFERENCES: UserPreferences = {
   theme: "light",
-  uiChineseFont: "system",
-  uiEnglishFont: "system",
+  uiFont: "system",
   uiFontSize: DEFAULT_FONT_SIZE,
-  textChineseFont: "system",
-  textEnglishFont: "system",
+  textFont: "system",
   textFontSize: DEFAULT_FONT_SIZE,
 };
 
-const CHINESE_FONT_STACKS: Record<ChineseFontPreference, string> = {
-  system:
-    '"Microsoft YaHei", "PingFang SC", "Noto Sans CJK SC", sans-serif',
+const FONT_STACKS: Record<FontPreference, string> = {
+  system: 'Inter, "Segoe UI", "Microsoft YaHei", "PingFang SC", sans-serif',
   "microsoft-yahei":
-    '"Microsoft YaHei", "Microsoft YaHei UI", "PingFang SC", sans-serif',
-  youyuan: 'YouYuan, "幼圆", "Microsoft YaHei", sans-serif',
-  kaiti: 'KaiTi, "楷体", STKaiti, "Microsoft YaHei", serif',
+    '"Microsoft YaHei", "Microsoft YaHei UI", "Segoe UI", sans-serif',
+  youyuan: 'YouYuan, "幼圆", "Microsoft YaHei", "Segoe UI", sans-serif',
+  kaiti: 'KaiTi, "楷体", STKaiti, "Microsoft YaHei", Georgia, serif',
   "source-han-sans":
-    '"Source Han Sans SC", "Noto Sans CJK SC", "Microsoft YaHei", sans-serif',
-  songti: 'SimSun, "宋体", "Songti SC", STSong, serif',
-};
-
-const ENGLISH_FONT_STACKS: Record<EnglishFontPreference, string> = {
-  system: 'Inter, "Segoe UI", Arial, sans-serif',
-  humanist: '"Trebuchet MS", "Segoe UI", Arial, sans-serif',
-  serif: 'Georgia, "Times New Roman", serif',
-  consolas: 'Consolas, "Cascadia Mono", "Courier New", monospace',
+    '"Source Han Sans SC", "Noto Sans CJK SC", "Microsoft YaHei", "Segoe UI", sans-serif',
+  songti: 'SimSun, "宋体", "Songti SC", STSong, Georgia, serif',
+  humanist:
+    '"Trebuchet MS", "Segoe UI", "Microsoft YaHei", "PingFang SC", sans-serif',
+  serif:
+    'Georgia, "Times New Roman", SimSun, "宋体", "Songti SC", serif',
+  consolas:
+    'Consolas, "Cascadia Mono", "Microsoft YaHei", "PingFang SC", monospace',
 };
 
 const LEGACY_FONT_SIZES: Record<NonNullable<LegacyUserPreferences["fontSize"]>, number> = {
@@ -92,24 +92,14 @@ function isThemePreference(value: unknown): value is ThemePreference {
   return value === "light" || value === "dark";
 }
 
-function isChineseFontPreference(
-  value: unknown,
-): value is ChineseFontPreference {
+function isFontPreference(value: unknown): value is FontPreference {
   return (
     value === "system" ||
     value === "microsoft-yahei" ||
     value === "youyuan" ||
     value === "kaiti" ||
     value === "source-han-sans" ||
-    value === "songti"
-  );
-}
-
-function isEnglishFontPreference(
-  value: unknown,
-): value is EnglishFontPreference {
-  return (
-    value === "system" ||
+    value === "songti" ||
     value === "humanist" ||
     value === "serif" ||
     value === "consolas"
@@ -122,12 +112,6 @@ function normalizeFontSize(value: unknown, fallback: number) {
     : fallback;
 }
 
-function migrateLegacyChineseFont(
-  value: LegacyUserPreferences["chineseFont"],
-): ChineseFontPreference {
-  return value === "serif" ? "songti" : value ?? "system";
-}
-
 function parsePreferences(storedValue: string): UserPreferences {
   try {
     if (!storedValue) {
@@ -136,10 +120,20 @@ function parsePreferences(storedValue: string): UserPreferences {
 
     const parsed = JSON.parse(storedValue) as Partial<UserPreferences> &
       LegacyUserPreferences;
-    const legacyChineseFont = migrateLegacyChineseFont(parsed.chineseFont);
-    const legacyEnglishFont = isEnglishFontPreference(parsed.englishFont)
-      ? parsed.englishFont
-      : DEFAULT_PREFERENCES.uiEnglishFont;
+    const legacyFont = isFontPreference(parsed.uiChineseFont)
+      ? parsed.uiChineseFont
+      : isFontPreference(parsed.uiEnglishFont)
+        ? parsed.uiEnglishFont
+        : isFontPreference(parsed.chineseFont)
+          ? parsed.chineseFont === "serif" ? "songti" : parsed.chineseFont
+          : isFontPreference(parsed.englishFont)
+            ? parsed.englishFont
+            : DEFAULT_PREFERENCES.uiFont;
+    const legacyTextFont = isFontPreference(parsed.textChineseFont)
+      ? parsed.textChineseFont
+      : isFontPreference(parsed.textEnglishFont)
+        ? parsed.textEnglishFont
+        : legacyFont;
     const legacyFontSize = isLegacyFontSize(parsed.fontSize)
       ? LEGACY_FONT_SIZES[parsed.fontSize]
       : DEFAULT_FONT_SIZE;
@@ -148,19 +142,11 @@ function parsePreferences(storedValue: string): UserPreferences {
       theme: isThemePreference(parsed.theme)
         ? parsed.theme
         : DEFAULT_PREFERENCES.theme,
-      uiChineseFont: isChineseFontPreference(parsed.uiChineseFont)
-        ? parsed.uiChineseFont
-        : legacyChineseFont,
-      uiEnglishFont: isEnglishFontPreference(parsed.uiEnglishFont)
-        ? parsed.uiEnglishFont
-        : legacyEnglishFont,
+      uiFont: isFontPreference(parsed.uiFont) ? parsed.uiFont : legacyFont,
       uiFontSize: normalizeFontSize(parsed.uiFontSize, legacyFontSize),
-      textChineseFont: isChineseFontPreference(parsed.textChineseFont)
-        ? parsed.textChineseFont
-        : legacyChineseFont,
-      textEnglishFont: isEnglishFontPreference(parsed.textEnglishFont)
-        ? parsed.textEnglishFont
-        : legacyEnglishFont,
+      textFont: isFontPreference(parsed.textFont)
+        ? parsed.textFont
+        : legacyTextFont,
       textFontSize: normalizeFontSize(parsed.textFontSize, legacyFontSize),
     };
   } catch {
@@ -199,23 +185,9 @@ function subscribeToPreferenceStorage(onStoreChange: () => void) {
 function applyPreferences(preferences: UserPreferences) {
   const root = document.documentElement;
   root.dataset.theme = preferences.theme;
-  root.style.setProperty(
-    "--ui-font-zh",
-    CHINESE_FONT_STACKS[preferences.uiChineseFont],
-  );
-  root.style.setProperty(
-    "--ui-font-en",
-    ENGLISH_FONT_STACKS[preferences.uiEnglishFont],
-  );
+  root.style.setProperty("--ui-font", FONT_STACKS[preferences.uiFont]);
   root.style.setProperty("--ui-font-size", `${preferences.uiFontSize}px`);
-  root.style.setProperty(
-    "--text-font-zh",
-    CHINESE_FONT_STACKS[preferences.textChineseFont],
-  );
-  root.style.setProperty(
-    "--text-font-en",
-    ENGLISH_FONT_STACKS[preferences.textEnglishFont],
-  );
+  root.style.setProperty("--text-font", FONT_STACKS[preferences.textFont]);
   root.style.setProperty("--text-font-size", `${preferences.textFontSize}px`);
   root.style.setProperty(
     "--content-font-adjust",
@@ -235,22 +207,18 @@ function savePreferences(preferences: UserPreferences) {
 interface TypographyFieldsProps {
   legend: string;
   description: string;
-  chineseFont: ChineseFontPreference;
-  englishFont: EnglishFontPreference;
+  font: FontPreference;
   fontSize: number;
-  onChineseFontChange: (value: ChineseFontPreference) => void;
-  onEnglishFontChange: (value: EnglishFontPreference) => void;
+  onFontChange: (value: FontPreference) => void;
   onFontSizeChange: (value: number) => void;
 }
 
 function TypographyFields({
   legend,
   description,
-  chineseFont,
-  englishFont,
+  font,
   fontSize,
-  onChineseFontChange,
-  onEnglishFontChange,
+  onFontChange,
   onFontSizeChange,
 }: TypographyFieldsProps) {
   const commitFontSize = (rawValue: number) => {
@@ -263,11 +231,11 @@ function TypographyFields({
       <p>{description}</p>
 
       <label className="settings-field">
-        <span>中文字体</span>
+        <span>字体</span>
         <select
-          value={chineseFont}
+          value={font}
           onChange={(event) =>
-            onChineseFontChange(event.target.value as ChineseFontPreference)
+            onFontChange(event.target.value as FontPreference)
           }
         >
           <option value="system">系统默认</option>
@@ -276,18 +244,6 @@ function TypographyFields({
           <option value="kaiti">楷体</option>
           <option value="source-han-sans">思源黑体</option>
           <option value="songti">宋体</option>
-        </select>
-      </label>
-
-      <label className="settings-field">
-        <span>英文字体</span>
-        <select
-          value={englishFont}
-          onChange={(event) =>
-            onEnglishFontChange(event.target.value as EnglishFontPreference)
-          }
-        >
-          <option value="system">Inter / 系统</option>
           <option value="humanist">Humanist</option>
           <option value="serif">Georgia</option>
           <option value="consolas">Consolas</option>
@@ -459,22 +415,18 @@ export default function UserSettingsMenu() {
           <TypographyFields
             legend="UI 字体"
             description="用于导航、按钮、输入框和对话列表。"
-            chineseFont={preferences.uiChineseFont}
-            englishFont={preferences.uiEnglishFont}
+            font={preferences.uiFont}
             fontSize={preferences.uiFontSize}
-            onChineseFontChange={(value) => updatePreference("uiChineseFont", value)}
-            onEnglishFontChange={(value) => updatePreference("uiEnglishFont", value)}
+            onFontChange={(value) => updatePreference("uiFont", value)}
             onFontSizeChange={(value) => updatePreference("uiFontSize", value)}
           />
 
           <TypographyFields
             legend="文本字体"
             description="用于视频总结、章节内容和后续对话。"
-            chineseFont={preferences.textChineseFont}
-            englishFont={preferences.textEnglishFont}
+            font={preferences.textFont}
             fontSize={preferences.textFontSize}
-            onChineseFontChange={(value) => updatePreference("textChineseFont", value)}
-            onEnglishFontChange={(value) => updatePreference("textEnglishFont", value)}
+            onFontChange={(value) => updatePreference("textFont", value)}
             onFontSizeChange={(value) => updatePreference("textFontSize", value)}
           />
 

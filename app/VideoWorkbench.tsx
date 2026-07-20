@@ -1,6 +1,7 @@
 "use client";
 
 import {
+  type ReactNode,
   type ChangeEvent,
   type DragEvent,
   type FormEvent,
@@ -13,6 +14,7 @@ import {
   extractBvid,
   formatDuration,
   formatFileSize,
+  type PersistedVideoDescriptor,
   type VideoModelContext,
   type VideoSourceDescriptor,
   type VideoSummary,
@@ -38,11 +40,13 @@ import {
 } from "@/lib/bilibili-api";
 import {
   appendConversationMessages,
+  conversationVideoUrl,
   createConversation,
   deleteConversation,
   getConversation,
   listConversations,
   renameConversation,
+  storeConversationVideo,
 } from "@/lib/client/conversation-client";
 import type {
   ConversationListItem,
@@ -60,7 +64,7 @@ interface SelectedVideo {
 }
 
 interface VideoPreview {
-  kind: "downloaded" | "remote";
+  kind: "downloaded" | "local" | "remote" | "stored";
   playbackUrl: string;
   downloadUrl: string;
   filename: string;
@@ -70,6 +74,11 @@ interface VideoPreview {
   durationLabel?: string;
   qualityLabel?: string;
   sourceLabel?: string;
+}
+
+interface InlineNotice {
+  message: string;
+  tone: "error" | "success";
 }
 
 type ChatMessage = Pick<ConversationMessage, "id" | "role" | "content">;
@@ -154,6 +163,99 @@ function summaryTimeline(summary: VideoSummary) {
   }));
 }
 
+function videoMimeType(file: File) {
+  if (/^video\//i.test(file.type)) return file.type.split(";")[0];
+  const extension = fileExtension(file.name);
+  if (extension === "mov") return "video/quicktime";
+  if (extension === "webm") return "video/webm";
+  if (extension === "mkv") return "video/x-matroska";
+  return "video/mp4";
+}
+
+function timestampToSeconds(value: string) {
+  const normalized = value.trim();
+  const colonParts = normalized.split(":");
+  if (
+    colonParts.length >= 2 &&
+    colonParts.length <= 3 &&
+    colonParts.every((part) => /^\d+(?:\.\d+)?$/.test(part))
+  ) {
+    return colonParts.reduce(
+      (total, part) => total * 60 + Number(part),
+      0,
+    );
+  }
+  const chinese = normalized.match(
+    /^(?:(\d+)\s*时)?(?:(\d+)\s*分)?(?:(\d+(?:\.\d+)?)\s*秒)?$/,
+  );
+  if (chinese && (chinese[1] || chinese[2] || chinese[3])) {
+    return Number(chinese[1] ?? 0) * 3600 +
+      Number(chinese[2] ?? 0) * 60 +
+      Number(chinese[3] ?? 0);
+  }
+  return null;
+}
+
+function renderInlineMarkdown(value: string, keyPrefix: string): ReactNode[] {
+  return value.split(/(\*\*[^*\n]+\*\*)/g).filter(Boolean).map((part, index) =>
+    part.startsWith("**") && part.endsWith("**") ? (
+      <strong key={`${keyPrefix}-strong-${index}`}>{part.slice(2, -2)}</strong>
+    ) : (
+      <span key={`${keyPrefix}-text-${index}`}>{part}</span>
+    ),
+  );
+}
+
+function MarkdownMessage({ content }: { content: string }) {
+  const normalized = content
+    .trim()
+    .replace(/\s+(?=\*\*(?:\d+[.、]|[^*\n]{1,18}[：:])\*\*)/g, "\n\n");
+  const blocks = normalized.split(/\n{2,}/).map((block) => block.trim()).filter(Boolean);
+
+  return (
+    <div className="message-markdown">
+      {blocks.map((block, blockIndex) => {
+        const lines = block.split(/\n/).map((line) => line.trim()).filter(Boolean);
+        const unordered = lines.every((line) => /^[-*]\s+/.test(line));
+        const ordered = lines.every((line) => /^\d+[.、]\s*/.test(line));
+        if (unordered || ordered) {
+          const List = ordered ? "ol" : "ul";
+          return (
+            <List key={`list-${blockIndex}`}>
+              {lines.map((line, lineIndex) => (
+                <li key={`item-${blockIndex}-${lineIndex}`}>
+                  {renderInlineMarkdown(
+                    line.replace(unordered ? /^[-*]\s+/ : /^\d+[.、]\s*/, ""),
+                    `item-${blockIndex}-${lineIndex}`,
+                  )}
+                </li>
+              ))}
+            </List>
+          );
+        }
+        const heading = block.match(/^#{1,6}\s+([\s\S]+)$/);
+        if (heading) {
+          return (
+            <h5 key={`heading-${blockIndex}`}>
+              {renderInlineMarkdown(heading[1], `heading-${blockIndex}`)}
+            </h5>
+          );
+        }
+        return (
+          <p key={`paragraph-${blockIndex}`}>
+            {lines.map((line, lineIndex) => (
+              <span key={`line-${blockIndex}-${lineIndex}`}>
+                {lineIndex > 0 ? <br /> : null}
+                {renderInlineMarkdown(line, `line-${blockIndex}-${lineIndex}`)}
+              </span>
+            ))}
+          </p>
+        );
+      })}
+    </div>
+  );
+}
+
 function bilibiliPreviewQualityLabel(result: BilibiliDownloadResult) {
   const dimensions = result.width && result.height
     ? `实际 ${result.width}×${result.height}`
@@ -223,7 +325,7 @@ export default function VideoWorkbench() {
   const [stageProgress, setStageProgress] = useState(0);
   const [preprocessingResult, setPreprocessingResult] =
     useState<VideoPreprocessingResult | null>(null);
-  const [notice, setNotice] = useState<string | null>(null);
+  const [notice, setNotice] = useState<InlineNotice | null>(null);
   const [isDragging, setIsDragging] = useState(false);
   const [messages, setMessages] = useState<ChatMessage[]>([]);
   const [question, setQuestion] = useState("");
@@ -251,7 +353,12 @@ export default function VideoWorkbench() {
   const fetchVideoAbortRef = useRef<AbortController | null>(null);
   const askAbortRef = useRef<AbortController | null>(null);
   const conversationLoadAbortRef = useRef<AbortController | null>(null);
+  const restoreConversationRef = useRef<(id: string) => void>(() => undefined);
+  const hasRestoredConversationRef = useRef(false);
   const downloadedVideoUrlRef = useRef<string | null>(null);
+  const videoPlayerRef = useRef<HTMLVideoElement>(null);
+  const sideVideoPreviewRef = useRef<HTMLDivElement>(null);
+  const pendingSeekSecondsRef = useRef<number | null>(null);
 
   const bvid = useMemo(() => extractBvid(bilibiliInput), [bilibiliInput]);
   const directVideoUrl = useMemo(
@@ -330,6 +437,10 @@ export default function VideoWorkbench() {
       .then((items) => {
         setConversationItems(items);
         setConversationListError(null);
+        if (!hasRestoredConversationRef.current && items[0]) {
+          hasRestoredConversationRef.current = true;
+          restoreConversationRef.current(items[0].id);
+        }
       })
       .catch((error: unknown) => {
         if (error instanceof DOMException && error.name === "AbortError") return;
@@ -364,6 +475,10 @@ export default function VideoWorkbench() {
     return `${role}-${messageCounterRef.current}`;
   }
 
+  function showNotice(message: string, tone: InlineNotice["tone"] = "error") {
+    setNotice({ message, tone });
+  }
+
   function upsertConversationItem(item: ConversationListItem) {
     setConversationItems((current) =>
       [item, ...current.filter((conversation) => conversation.id !== item.id)].sort(
@@ -394,6 +509,43 @@ export default function VideoWorkbench() {
       title: titleFromUrl(url),
       description: "播放器直接读取 HTTPS 视频直链；是否能保存由源站响应设置决定。",
       sourceLabel: "HTTPS 视频直链",
+    });
+    setVideoPreviewFailed(false);
+  }
+
+  function showLocalVideo(video: SelectedVideo) {
+    releaseDownloadedVideoUrl();
+    setVideoPreview({
+      kind: "local",
+      playbackUrl: video.objectUrl,
+      downloadUrl: video.objectUrl,
+      filename: video.file.name,
+      title: titleFromFilename(video.file.name),
+      description: "本地原视频已用于本次分析；总结保存后会同步保存到当前视频对话。",
+      sizeLabel: formatFileSize(video.file.size),
+      durationLabel: video.duration ? formatDuration(video.duration) : undefined,
+      sourceLabel: "本地上传",
+    });
+    setVideoPreviewFailed(false);
+  }
+
+  function showStoredVideo(
+    conversationId: string,
+    video: PersistedVideoDescriptor,
+  ) {
+    releaseDownloadedVideoUrl();
+    const url = conversationVideoUrl(conversationId);
+    setVideoPreview({
+      kind: "stored",
+      playbackUrl: url,
+      downloadUrl: url,
+      filename: video.filename,
+      title: video.title,
+      description: video.description,
+      sizeLabel: formatFileSize(video.sizeBytes),
+      durationLabel: video.durationLabel,
+      qualityLabel: video.qualityLabel,
+      sourceLabel: video.sourceLabel,
     });
     setVideoPreviewFailed(false);
   }
@@ -441,12 +593,12 @@ export default function VideoWorkbench() {
     const extension = fileExtension(file.name);
 
     if (!acceptedExtensions.includes(extension)) {
-      setNotice("暂不支持这个文件格式，请选择 MP4、MOV、WebM、MKV 或 M4V 视频。");
+      showNotice("暂不支持这个文件格式，请选择 MP4、MOV、WebM、MKV 或 M4V 视频。");
       return;
     }
 
     if (file.size > LOCAL_VIDEO_PREPROCESSING_LIMITS.maxSourceBytes) {
-      setNotice(
+      showNotice(
         `浏览器本地处理暂时支持不超过 ${Math.round(
           LOCAL_VIDEO_PREPROCESSING_LIMITS.maxSourceBytes / 1024 / 1024,
         )} MB 的视频；更大文件请使用 HTTPS 视频直链。`,
@@ -518,7 +670,7 @@ export default function VideoWorkbench() {
 
   async function handleFetchVideo() {
     if (!pendingSource || pendingSource.kind === "upload") {
-      setNotice("请输入 B站链接、BV 号或 HTTPS 视频直链后再获取视频。");
+      showNotice("请输入 B站链接、BV 号或 HTTPS 视频直链后再获取视频。");
       return;
     }
     if (phase === "processing" || isFetchingVideo) return;
@@ -543,7 +695,10 @@ export default function VideoWorkbench() {
     if (pendingSource.kind === "url" && pendingSource.sourceUrl) {
       showRemoteVideo(pendingSource.sourceUrl);
       setPhase("idle");
-      setNotice("视频直链已准备好，可预览；点击生成 AI 总结后再开始分析。");
+      showNotice(
+        "视频直链已准备好，可预览；点击生成 AI 总结后再开始分析。",
+        "success",
+      );
       if (fetchVideoAbortRef.current === controller) fetchVideoAbortRef.current = null;
       return;
     }
@@ -577,12 +732,15 @@ export default function VideoWorkbench() {
       setStageIndex(stages.length);
       setStageProgress(1);
       setPhase("idle");
-      setNotice("视频已获取，可预览或下载；点击生成 AI 总结后再开始分析。");
+      showNotice(
+        "视频已获取，可预览或下载；点击生成 AI 总结后再开始分析。",
+        "success",
+      );
     } catch (error) {
       if (runTokenRef.current !== runToken) return;
       if (error instanceof DOMException && error.name === "AbortError") return;
       setPhase("error");
-      setNotice(
+      showNotice(
         error instanceof Error ? error.message : "获取视频失败，请检查链接后重试。",
       );
     } finally {
@@ -593,7 +751,7 @@ export default function VideoWorkbench() {
 
   async function handleAnalyze() {
     if (!pendingSource) {
-      setNotice(
+      showNotice(
         mode === "upload"
           ? "请先选择一个视频文件。"
           : "请输入有效的 B 站视频链接或 BV 号。",
@@ -627,12 +785,13 @@ export default function VideoWorkbench() {
     if (pendingSource.kind === "url" && pendingSource.sourceUrl) {
       showRemoteVideo(pendingSource.sourceUrl);
     } else if (pendingSource.kind === "upload") {
-      clearVideoPreview();
+      if (selectedVideo) showLocalVideo(selectedVideo);
     }
 
     try {
       let context: VideoModelContext;
       let analysisSource = pendingSource;
+      let analyzedBilibiliVideo: BilibiliDownloadResult | null = null;
       if (pendingSource.kind === "upload") {
         if (!selectedVideo?.duration) {
           throw new Error("尚未读取到视频时长，请稍后重试。");
@@ -662,6 +821,7 @@ export default function VideoWorkbench() {
         );
         if (!downloaded) return;
         if (runTokenRef.current !== runToken) return;
+        analyzedBilibiliVideo = downloaded;
 
         analysisSource = {
           ...pendingSource,
@@ -742,6 +902,57 @@ export default function VideoWorkbench() {
         setActiveConversationId(saved.id);
         upsertConversationItem(saved);
         setConversationListError(null);
+
+        const bilibiliVideo =
+          analysisSource.kind === "bilibili"
+            ? previewBilibiliVideo ?? analyzedBilibiliVideo
+            : null;
+        const videoFile =
+          analysisSource.kind === "upload"
+            ? selectedVideo?.file ?? null
+            : bilibiliVideo?.file ?? null;
+        if (videoFile) {
+          if (bilibiliVideo && !videoPreview) showDownloadedVideo(bilibiliVideo);
+          const persistedVideo: PersistedVideoDescriptor = {
+            filename: videoFile.name || "video.mp4",
+            mimeType: videoMimeType(videoFile),
+            sizeBytes: videoFile.size,
+            title: analysisSource.title,
+            description:
+              analysisSource.kind === "bilibili"
+                ? "该视频已随对话保存，可直接预览、下载，并可通过总结时间点跳转。"
+                : "本地原视频已随对话保存，可直接预览、下载，并可通过总结时间点跳转。",
+            durationLabel:
+              bilibiliVideo
+                ? formatDuration(bilibiliVideo.durationSeconds)
+                : selectedVideo?.duration
+                  ? formatDuration(selectedVideo.duration)
+                  : analysisSource.durationLabel,
+            qualityLabel: bilibiliVideo
+              ? bilibiliVideo.variant === "preview"
+                ? bilibiliPreviewQualityLabel(bilibiliVideo)
+                : bilibiliAnalysisLabel(bilibiliVideo)
+              : undefined,
+            sourceLabel: bilibiliVideo?.bvid ?? "本地上传",
+          };
+          try {
+            const storedSource = await storeConversationVideo(
+              saved.id,
+              videoFile,
+              persistedVideo,
+              controller.signal,
+            );
+            if (runTokenRef.current !== runToken) return;
+            setActiveSource(storedSource);
+          } catch (videoSaveError) {
+            if (runTokenRef.current !== runToken) return;
+            setConversationListError(
+              videoSaveError instanceof Error
+                ? `总结已保存，但视频持久化失败：${videoSaveError.message}`
+                : "总结已保存，但视频持久化失败。",
+            );
+          }
+        }
       } catch (saveError) {
         if (runTokenRef.current !== runToken) return;
         setConversationListError(
@@ -756,7 +967,7 @@ export default function VideoWorkbench() {
       if (runTokenRef.current !== runToken) return;
       if (error instanceof DOMException && error.name === "AbortError") return;
       setPhase("error");
-      setNotice(
+      showNotice(
         error instanceof ModelClientError || error instanceof Error
           ? error.message
           : "处理没有完成，请检查素材后重试。",
@@ -846,7 +1057,14 @@ export default function VideoWorkbench() {
       setIsReplying(false);
       upsertConversationItem(conversation);
 
-      if (conversation.source.kind === "url" && conversation.source.sourceUrl) {
+      if (conversation.source.persistedVideo) {
+        setMode(conversation.source.kind === "upload" ? "upload" : "bilibili");
+        setBilibiliInput(
+          conversation.source.bvid ?? conversation.source.sourceUrl ?? "",
+        );
+        showStoredVideo(conversation.id, conversation.source.persistedVideo);
+        setNotice(null);
+      } else if (conversation.source.kind === "url" && conversation.source.sourceUrl) {
         setMode("bilibili");
         setBilibiliInput(conversation.source.sourceUrl);
         showRemoteVideo(conversation.source.sourceUrl);
@@ -857,12 +1075,18 @@ export default function VideoWorkbench() {
           conversation.source.bvid ?? conversation.source.sourceUrl ?? "",
         );
         clearVideoPreview();
-        setNotice("总结和对话已恢复；如需预览或下载，请重新获取这个 B站视频。");
+        showNotice(
+          "总结和对话已恢复；这个旧对话没有保存视频，如需预览请重新获取。",
+          "success",
+        );
       } else {
         setMode("upload");
         setBilibiliInput("");
         clearVideoPreview();
-        setNotice("总结和对话已恢复；本地原视频不会存入 D1，预览时请重新选择文件。");
+        showNotice(
+          "总结和对话已恢复；这个旧对话没有保存本地原视频。",
+          "success",
+        );
       }
     } catch (error) {
       if (error instanceof DOMException && error.name === "AbortError") return;
@@ -1021,6 +1245,10 @@ export default function VideoWorkbench() {
         )
       : 0;
 
+  restoreConversationRef.current = (id) => {
+    void handleSelectConversation(id);
+  };
+
   const shownSource = activeSource ?? pendingSource;
   const activeConversationTitle = activeConversationId
     ? conversationItems.find((item) => item.id === activeConversationId)?.title
@@ -1028,6 +1256,113 @@ export default function VideoWorkbench() {
   const canFetchVideo =
     mode === "bilibili" && pendingSource !== null && pendingSource.kind !== "upload";
   const fetchVideoLabel = directVideoUrl ? "预览视频" : "获取视频";
+
+  function seekToTimeline(time: string) {
+    const seconds = timestampToSeconds(time);
+    const player = videoPlayerRef.current;
+    if (seconds === null || !player || !videoPreview) return;
+    if (player.readyState >= HTMLMediaElement.HAVE_METADATA) {
+      player.currentTime = Math.min(seconds, Number.isFinite(player.duration)
+        ? Math.max(0, player.duration - 0.05)
+        : seconds);
+      void player.play().catch(() => undefined);
+    } else {
+      pendingSeekSecondsRef.current = seconds;
+      player.load();
+    }
+    sideVideoPreviewRef.current?.scrollIntoView({
+      behavior: "smooth",
+      block: "nearest",
+    });
+    player.focus({ preventScroll: true });
+  }
+
+  function renderVideoPreviewCard(placement: "conversation" | "side") {
+    if (!videoPreview) return null;
+    const details = (
+      <div className="video-preview-details">
+        <span className="video-ready-label">
+          {videoPreview.kind === "stored"
+            ? "视频已随对话保存"
+            : videoPreview.kind === "downloaded"
+              ? "视频已下载并合并"
+              : videoPreview.kind === "local"
+                ? "本地视频已就绪"
+                : "HTTPS 视频直链已就绪"}
+        </span>
+        <strong>{videoPreview.title ?? videoPreview.filename}</strong>
+        <div className="video-preview-meta" aria-label="视频信息">
+          {videoPreview.sourceLabel ? <span>{videoPreview.sourceLabel}</span> : null}
+          {videoPreview.qualityLabel ? <span>{videoPreview.qualityLabel}</span> : null}
+          {videoPreview.sizeLabel ? <span>{videoPreview.sizeLabel}</span> : null}
+          {videoPreview.durationLabel ? <span>{videoPreview.durationLabel}</span> : null}
+        </div>
+        <p>
+          {videoPreviewFailed
+            ? "浏览器无法直接预览，但仍可以尝试打开或保存视频。"
+            : videoPreview.description}
+        </p>
+        <div className="video-preview-actions">
+          <a
+            className="video-download-action"
+            href={videoPreview.downloadUrl}
+            download={videoPreview.filename}
+            target={videoPreview.kind === "remote" ? "_blank" : undefined}
+            rel={videoPreview.kind === "remote" ? "noreferrer" : undefined}
+          >
+            {videoPreview.kind === "remote" ? "打开/下载原视频" : "下载视频"}
+          </a>
+          {videoPreview.kind === "remote" ? (
+            <a
+              className="video-source-action"
+              href={videoPreview.playbackUrl}
+              target="_blank"
+              rel="noreferrer"
+            >
+              打开源地址 ↗
+            </a>
+          ) : null}
+        </div>
+      </div>
+    );
+    const player = (
+      <div className="video-preview-player">
+        <video
+          ref={videoPlayerRef}
+          src={videoPreview.playbackUrl}
+          controls
+          playsInline
+          preload="metadata"
+          tabIndex={-1}
+          onLoadedMetadata={(event) => {
+            setVideoPreviewFailed(false);
+            const pendingSeconds = pendingSeekSecondsRef.current;
+            if (pendingSeconds !== null) {
+              event.currentTarget.currentTime = Math.min(
+                pendingSeconds,
+                Math.max(0, event.currentTarget.duration - 0.05),
+              );
+              pendingSeekSecondsRef.current = null;
+              void event.currentTarget.play().catch(() => undefined);
+            }
+          }}
+          onError={() => setVideoPreviewFailed(true)}
+        >
+          当前浏览器无法播放这个视频。
+        </video>
+      </div>
+    );
+
+    return (
+      <section
+        className={`video-preview-card ${placement}`}
+        aria-label="视频预览与下载"
+      >
+        {placement === "side" ? details : player}
+        {placement === "side" ? player : details}
+      </section>
+    );
+  }
 
   return (
     <main className="app-shell">
@@ -1051,7 +1386,11 @@ export default function VideoWorkbench() {
 
       <div className="workspace" id="top">
         <section className="setup-column" aria-label="添加并分析视频">
-          <div className="source-card">
+          <div
+            className={`source-card ${
+              phase === "ready" && videoPreview ? "showing-side-video" : ""
+            }`}
+          >
             <div className="mode-tabs" role="tablist" aria-label="选择视频来源">
               <button
                 className={mode === "upload" ? "active" : ""}
@@ -1197,9 +1536,12 @@ export default function VideoWorkbench() {
             )}
 
             {notice ? (
-              <div className="inline-notice" role="alert">
-                <span aria-hidden="true">!</span>
-                {notice}
+              <div
+                className={`inline-notice ${notice.tone}`}
+                role={notice.tone === "error" ? "alert" : "status"}
+              >
+                <span aria-hidden="true">{notice.tone === "error" ? "!" : "✓"}</span>
+                {notice.message}
               </div>
             ) : null}
 
@@ -1262,6 +1604,12 @@ export default function VideoWorkbench() {
                 )}
               </button>
             )}
+
+            {phase === "ready" && videoPreview ? (
+              <div className="side-video-context" ref={sideVideoPreviewRef}>
+                {renderVideoPreviewCard("side")}
+              </div>
+            ) : null}
           </div>
 
           <aside className="conversation-library" aria-label="视频对话列表">
@@ -1416,60 +1764,9 @@ export default function VideoWorkbench() {
           </div>
 
           <div className="conversation-scroll" aria-live="polite">
-            {videoPreview ? (
-              <section className="video-preview-card" aria-label="视频预览与下载">
-                <div className="video-preview-player">
-                  <video
-                    src={videoPreview.playbackUrl}
-                    controls
-                    playsInline
-                    preload="metadata"
-                    onLoadedMetadata={() => setVideoPreviewFailed(false)}
-                    onError={() => setVideoPreviewFailed(true)}
-                  >
-                    当前浏览器无法播放这个视频。
-                  </video>
-                </div>
-                <div className="video-preview-details">
-                  <span className="video-ready-label">
-                    {videoPreview.kind === "downloaded" ? "视频已下载并合并" : "HTTPS 视频直链已就绪"}
-                  </span>
-                  <strong>{videoPreview.title ?? videoPreview.filename}</strong>
-                  <div className="video-preview-meta" aria-label="视频信息">
-                    {videoPreview.sourceLabel ? <span>{videoPreview.sourceLabel}</span> : null}
-                    {videoPreview.qualityLabel ? <span>{videoPreview.qualityLabel}</span> : null}
-                    {videoPreview.sizeLabel ? <span>{videoPreview.sizeLabel}</span> : null}
-                    {videoPreview.durationLabel ? <span>{videoPreview.durationLabel}</span> : null}
-                  </div>
-                  <p>
-                    {videoPreviewFailed
-                      ? "浏览器无法直接预览，但仍可以尝试打开或保存视频。"
-                      : videoPreview.description}
-                  </p>
-                  <div className="video-preview-actions">
-                    <a
-                      className="video-download-action"
-                      href={videoPreview.downloadUrl}
-                      download={videoPreview.filename}
-                      target={videoPreview.kind === "remote" ? "_blank" : undefined}
-                      rel={videoPreview.kind === "remote" ? "noreferrer" : undefined}
-                    >
-                      {videoPreview.kind === "downloaded" ? "下载视频" : "打开/下载原视频"}
-                    </a>
-                    {videoPreview.kind === "remote" ? (
-                      <a
-                        className="video-source-action"
-                        href={videoPreview.playbackUrl}
-                        target="_blank"
-                        rel="noreferrer"
-                      >
-                        打开源地址 ↗
-                      </a>
-                    ) : null}
-                  </div>
-                </div>
-              </section>
-            ) : null}
+            {videoPreview && phase !== "ready"
+              ? renderVideoPreviewCard("conversation")
+              : null}
 
             {(phase === "idle" || phase === "error") && !videoPreview ? (
               <div className="empty-state">
@@ -1560,7 +1857,6 @@ export default function VideoWorkbench() {
                       <span className="section-label">AI 视频总结</span>
                       <h3>{summary.title}</h3>
                     </div>
-                    <span className="summary-mode">结构化</span>
                   </div>
 
                   <div className="summary-stats">
@@ -1601,7 +1897,17 @@ export default function VideoWorkbench() {
                     <div className="timeline-list">
                       {timelineItems.map((item) => (
                         <div className="timeline-row" key={item.key}>
-                          <time>{item.time}</time>
+                          <button
+                            className="timeline-seek"
+                            type="button"
+                            disabled={
+                              !videoPreview || timestampToSeconds(item.time) === null
+                            }
+                            onClick={() => seekToTimeline(item.time)}
+                            aria-label={`跳转到 ${item.time}`}
+                          >
+                            <time>{item.time}</time>
+                          </button>
                           <div>
                             <strong>{item.title}</strong>
                             <p>{item.detail}</p>
@@ -1624,7 +1930,7 @@ export default function VideoWorkbench() {
                       </span>
                       <div>
                         <strong>{message.role === "assistant" ? "帧记 AI" : "你"}</strong>
-                        <p>{message.content}</p>
+                        <MarkdownMessage content={message.content} />
                       </div>
                     </div>
                   ))}

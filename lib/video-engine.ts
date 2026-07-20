@@ -1,5 +1,16 @@
 export type SourceKind = "upload" | "bilibili" | "url";
 
+export interface PersistedVideoDescriptor {
+  filename: string;
+  mimeType: string;
+  sizeBytes: number;
+  title?: string;
+  description: string;
+  durationLabel?: string;
+  qualityLabel?: string;
+  sourceLabel?: string;
+}
+
 export interface VideoSourceDescriptor {
   kind: SourceKind;
   title: string;
@@ -8,6 +19,7 @@ export interface VideoSourceDescriptor {
   bvid?: string;
   sourceUrl?: string;
   downloadFirst: boolean;
+  persistedVideo?: PersistedVideoDescriptor;
 }
 
 export interface SummaryPoint {
