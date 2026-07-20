@@ -1292,20 +1292,19 @@ test("removes disposable starter assets and keeps model choice decoupled", async
     workbench,
     /完成左侧设置后，你会先得到一份带章节的总结，然后可以像聊天一样继续追问。/,
   );
-  assert.match(workbench, /aria-label="视频预览与下载"/);
+  assert.match(workbench, /aria-label="视频预览"/);
   assert.match(workbench, /handleFetchVideo/);
   assert.match(workbench, /获取视频/);
   assert.match(workbench, /BILIBILI_ANALYSIS_DOWNLOAD_VARIANT/);
   assert.match(workbench, /最高兼容清晰度/);
   assert.doesNotMatch(workbench, /BILIBILI_VIDEO_QUALITIES|最高 \{height\}p/);
-  assert.match(workbench, /download=\{videoPreview\.filename\}/);
+  assert.doesNotMatch(workbench, /download=\{videoPreview\.filename\}/);
   assert.match(workbench, /MarkdownMessage/);
   assert.match(workbench, /timeline-seek/);
   assert.match(workbench, /seekToTimeline/);
   assert.match(workbench, /showStoredVideo/);
   assert.doesNotMatch(workbench, /summary-mode|>结构化</);
-  assert.match(workbench, /"下载视频"/);
-  assert.match(workbench, /"打开\/下载原视频"/);
+  assert.doesNotMatch(workbench, /"下载视频"|"打开\/下载原视频"/);
   assert.match(bilibiliClient, /\/api\/bilibili\/jobs/);
   for (const clientOperation of [
     "listConversations",
@@ -1342,7 +1341,7 @@ test("removes disposable starter assets and keeps model choice decoupled", async
   assert.match(styles, /--ui-font:/);
   assert.match(styles, /--text-font:/);
   assert.match(styles, /html\[data-theme="dark"\] \.primary-action/);
-  assert.match(styles, /html\[data-theme="dark"\] \.video-download-action/);
+  assert.doesNotMatch(styles, /video-download-action/);
   assert.match(styles, /html\[data-theme="dark"\] \.message\.assistant \.message-avatar/);
   assert.doesNotMatch(workbench, /new-task-button|新建任务/);
   assert.doesNotMatch(workbench, /download-option|switch-wrap|下载公开视频，再进行总结/);

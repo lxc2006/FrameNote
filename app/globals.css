@@ -1449,7 +1449,7 @@ textarea:focus-visible {
 
 .video-ready-label {
   color: #168866;
-  font-size: 9px;
+  font-size: max(9px, calc(var(--ui-font-size) - 7px));
   font-weight: 820;
   letter-spacing: 0.08em;
 }
@@ -1457,7 +1457,7 @@ textarea:focus-visible {
 .video-preview-details > strong {
   margin-top: 7px;
   color: var(--ink-strong);
-  font-size: 15px;
+  font-size: max(15px, calc(var(--ui-font-size) - 1px));
   line-height: 1.45;
 }
 
@@ -1466,7 +1466,7 @@ textarea:focus-visible {
   flex-wrap: wrap;
   margin-top: 8px;
   color: var(--faint);
-  font-size: 10px;
+  font-size: max(10px, calc(var(--ui-font-size) - 6px));
   gap: 8px;
 }
 
@@ -1482,7 +1482,7 @@ textarea:focus-visible {
 .video-preview-details p {
   margin: 8px 0 0;
   color: var(--muted);
-  font-size: 10px;
+  font-size: max(10px, calc(var(--ui-font-size) - 6px));
   line-height: 1.65;
 }
 
@@ -1502,16 +1502,6 @@ textarea:focus-visible {
   font-size: 10px;
   font-weight: 760;
   text-decoration: none;
-}
-
-.video-download-action {
-  padding: 0 14px;
-  background: var(--accent);
-  color: #fff;
-}
-
-.video-download-action:hover {
-  background: var(--accent-deep);
 }
 
 .video-source-action {
@@ -2120,16 +2110,6 @@ html[data-theme="dark"] .video-preview-meta span {
   background: #111112;
 }
 
-html[data-theme="dark"] .video-download-action {
-  background: #c6e6ff;
-  color: #071019;
-}
-
-html[data-theme="dark"] .video-download-action:hover {
-  background: #d9efff;
-  color: #071019;
-}
-
 html[data-theme="dark"] .message.assistant .message-avatar {
   border: 1px solid #37373c;
   background:
@@ -2201,15 +2181,19 @@ html[data-theme="dark"] .timeline-row::before {
 }
 
 html[data-theme="dark"] .timeline-seek {
-  border-color: #55555b;
-  background: #c8c8cd;
-  color: #09090a;
+  border-color: transparent;
+  background: transparent;
+  color: #43adf5;
 }
 
 html[data-theme="dark"] .timeline-seek:hover:not(:disabled) {
-  border-color: #f1f1f2;
-  background: #e0e0e3;
-  color: #09090a;
+  border-color: #285f85;
+  background: #09090a;
+  color: #6cc1fb;
+}
+
+html[data-theme="dark"] .timeline-seek time {
+  color: inherit;
 }
 
 html[data-theme="dark"] .timeline-seek:disabled {

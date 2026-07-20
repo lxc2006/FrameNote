@@ -66,7 +66,6 @@ interface SelectedVideo {
 interface VideoPreview {
   kind: "downloaded" | "local" | "remote" | "stored";
   playbackUrl: string;
-  downloadUrl: string;
   filename: string;
   title?: string;
   description: string;
@@ -504,7 +503,6 @@ export default function VideoWorkbench() {
     setVideoPreview({
       kind: "remote",
       playbackUrl: url,
-      downloadUrl: url,
       filename: titleFromUrl(url),
       title: titleFromUrl(url),
       description: "播放器直接读取 HTTPS 视频直链；是否能保存由源站响应设置决定。",
@@ -518,7 +516,6 @@ export default function VideoWorkbench() {
     setVideoPreview({
       kind: "local",
       playbackUrl: video.objectUrl,
-      downloadUrl: video.objectUrl,
       filename: video.file.name,
       title: titleFromFilename(video.file.name),
       description: "本地原视频已用于本次分析；总结保存后会同步保存到当前视频对话。",
@@ -538,7 +535,6 @@ export default function VideoWorkbench() {
     setVideoPreview({
       kind: "stored",
       playbackUrl: url,
-      downloadUrl: url,
       filename: video.filename,
       title: video.title,
       description: video.description,
@@ -557,10 +553,9 @@ export default function VideoWorkbench() {
     setVideoPreview({
       kind: "downloaded",
       playbackUrl: objectUrl,
-      downloadUrl: objectUrl,
       filename: result.file.name || "bilibili-video.mp4",
       title: result.title,
-      description: "视频已下载并合并，可直接预览或手动下载；AI 总结会另取 720p 等价素材用于抽帧与音轨分析。",
+      description: "视频已下载并合并，可直接预览；AI 总结会另取 720p 等价素材用于抽帧与音轨分析。",
       sizeLabel: formatFileSize(result.sizeBytes),
       durationLabel: formatDuration(result.durationSeconds),
       qualityLabel: bilibiliPreviewQualityLabel(result),
@@ -1299,20 +1294,11 @@ export default function VideoWorkbench() {
         </div>
         <p>
           {videoPreviewFailed
-            ? "浏览器无法直接预览，但仍可以尝试打开或保存视频。"
+            ? "浏览器无法直接预览，可以尝试打开视频源地址。"
             : videoPreview.description}
         </p>
-        <div className="video-preview-actions">
-          <a
-            className="video-download-action"
-            href={videoPreview.downloadUrl}
-            download={videoPreview.filename}
-            target={videoPreview.kind === "remote" ? "_blank" : undefined}
-            rel={videoPreview.kind === "remote" ? "noreferrer" : undefined}
-          >
-            {videoPreview.kind === "remote" ? "打开/下载原视频" : "下载视频"}
-          </a>
-          {videoPreview.kind === "remote" ? (
+        {videoPreview.kind === "remote" ? (
+          <div className="video-preview-actions">
             <a
               className="video-source-action"
               href={videoPreview.playbackUrl}
@@ -1321,8 +1307,8 @@ export default function VideoWorkbench() {
             >
               打开源地址 ↗
             </a>
-          ) : null}
-        </div>
+          </div>
+        ) : null}
       </div>
     );
     const player = (
@@ -1356,7 +1342,7 @@ export default function VideoWorkbench() {
     return (
       <section
         className={`video-preview-card ${placement}`}
-        aria-label="视频预览与下载"
+        aria-label="视频预览"
       >
         {placement === "side" ? details : player}
         {placement === "side" ? player : details}
