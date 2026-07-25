@@ -11,6 +11,7 @@ from yt_dlp import YoutubeDL
 
 from media_service.worker import (
     BROWSER_COMPATIBLE_FORMAT,
+    DOWNLOAD_FRAGMENT_CONCURRENCY,
     WorkerFailure,
     browser_compatible_format,
     classify_download_error,
@@ -47,6 +48,9 @@ class WorkerValidationTests(unittest.TestCase):
         }
         payload.update(values)
         return payload
+
+    def test_downloads_four_fragments_concurrently(self) -> None:
+        self.assertEqual(DOWNLOAD_FRAGMENT_CONCURRENCY, 4)
 
     def test_browser_format_restricts_every_fallback_to_avc_and_aac(self) -> None:
         branches = BROWSER_COMPATIBLE_FORMAT.split("/")

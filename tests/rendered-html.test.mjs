@@ -1295,7 +1295,11 @@ test("removes disposable starter assets and keeps model choice decoupled", async
   assert.match(workbench, /aria-label="视频预览"/);
   assert.match(workbench, /handleFetchVideo/);
   assert.match(workbench, /获取视频/);
-  assert.match(workbench, /BILIBILI_ANALYSIS_DOWNLOAD_VARIANT/);
+  assert.match(workbench, /isReusableBilibiliDownload/);
+  assert.doesNotMatch(workbench, /BILIBILI_ANALYSIS_DOWNLOAD_VARIANT/);
+  assert.match(workbench, /总结生成完毕，我还可以继续和你讨论相关内容 : \)/);
+  assert.match(workbench, /function stopReply\(\)/);
+  assert.match(workbench, /aria-label=\{isReplying \? "停止生成" : "发送问题"\}/);
   assert.match(workbench, /最高兼容清晰度/);
   assert.doesNotMatch(workbench, /BILIBILI_VIDEO_QUALITIES|最高 \{height\}p/);
   assert.doesNotMatch(workbench, /download=\{videoPreview\.filename\}/);

@@ -29,6 +29,21 @@ test("extracts sampled frames without scanning the full video", async (t) => {
     ));
   });
 
+  await t.test("compresses either video orientation to a 720px longest edge", () => {
+    assert.deepEqual(extractor.fitFrameDimensions(1920, 1080, 720), {
+      width: 720,
+      height: 404,
+    });
+    assert.deepEqual(extractor.fitFrameDimensions(1080, 1920, 720), {
+      width: 404,
+      height: 720,
+    });
+    assert.deepEqual(extractor.fitFrameDimensions(640, 360, 720), {
+      width: 640,
+      height: 360,
+    });
+  });
+
   await t.test("requires non-empty audio evidence when the source promises audio", () => {
     assert.throws(
       () => preprocessor.assertRequiredAudioEvidence(undefined, true),
@@ -139,7 +154,7 @@ test("extracts sampled frames without scanning the full video", async (t) => {
     const frames = await extractor.extractFramesWithFfmpegSeeks(ffmpeg, {
       inputPath: "/source/video.mp4",
       timestamps,
-      width: 960,
+      maxEdge: 720,
       jpegQuality: 6,
       timeoutMs: 1_000,
       seekTimeoutMs: 100,
@@ -152,6 +167,7 @@ test("extracts sampled frames without scanning the full video", async (t) => {
       assert.ok(command.indexOf("-ss") < command.indexOf("-i"));
       assert.ok(!command.some((value) => value.startsWith("fps=")));
       assert.equal(command[command.indexOf("-frames:v") + 1], "1");
+      assert.match(command[command.indexOf("-vf") + 1], /max|720/);
     }
     assert.equal(deleted.length, timestamps.length);
     assert.equal(progress.at(-1), 1);
@@ -240,7 +256,7 @@ test("extracts sampled frames without scanning the full video", async (t) => {
       new File([new Uint8Array([1])], "video.mp4", { type: "video/mp4" }),
       {
         timestamps: [0, 15, 30],
-        width: 960,
+        maxEdge: 720,
         jpegQuality: 0.82,
         timeoutMs: 100,
         seekTimeoutMs: 50,
@@ -298,7 +314,7 @@ test("extracts sampled frames without scanning the full video", async (t) => {
         new File([new Uint8Array([1])], "video.mp4", { type: "video/mp4" }),
         {
           timestamps: [0],
-          width: 960,
+          maxEdge: 720,
           jpegQuality: 0.82,
           timeoutMs: 10,
           seekTimeoutMs: 10,

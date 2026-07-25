@@ -13,7 +13,7 @@ export const LOCAL_VIDEO_PREPROCESSING_LIMITS = {
   maxKeyframes: 24,
   minKeyframes: 3,
   targetFrameIntervalSeconds: 12,
-  frameWidth: 960,
+  analysisFrameMaxEdge: 720,
   jpegQuality: 6,
   nativeJpegQuality: 0.82,
   targetAudioBytes: 6 * 1024 * 1024,
@@ -145,7 +145,7 @@ export async function extractVideoEvidence(
             nativeExtractor: (onProgress: (progress: number) => void) =>
               extractFramesWithNativeVideo(file, {
                 timestamps: framePlan.timestamps,
-                width: LOCAL_VIDEO_PREPROCESSING_LIMITS.frameWidth,
+                maxEdge: LOCAL_VIDEO_PREPROCESSING_LIMITS.analysisFrameMaxEdge,
                 jpegQuality: LOCAL_VIDEO_PREPROCESSING_LIMITS.nativeJpegQuality,
                 signal: options.signal,
                 onProgress,
@@ -156,7 +156,7 @@ export async function extractVideoEvidence(
         extractFramesWithFfmpegSeeks(ffmpeg, {
           inputPath,
           timestamps: framePlan.timestamps,
-          width: LOCAL_VIDEO_PREPROCESSING_LIMITS.frameWidth,
+          maxEdge: LOCAL_VIDEO_PREPROCESSING_LIMITS.analysisFrameMaxEdge,
           jpegQuality: LOCAL_VIDEO_PREPROCESSING_LIMITS.jpegQuality,
           signal: options.signal,
           onProgress,

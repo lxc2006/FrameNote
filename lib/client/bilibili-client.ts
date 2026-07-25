@@ -31,6 +31,18 @@ export interface BilibiliDownloadResult {
   height?: number;
 }
 
+export function isReusableBilibiliDownload(
+  result: BilibiliDownloadResult | null,
+  bvid: string | undefined,
+) {
+  return Boolean(
+    result &&
+      bvid &&
+      result.bvid === bvid &&
+      result.variant === "preview",
+  );
+}
+
 export interface BilibiliDownloadOptions {
   signal?: AbortSignal;
   onProgress?: (progress: BilibiliDownloadProgress) => void;

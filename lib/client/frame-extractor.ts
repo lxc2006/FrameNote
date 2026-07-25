@@ -5,7 +5,7 @@ export interface TimedVideoFrame {
 
 export interface NativeFrameExtractionOptions {
   timestamps: number[];
-  width: number;
+  maxEdge: number;
   jpegQuality: number;
   signal?: AbortSignal;
   timeoutMs?: number;
@@ -16,7 +16,7 @@ export interface NativeFrameExtractionOptions {
 export interface FfmpegFrameExtractionOptions {
   inputPath: string;
   timestamps: number[];
-  width: number;
+  maxEdge: number;
   jpegQuality: number;
   signal?: AbortSignal;
   timeoutMs?: number;
@@ -71,6 +71,31 @@ export function canUseNativeFrameExtraction(file: File) {
     mimeType === "video/webm" ||
     /\.(?:mp4|m4v|mov|webm)$/i.test(file.name)
   );
+}
+
+export function fitFrameDimensions(
+  sourceWidth: number,
+  sourceHeight: number,
+  maxEdge: number,
+) {
+  if (
+    !Number.isFinite(sourceWidth) ||
+    !Number.isFinite(sourceHeight) ||
+    !Number.isFinite(maxEdge) ||
+    sourceWidth <= 0 ||
+    sourceHeight <= 0 ||
+    maxEdge < 2
+  ) {
+    throw new RangeError("Frame dimensions and maxEdge must be positive.");
+  }
+
+  const scale = Math.min(1, maxEdge / Math.max(sourceWidth, sourceHeight));
+  const toEvenDimension = (value: number) =>
+    Math.max(2, Math.floor((value * scale) / 2) * 2);
+  return {
+    width: toEvenDimension(sourceWidth),
+    height: toEvenDimension(sourceHeight),
+  };
 }
 
 export async function extractFramesWithFallback(
@@ -149,10 +174,10 @@ export async function extractFramesWithNativeVideo(
     }
 
     canvas = document.createElement("canvas");
-    const targetWidth = Math.max(2, Math.min(options.width, video.videoWidth));
-    const targetHeight = Math.max(
-      2,
-      Math.round((video.videoHeight * targetWidth) / video.videoWidth / 2) * 2,
+    const { width: targetWidth, height: targetHeight } = fitFrameDimensions(
+      video.videoWidth,
+      video.videoHeight,
+      options.maxEdge,
     );
     canvas.width = targetWidth;
     canvas.height = targetHeight;
@@ -241,7 +266,7 @@ export async function extractFramesWithFfmpegSeeks(
         "0:v:0",
         "-an",
         "-vf",
-        `scale=${options.width}:-2`,
+        `scale=w=min(${options.maxEdge}\\,iw):h=min(${options.maxEdge}\\,ih):force_original_aspect_ratio=decrease:force_divisible_by=2`,
         "-frames:v",
         "1",
         "-q:v",

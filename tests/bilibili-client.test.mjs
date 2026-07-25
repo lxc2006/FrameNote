@@ -135,7 +135,8 @@ test("returns a complete File that can back preview and manual download", async 
     globalThis.fetch = originalFetch;
   });
 
-  const { downloadBilibiliVideo } = await vite.ssrLoadModule(
+  const { downloadBilibiliVideo, isReusableBilibiliDownload } =
+    await vite.ssrLoadModule(
     `/lib/client/bilibili-client.ts?successful-job=${Date.now()}`,
   );
   const result = await downloadBilibiliVideo("BV1nx411u79K", {
@@ -165,4 +166,16 @@ test("returns a complete File that can back preview and manual download", async 
     bvid: "BV1nx411u79K",
     variant: "analysis",
   });
+  assert.equal(isReusableBilibiliDownload(result, result.bvid), false);
+  assert.equal(
+    isReusableBilibiliDownload({ ...result, variant: "preview" }, result.bvid),
+    true,
+  );
+  assert.equal(
+    isReusableBilibiliDownload(
+      { ...result, variant: "preview" },
+      "BV1xx411c7mD",
+    ),
+    false,
+  );
 });

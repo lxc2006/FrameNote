@@ -24,6 +24,7 @@ JOB_ID_RE = re.compile(
 FINAL_ARTIFACT_RE = re.compile(r"^artifact\.mp4$", re.IGNORECASE)
 SUPPORTED_VARIANTS = frozenset({"preview", "analysis"})
 ANALYSIS_MAX_EDGE = 1280
+DOWNLOAD_FRAGMENT_CONCURRENCY = 4
 BROWSER_VIDEO_CODECS = frozenset({"h264"})
 BROWSER_AUDIO_CODECS = frozenset({"aac"})
 
@@ -437,7 +438,7 @@ def run(args: argparse.Namespace) -> None:
         "fragment_retries": 3,
         "file_access_retries": 3,
         "extractor_retries": 3,
-        "concurrent_fragment_downloads": 2,
+        "concurrent_fragment_downloads": DOWNLOAD_FRAGMENT_CONCURRENCY,
         "cachedir": False,
         "usenetrc": False,
         "cookiefile": None,
