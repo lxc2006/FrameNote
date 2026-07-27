@@ -42,3 +42,13 @@ export const conversationMessages = sqliteTable(
     ),
   ],
 );
+
+export const conversationTranscripts = sqliteTable(
+  "conversation_transcripts",
+  {
+    conversationId: text("conversation_id")
+      .primaryKey()
+      .references(() => conversations.id, { onDelete: "cascade" }),
+    transcriptJson: text("transcript_json").notNull(),
+  },
+);

@@ -74,6 +74,7 @@ class FakeD1Database {
   constructor() {
     this.conversations = new Map();
     this.messages = [];
+    this.transcripts = new Map();
     this.schemaStatements = [];
   }
 
@@ -122,17 +123,6 @@ class FakeD1Database {
     }
 
     if (
-      query ===
-      "select source_json from conversations where id = ? and owner_id = ?"
-    ) {
-      const [id, ownerId] = parameters;
-      const conversation = this.conversations.get(id);
-      return conversation?.owner_id === ownerId
-        ? [{ source_json: conversation.source_json }]
-        : [];
-    }
-
-    if (
       query.startsWith(
         "select id, role, content, created_at from conversation_messages where conversation_id = ? order by sequence asc",
       )
@@ -150,16 +140,12 @@ class FakeD1Database {
     }
 
     if (
-      query.startsWith(
-        "select coalesce(max(sequence), -1) + 1 as next_sequence from conversation_messages where conversation_id = ?",
-      )
+      query ===
+      "select transcript_json from conversation_transcripts where conversation_id = ?"
     ) {
       const [conversationId] = parameters;
-      const next_sequence =
-        this.messages
-          .filter((message) => message.conversation_id === conversationId)
-          .reduce((maximum, message) => Math.max(maximum, message.sequence), -1) + 1;
-      return [{ next_sequence }];
+      const transcript_json = this.transcripts.get(conversationId);
+      return transcript_json ? [{ transcript_json }] : [];
     }
 
     if (
@@ -240,6 +226,12 @@ class FakeD1Database {
       return successfulD1Result();
     }
 
+    if (query.startsWith("insert into conversation_transcripts")) {
+      const [conversationId, transcriptJson] = parameters;
+      this.transcripts.set(conversationId, transcriptJson);
+      return successfulD1Result();
+    }
+
     if (
       query.startsWith("insert into conversation_messages") &&
       query.includes("coalesce(max(sequence), -1) + 1")
@@ -287,19 +279,6 @@ class FakeD1Database {
     }
 
 
-    if (
-      query.startsWith(
-        "update conversations set source_json = ?, updated_at = ? where id = ? and owner_id = ?",
-      )
-    ) {
-      const [sourceJson, updatedAt, id, ownerId] = parameters;
-      const conversation = this.conversations.get(id);
-      if (conversation?.owner_id !== ownerId) return successfulD1Result(0);
-      conversation.source_json = sourceJson;
-      conversation.updated_at = updatedAt;
-      return successfulD1Result();
-    }
-
     if (query.startsWith("delete from conversation_messages where conversation_id in")) {
       const [id, ownerId] = parameters;
       const conversation = this.conversations.get(id);
@@ -309,6 +288,13 @@ class FakeD1Database {
         (message) => message.conversation_id !== id,
       );
       return successfulD1Result(before - this.messages.length);
+    }
+
+    if (query.startsWith("delete from conversation_transcripts where conversation_id in")) {
+      const [id, ownerId] = parameters;
+      const conversation = this.conversations.get(id);
+      if (conversation?.owner_id !== ownerId) return successfulD1Result(0);
+      return successfulD1Result(this.transcripts.delete(id) ? 1 : 0);
     }
 
     if (
@@ -322,73 +308,6 @@ class FakeD1Database {
     }
 
     throw new Error(`Fake D1 does not support mutation: ${query}`);
-  }
-}
-
-class FakeR2Bucket {
-  constructor() {
-    this.objects = new Map();
-    this.uploads = new Map();
-    this.counter = 0;
-  }
-
-  async createMultipartUpload(key, options = {}) {
-    const uploadId = `upload-${++this.counter}`;
-    this.uploads.set(uploadId, { key, options, parts: new Map() });
-    return this.resumeMultipartUpload(key, uploadId);
-  }
-
-  resumeMultipartUpload(key, uploadId) {
-    const uploads = this.uploads;
-    const objects = this.objects;
-    return {
-      key,
-      uploadId,
-      async uploadPart(partNumber, value) {
-        const upload = uploads.get(uploadId);
-        assert.equal(upload?.key, key);
-        const bytes = new Uint8Array(await new Response(value).arrayBuffer());
-        upload.parts.set(partNumber, bytes);
-        return { partNumber, etag: `etag-${partNumber}-${bytes.byteLength}` };
-      },
-      async complete(parts) {
-        const upload = uploads.get(uploadId);
-        assert.ok(upload);
-        const chunks = parts.map(({ partNumber }) => upload.parts.get(partNumber));
-        assert.ok(chunks.every(Boolean));
-        const size = chunks.reduce((total, chunk) => total + chunk.byteLength, 0);
-        const bytes = new Uint8Array(size);
-        let offset = 0;
-        for (const chunk of chunks) {
-          bytes.set(chunk, offset);
-          offset += chunk.byteLength;
-        }
-        objects.set(key, { bytes, options: upload.options });
-        uploads.delete(uploadId);
-      },
-      async abort() {
-        uploads.delete(uploadId);
-      },
-    };
-  }
-
-  async get(key, options = {}) {
-    const object = this.objects.get(key);
-    if (!object) return null;
-    const range = options.range;
-    const bytes = range
-      ? object.bytes.slice(range.offset, range.offset + range.length)
-      : object.bytes;
-    return {
-      body: new Response(bytes).body,
-      size: object.bytes.byteLength,
-      etag: "stored-etag",
-      httpMetadata: object.options.httpMetadata,
-    };
-  }
-
-  async delete(key) {
-    this.objects.delete(key);
   }
 }
 
@@ -423,7 +342,7 @@ test("server-renders the FrameNote video workspace", async () => {
   assert.match(html, /设置/);
   assert.match(html, /视频对话/);
   assert.match(html, /新建/);
-  assert.match(html, /视频总结对话/);
+  assert.doesNotMatch(html, /视频总结对话/);
   assert.doesNotMatch(html, /architecture-note/);
   assert.doesNotMatch(html, /Qwen 视频理解 \+ DeepSeek V4 Pro 对话/);
   assert.doesNotMatch(
@@ -452,7 +371,16 @@ test("persists owner-scoped video conversations through their D1 lifecycle", asy
     title: "站台 Lofi",
     subtitle: "station-lofi.mp4 · 7:00",
     durationLabel: "07:00",
+  };
+  const legacySource = {
+    ...source,
     downloadFirst: false,
+    persistedVideo: {
+      filename: "station-lofi.mp4",
+      mimeType: "video/mp4",
+      sizeBytes: 6,
+      description: "旧版随对话保存的视频。",
+    },
   };
   const summary = {
     title: "站台 Lofi 总结",
@@ -475,7 +403,6 @@ test("persists owner-scoped video conversations through their D1 lifecycle", asy
     audioAnalysis: {
       status: "analyzed",
       summary: "舒缓的低保真音乐贯穿全片。",
-      speech: null,
       music: "节奏平稳的低保真爵士乐。",
       soundscape: "轻微的站台环境声。",
       temporalChanges: [
@@ -486,6 +413,18 @@ test("persists owner-scoped video conversations through their D1 lifecycle", asy
       ],
     },
   };
+  const transcript = {
+    status: "ready",
+    language: "zh",
+    text: "列车即将到站。",
+    cues: [
+      {
+        startSeconds: 12.5,
+        endSeconds: 14.2,
+        text: "列车即将到站。",
+      },
+    ],
+  };
 
   const createResponse = await request(
     "/api/conversations",
@@ -493,7 +432,7 @@ test("persists owner-scoped video conversations through their D1 lifecycle", asy
       method: "POST",
       headers: ownerHeaders,
       body: JSON.stringify({
-        source,
+        source: legacySource,
         summary,
         messages: [
           {
@@ -502,6 +441,7 @@ test("persists owner-scoped video conversations through their D1 lifecycle", asy
           },
         ],
         activeModel: "qwen3.5-omni-plus",
+        transcript,
       }),
     },
     { DB: database },
@@ -518,7 +458,8 @@ test("persists owner-scoped video conversations through their D1 lifecycle", asy
   assert.deepEqual(created.summary, summary);
   assert.equal(created.messages.length, 1);
   assert.equal(created.activeModel, "qwen3.5-omni-plus");
-  assert.equal(new Set(database.schemaStatements).size, 4);
+  assert.deepEqual(created.transcript, transcript);
+  assert.equal(new Set(database.schemaStatements).size, 5);
   assert.ok(
     database.schemaStatements.every((statement) =>
       statement.includes("if not exists"),
@@ -545,6 +486,7 @@ test("persists owner-scoped video conversations through their D1 lifecycle", asy
   const detail = (await detailResponse.json()).conversation;
   assert.deepEqual(detail.source, source);
   assert.deepEqual(detail.summary, summary);
+  assert.deepEqual(detail.transcript, transcript);
   assert.deepEqual(
     detail.messages.map(({ role, content }) => ({ role, content })),
     [{ role: "assistant", content: "总结已经生成，可以继续追问。" }],
@@ -582,77 +524,6 @@ test("persists owner-scoped video conversations through their D1 lifecycle", asy
     ],
   );
 
-  const media = new FakeR2Bucket();
-  const videoBytes = new Uint8Array([0, 1, 2, 3, 4, 5]);
-  const storedVideo = {
-    filename: "station-lofi.mp4",
-    mimeType: "video/mp4",
-    sizeBytes: videoBytes.byteLength,
-    title: "站台 Lofi",
-    description: "已随对话保存的视频。",
-    durationLabel: "07:00",
-    qualityLabel: "实际 1280×720",
-    sourceLabel: "本地上传",
-  };
-  const initializeVideoResponse = await request(
-    `/api/conversations/${created.id}/video`,
-    {
-      method: "POST",
-      headers: ownerHeaders,
-      body: JSON.stringify({ video: storedVideo }),
-    },
-    { DB: database, MEDIA: media },
-  );
-  assert.equal(initializeVideoResponse.status, 201);
-  const initializedVideo = await initializeVideoResponse.json();
-  const uploadPartResponse = await request(
-    `/api/conversations/${created.id}/video?uploadId=${initializedVideo.uploadId}&partNumber=1`,
-    {
-      method: "PUT",
-      headers: {
-        "oai-authenticated-user-email": "viewer@example.com",
-        "content-type": "application/octet-stream",
-        "x-video-part-bytes": String(videoBytes.byteLength),
-      },
-      body: videoBytes,
-    },
-    { DB: database, MEDIA: media },
-  );
-  assert.equal(uploadPartResponse.status, 201);
-  const uploadedPart = await uploadPartResponse.json();
-  const completeVideoResponse = await request(
-    `/api/conversations/${created.id}/video`,
-    {
-      method: "PATCH",
-      headers: ownerHeaders,
-      body: JSON.stringify({
-        uploadId: initializedVideo.uploadId,
-        parts: [uploadedPart],
-        video: storedVideo,
-      }),
-    },
-    { DB: database, MEDIA: media },
-  );
-  assert.equal(completeVideoResponse.status, 200);
-  assert.deepEqual((await completeVideoResponse.json()).source.persistedVideo, storedVideo);
-
-  const rangedVideoResponse = await request(
-    `/api/conversations/${created.id}/video`,
-    {
-      headers: {
-        "oai-authenticated-user-email": "viewer@example.com",
-        range: "bytes=2-4",
-      },
-    },
-    { DB: database, MEDIA: media },
-  );
-  assert.equal(rangedVideoResponse.status, 206);
-  assert.equal(rangedVideoResponse.headers.get("content-range"), "bytes 2-4/6");
-  assert.deepEqual(
-    [...new Uint8Array(await rangedVideoResponse.arrayBuffer())],
-    [2, 3, 4],
-  );
-
   const renameResponse = await request(
     `/api/conversations/${created.id}`,
     {
@@ -682,10 +553,10 @@ test("persists owner-scoped video conversations through their D1 lifecycle", asy
       method: "DELETE",
       headers: { "oai-authenticated-user-email": "viewer@example.com" },
     },
-    { DB: database, MEDIA: media },
+    { DB: database },
   );
   assert.equal(deleteResponse.status, 204);
-  assert.equal(media.objects.size, 0);
+  assert.equal(database.transcripts.size, 0);
 
   const missingResponse = await request(
     `/api/conversations/${created.id}`,
@@ -708,7 +579,6 @@ test("persists new summaries without a legacy takeaway", async () => {
     kind: "upload",
     title: "无一句话总结测试",
     subtitle: "summary.mp4",
-    downloadFirst: false,
   };
   const summary = {
     title: "无一句话总结测试",
@@ -753,28 +623,6 @@ test("persists new summaries without a legacy takeaway", async () => {
   const created = (await response.json()).conversation;
   assert.equal("takeaway" in created.summary, false);
   assert.equal(database.conversations.size, 1);
-});
-
-test("exposes Qwen and DeepSeek model status without leaking credentials", async () => {
-  const response = await request("/api/model/status");
-  assert.equal(response.status, 200);
-  assert.match(response.headers.get("cache-control") ?? "", /no-store/i);
-
-  const payload = await response.json();
-  assert.equal(payload.provider, "qwen");
-  assert.equal(typeof payload.configured, "boolean");
-  assert.equal(typeof payload.model, "string");
-  assert.deepEqual(payload.acceptedInputs, [
-    "video_url",
-    "frames",
-    "audio",
-    "transcript",
-  ]);
-  assert.equal(payload.conversation.provider, "deepseek");
-  assert.equal(payload.conversation.model, "deepseek-v4-pro");
-  assert.equal(typeof payload.conversation.configured, "boolean");
-  assert.equal("apiKey" in payload, false);
-  assert.equal("apiKey" in payload.conversation, false);
 });
 
 test("validates model requests before attempting a provider call", async () => {
@@ -863,6 +711,7 @@ test("validates and proxies Bilibili download jobs without exposing the service 
       } : {}),
       ...(ready ? {
         artifact: {
+          playbackUrl: `http://127.0.0.1/media/${jobId}?download=0`,
           downloadUrl: `http://127.0.0.1/media/${jobId}`,
           filename: "BV1nx411u79K.mp4",
           mimeType: "video/mp4",
@@ -900,6 +749,7 @@ test("validates and proxies Bilibili download jobs without exposing the service 
   const statusPayload = await statusResponse.json();
   assert.equal(statusPayload.status, "succeeded");
   assert.equal(statusPayload.artifact.sizeBytes, 1024);
+  assert.match(statusPayload.artifact.playbackUrl, /download=0/);
   assert.equal(JSON.stringify(statusPayload).includes("media-service-test-token"), false);
 
   const failedResponse = await request(
@@ -944,7 +794,6 @@ test("uses Qwen for analysis and DeepSeek V4 Pro for follow-up answers", async (
     audioAnalysis: {
       status: "analyzed",
       summary: "低保真爵士乐与站台环境声共同营造出安静的夜间氛围。",
-      speech: null,
       music: "持续的低保真爵士乐，节奏舒缓。",
       soundscape: "能够听到轻微的列车站台环境声。",
       temporalChanges: [{
@@ -956,6 +805,23 @@ test("uses Qwen for analysis and DeepSeek V4 Pro for follow-up answers", async (
   };
   const summaryWithoutAudioAnalysis = { ...summary };
   delete summaryWithoutAudioAnalysis.audioAnalysis;
+  const ordinalFrameSummary = {
+    ...summary,
+    keyPoints: [1, 2, 3, 4].map((number) => ({
+      time: `KF_00${number}`,
+      title: `画面 ${number}`,
+      detail: `第 ${number} 个关键帧。`,
+    })),
+    chapters: [
+      { time: "KF_001", title: "前段", description: "前段内容。" },
+      { time: "KF_002", title: "后段", description: "后段内容。" },
+    ],
+    evidence: [{ time: "KF_003", fact: "第三个关键帧证据。" }],
+    audioAnalysis: {
+      ...summary.audioAnalysis,
+      temporalChanges: [{ time: "00:04", description: "第四帧附近声音变化。" }],
+    },
+  };
   const provider = createServer(async (req, res) => {
     let body = "";
     for await (const chunk of req) body += chunk;
@@ -984,11 +850,14 @@ test("uses Qwen for analysis and DeepSeek V4 Pro for follow-up answers", async (
       return;
     }
 
-    const responseSummary = JSON.stringify(providerRequest.body.messages).includes(
-      "缺少声音分析字段",
-    )
+    const serializedMessages = JSON.stringify(providerRequest.body.messages);
+    const responseSummary = serializedMessages.includes("缺少声音分析字段")
       ? summaryWithoutAudioAnalysis
-      : summary;
+      : providerRequest.body.messages[1]?.content?.some(
+          (part) => part.type === "image_url",
+        )
+        ? ordinalFrameSummary
+        : summary;
     const content = `${JSON.stringify(responseSummary)}\n\`\`\``;
     res.writeHead(200, { "content-type": "text/event-stream" });
     res.write(`data: ${JSON.stringify({
@@ -1021,7 +890,6 @@ test("uses Qwen for analysis and DeepSeek V4 Pro for follow-up answers", async (
           title: "测试视频",
           subtitle: "HTTPS 视频直链",
           sourceUrl: "https://media.example.com/test.mp4",
-          downloadFirst: false,
         },
         context: {
           videoUrl: "https://media.example.com/test.mp4",
@@ -1047,7 +915,7 @@ test("uses Qwen for analysis and DeepSeek V4 Pro for follow-up answers", async (
   const videoPart = providerRequest.body.messages[1].content[0];
   assert.equal(videoPart.type, "video_url");
   assert.equal(videoPart.video_url.url, "https://media.example.com/test.mp4");
-  assert.equal(videoPart.fps, 0.5);
+  assert.equal(videoPart.fps, 1);
   assertAudioAnalysisPrompt(providerRequest);
 
   const extractedMediaResponse = await request(
@@ -1062,15 +930,17 @@ test("uses Qwen for analysis and DeepSeek V4 Pro for follow-up answers", async (
           subtitle: "BV1nx411u79K",
           bvid: "BV1nx411u79K",
           sourceUrl: "https://www.bilibili.com/video/BV1nx411u79K",
-          downloadFirst: true,
         },
         context: {
           frameUrls: [
             "data:image/jpeg;base64,AAAA",
             "data:image/jpeg;base64,BBBB",
+            "data:image/jpeg;base64,CCCC",
+            "data:image/jpeg;base64,DDDD",
           ],
-          frameTimestamps: [0, 12.5],
-          audioUrl: "data:audio/mpeg;base64,CCCC",
+          frameTimestamps: [0, 12.5, 25, 37.5],
+          durationSeconds: 40,
+          audioUrl: "data:audio/mpeg;base64,EEEE",
           audioFormat: "mp3",
         },
       }),
@@ -1083,15 +953,46 @@ test("uses Qwen for analysis and DeepSeek V4 Pro for follow-up answers", async (
   );
   assert.equal(extractedMediaResponse.status, 200);
   const extractedMediaPayload = await extractedMediaResponse.json();
-  assert.deepEqual(extractedMediaPayload.summary.audioAnalysis, summary.audioAnalysis);
+  assert.deepEqual(
+    extractedMediaPayload.summary.keyPoints.map(({ time }) => time),
+    ["00:00", "00:13", "00:25", "00:38"],
+  );
+  assert.equal(
+    extractedMediaPayload.summary.audioAnalysis.temporalChanges[0].time,
+    "00:04",
+  );
   const extractedMediaRequest = providerRequests[1];
   const extractedParts = extractedMediaRequest.body.messages[1].content;
-  assert.equal(extractedParts[0].type, "video");
-  assert.equal(extractedParts[0].video.length, 2);
-  assert.equal(extractedParts[1].type, "input_audio");
-  assert.equal(extractedParts[1].input_audio.format, "mp3");
-  assert.equal(extractedParts[1].input_audio.data, "data:audio/mpeg;base64,CCCC");
-  assert.match(extractedParts[2].text, /第2帧=12\.50秒/);
+  const extractedFrameParts = extractedParts.filter(
+    (part) => part.type === "image_url",
+  );
+  assert.equal(extractedFrameParts.length, 4);
+  assert.equal(
+    extractedFrameParts[1].image_url.url,
+    "data:image/jpeg;base64,BBBB",
+  );
+  assert.match(
+    extractedParts.find(
+      (part) => part.type === "text" && part.text.includes("KF_002"),
+    ).text,
+    /KF_002，对应原视频 00:12\.500/,
+  );
+  const extractedAudioPart = extractedParts.find(
+    (part) => part.type === "input_audio",
+  );
+  assert.equal(extractedAudioPart.input_audio.format, "mp3");
+  assert.equal(
+    extractedAudioPart.input_audio.data,
+    "data:audio/mpeg;base64,EEEE",
+  );
+  assert.match(
+    extractedParts.find(
+      (part) =>
+        part.type === "text" &&
+        part.text.includes("原视频总时长为 40.00 秒"),
+    ).text,
+    /原视频总时长为 40\.00 秒/,
+  );
   assertAudioAnalysisPrompt(extractedMediaRequest);
 
   const providerRequestCountBeforeMissingBvAudio = providerRequests.length;
@@ -1106,7 +1007,6 @@ test("uses Qwen for analysis and DeepSeek V4 Pro for follow-up answers", async (
           title: "缺少音轨的 B 站视频",
           subtitle: "BV1nx411u79K",
           bvid: "BV1nx411u79K",
-          downloadFirst: true,
         },
         context: {
           frameUrls: ["data:image/jpeg;base64,AAAA"],
@@ -1137,7 +1037,6 @@ test("uses Qwen for analysis and DeepSeek V4 Pro for follow-up answers", async (
           title: "缺少声音分析字段",
           subtitle: "HTTPS 视频直链",
           sourceUrl: "https://media.example.com/incomplete.mp4",
-          downloadFirst: false,
         },
         context: {
           videoUrl: "https://media.example.com/incomplete.mp4",
@@ -1169,9 +1068,12 @@ test("uses Qwen for analysis and DeepSeek V4 Pro for follow-up answers", async (
           kind: "upload",
           title: "测试视频",
           subtitle: "test.mp4",
-          downloadFirst: false,
         },
         summary,
+        context: {
+          transcript:
+            "[00:00] 视频介绍模型接口。\n[00:08] 随后完成调用验证。",
+        },
         history: [{ role: "user", content: "它讲了什么？" }],
       }),
     },
@@ -1191,11 +1093,15 @@ test("uses Qwen for analysis and DeepSeek V4 Pro for follow-up answers", async (
   assert.equal(askProviderRequest.url, "/deepseek/chat/completions");
   assert.equal(askProviderRequest.body.stream, false);
   const askPrompt = askProviderRequest.body.messages.at(-1).content;
+  const askBaseContext = askProviderRequest.body.messages[1].content;
   const askSystemPrompt = askProviderRequest.body.messages[0].content;
   assert.match(askPrompt, /结论是什么/);
-  assert.match(askPrompt, /audioAnalysis/);
-  assert.match(askPrompt, /低保真爵士乐/);
+  assert.match(askBaseContext, /audioAnalysis/);
+  assert.match(askBaseContext, /低保真爵士乐/);
+  assert.match(askBaseContext, /\[00:08\] 随后完成调用验证/);
+  assert.match(askBaseContext, /视频信息|结构化总结|带时间点字幕/);
   assert.match(askSystemPrompt, /不是每个回答的边界/);
+  assert.match(askSystemPrompt, /不可遗忘的基础上下文/);
   assert.match(askSystemPrompt, /视频之外/);
   assert.match(askSystemPrompt, /系统提示词|API Key|隐私/);
 
@@ -1210,7 +1116,6 @@ test("uses Qwen for analysis and DeepSeek V4 Pro for follow-up answers", async (
           kind: "upload",
           title: "旧版测试视频",
           subtitle: "legacy.mp4",
-          downloadFirst: false,
         },
         summary: summaryWithoutAudioAnalysis,
       }),
@@ -1240,8 +1145,7 @@ test("removes disposable starter assets and keeps model choice decoupled", async
     hostingJson,
     databaseSchema,
     databaseMigration,
-    conversationVideoStore,
-    conversationVideoRoute,
+    nextConfig,
   ] = await Promise.all([
     readFile(new URL("../app/page.tsx", import.meta.url), "utf8"),
     readFile(new URL("../app/layout.tsx", import.meta.url), "utf8"),
@@ -1257,24 +1161,27 @@ test("removes disposable starter assets and keeps model choice decoupled", async
     readFile(new URL("../.openai/hosting.json", import.meta.url), "utf8"),
     readFile(new URL("../db/schema.ts", import.meta.url), "utf8"),
     readFile(new URL("../drizzle/0000_first_darkhawk.sql", import.meta.url), "utf8"),
-    readFile(new URL("../lib/server/conversation-video-store.ts", import.meta.url), "utf8"),
-    readFile(
-      new URL("../app/api/conversations/[conversationId]/video/route.ts", import.meta.url),
-      "utf8",
-    ),
+    readFile(new URL("../next.config.ts", import.meta.url), "utf8"),
   ]);
 
   assert.match(page, /<VideoWorkbench \/>/);
   assert.match(layout, /lang="zh-CN"/);
+  assert.match(layout, /suppressHydrationWarning/);
+  assert.match(layout, /framenote\.user-preferences\.v1/);
+  assert.match(layout, /document\.documentElement\.dataset\.theme/);
   assert.doesNotMatch(layout, /Starter Project|codex-preview/);
-  assert.doesNotMatch(packageJson, /react-loading-skeleton/);
+  assert.doesNotMatch(packageJson, /tailwindcss/);
   assert.match(engine, /interface VideoEngine/);
-  assert.match(engine, /mode: "demo"/);
+  assert.doesNotMatch(engine, /demoVideoEngine|mode:\s*"demo"/);
   assert.match(workbench, /analyzeVideo/);
   assert.match(workbench, /askVideo/);
   assert.match(workbench, /downloadBilibiliVideo/);
-  assert.match(workbench, /showDownloadedVideo\(downloaded\)/);
-  assert.match(workbench, /requireAudio:\s*true/);
+  assert.match(workbench, /prepareBilibiliVideoDownload/);
+  assert.doesNotMatch(workbench, /\bisPreparingVideo\b/);
+  assert.doesNotMatch(workbench, /variant:\s*"preview"/);
+  assert.match(bilibiliClient, /variant: BILIBILI_ANALYSIS_DOWNLOAD_VARIANT/);
+  assert.match(workbench, /prepareMediaAnalysis/);
+  assert.match(workbench, /MAX_MEDIA_ANALYSIS_BYTES/);
   assert.match(workbench, /summaryTimeline/);
   assert.match(workbench, /<h4>时间线<\/h4>/);
   assert.match(workbench, /timelineItems\.length/);
@@ -1295,18 +1202,78 @@ test("removes disposable starter assets and keeps model choice decoupled", async
   assert.match(workbench, /aria-label="视频预览"/);
   assert.match(workbench, /handleFetchVideo/);
   assert.match(workbench, /获取视频/);
-  assert.match(workbench, /isReusableBilibiliDownload/);
-  assert.doesNotMatch(workbench, /BILIBILI_ANALYSIS_DOWNLOAD_VARIANT/);
+  assert.match(workbench, /showBilibiliVideo/);
+  assert.doesNotMatch(workbench, /showDownloadedVideo/);
+  assert.doesNotMatch(workbench, /isReusableBilibiliDownload/);
+  assert.doesNotMatch(workbench, /URL\.createObjectURL\(result\.file\)/);
+  assert.doesNotMatch(workbench, /bilibiliPlayerUrl|player\.bilibili\.com|<iframe/);
+  assert.match(workbench, /<video/);
+  assert.match(workbench, /preload="metadata"/);
+  assert.match(workbench, /src=\{videoPreview\.playbackUrl\}/);
+  assert.match(workbench, /\$\{result\.width\}x\$\{result\.height\}/);
+  assert.match(workbench, /videoPreview\.resolutionLabel/);
+  assert.doesNotMatch(
+    workbench,
+    /下载最高画质 MP4|打开 B站原页面|边播放边缓存|最高画质浏览器预览已就绪|最高兼容清晰度|以下内容由真实 Qwen|查看源视频/,
+  );
+  assert.match(workbench, /downloaded\.context/);
+  assert.match(workbench, /preservesConversation/);
+  assert.match(workbench, /if \(conversation\.source\.kind === "bilibili"\)/);
+  assert.match(workbench, /conversation\.source\.kind === "url"/);
+  assert.doesNotMatch(
+    workbench,
+    /persistedVideo|showStoredVideo|storeConversationVideo|conversationVideoUrl/,
+  );
+  assert.match(workbench, /loadBilibiliConversationPreview/);
+  assert.match(workbench, /"first-summary"/);
+  assert.match(workbench, /video-preview-description/);
+  assert.match(workbench, /fetchVideoAbortRef\.current !== controller/);
+  assert.match(workbench, /runTokenRef\.current !== runToken/);
+  assert.doesNotMatch(workbench, /bilibiliVideo\?\.file \?\? null/);
   assert.match(workbench, /总结生成完毕，我还可以继续和你讨论相关内容 : \)/);
   assert.match(workbench, /function stopReply\(\)/);
+  assert.match(
+    workbench,
+    /async function handleFetchVideo[\s\S]+stopReply\(\);[\s\S]+async function handleAnalyze[\s\S]+stopReply\(\);/,
+  );
+  assert.match(
+    workbench,
+    /async function handleSelectConversation[\s\S]+stopReply\(\);/,
+  );
   assert.match(workbench, /aria-label=\{isReplying \? "停止生成" : "发送问题"\}/);
-  assert.match(workbench, /最高兼容清晰度/);
+  assert.match(workbench, /transcriptForConversationContext/);
+  assert.doesNotMatch(workbench, /可以继续输入；停止当前回答后即可发送/);
+  assert.match(workbench, /480p 等价分析素材/);
+  assert.doesNotMatch(workbench, /不设网页文件大小上限/);
+  assert.match(workbench, /自动生成低分辨率分析素材/);
+  assert.doesNotMatch(workbench, /浏览器处理上限/);
   assert.doesNotMatch(workbench, /BILIBILI_VIDEO_QUALITIES|最高 \{height\}p/);
   assert.doesNotMatch(workbench, /download=\{videoPreview\.filename\}/);
+  assert.match(
+    workbench,
+    /phase === "ready" && videoPreview[\s\S]+side-video-context/,
+  );
+  assert.match(workbench, /isRestoredLocalConversation/);
+  assert.match(workbench, /videoPreview\.kind === "local"[\s\S]+更改/);
+  assert.match(workbench, /字幕提取/);
+  assert.match(workbench, /FunASR Nano＋CT-Punc/);
+  assert.match(workbench, /transcriptExtractionEnabled/);
+  const restoreStart = workbench.indexOf(
+    "async function loadBilibiliConversationPreview",
+  );
+  const restoreEnd = workbench.indexOf(
+    "\n  async function handleFetchVideo",
+    restoreStart,
+  );
+  assert.ok(restoreStart >= 0 && restoreEnd > restoreStart);
+  const restoreBody = workbench.slice(restoreStart, restoreEnd);
+  assert.doesNotMatch(
+    restoreBody,
+    /setSummary\(null\)|setMessages\(\[\]\)|setActiveConversationId\(null\)|setPhase\("error"\)/,
+  );
   assert.match(workbench, /MarkdownMessage/);
   assert.match(workbench, /timeline-seek/);
   assert.match(workbench, /seekToTimeline/);
-  assert.match(workbench, /showStoredVideo/);
   assert.doesNotMatch(workbench, /summary-mode|>结构化</);
   assert.doesNotMatch(workbench, /"下载视频"|"打开\/下载原视频"/);
   assert.match(bilibiliClient, /\/api\/bilibili\/jobs/);
@@ -1317,8 +1284,6 @@ test("removes disposable starter assets and keeps model choice decoupled", async
     "renameConversation",
     "deleteConversation",
     "appendConversationMessages",
-    "storeConversationVideo",
-    "conversationVideoUrl",
   ]) {
     assert.match(conversationClient, new RegExp(`function ${clientOperation}\\b`));
     assert.match(workbench, new RegExp(`\\b${clientOperation}\\b`));
@@ -1329,6 +1294,9 @@ test("removes disposable starter assets and keeps model choice decoupled", async
   assert.match(settingsMenu, /uiFontSize:\s*DEFAULT_FONT_SIZE/);
   assert.match(settingsMenu, /textFontSize:\s*DEFAULT_FONT_SIZE/);
   assert.match(settingsMenu, /DEFAULT_FONT_SIZE\s*=\s*16/);
+  assert.match(settingsMenu, /DEFAULT_QWEN_DIRECT_SUMMARY_MAX_SECONDS\s*=\s*360/);
+  assert.match(settingsMenu, /MAX_QWEN_DIRECT_SUMMARY_MAX_SECONDS\s*=\s*900/);
+  assert.match(settingsMenu, /设为 0/);
   assert.match(settingsMenu, /value="youyuan">幼圆/);
   assert.match(settingsMenu, /value="kaiti">楷体/);
   assert.match(settingsMenu, /value="microsoft-yahei">微软雅黑/);
@@ -1345,10 +1313,14 @@ test("removes disposable starter assets and keeps model choice decoupled", async
   assert.match(styles, /--ui-font:/);
   assert.match(styles, /--text-font:/);
   assert.match(styles, /html\[data-theme="dark"\] \.primary-action/);
-  assert.doesNotMatch(styles, /video-download-action/);
+  assert.doesNotMatch(styles, /video-download-action|video-source-action|video-ready-label|demo-disclaimer/);
   assert.match(
     styles,
     /html\[data-theme="dark"\] \.timeline-seek\s*\{[^}]*background:\s*transparent;[^}]*color:\s*#43adf5;/s,
+  );
+  assert.match(
+    styles,
+    /html\[data-theme="dark"\] \.transcript-row button\s*\{[^}]*color:\s*#6cc1fb;/s,
   );
   assert.match(
     styles,
@@ -1363,22 +1335,27 @@ test("removes disposable starter assets and keeps model choice decoupled", async
   assert.doesNotMatch(workbench, /download-option|switch-wrap|下载公开视频，再进行总结/);
   assert.match(styles, /\.conversation-library\s*\{[^}]*display:\s*flex/s);
   assert.match(styles, /\.conversation-list\s*\{[^}]*flex:\s*1/s);
-  assert.equal(JSON.parse(hostingJson).d1, "DB");
-  assert.equal(JSON.parse(hostingJson).r2, "MEDIA");
-  assert.match(conversationVideoStore, /createMultipartUpload/);
-  assert.match(conversationVideoStore, /resumeMultipartUpload/);
-  assert.match(conversationVideoStore, /content-range/);
-  assert.match(conversationVideoRoute, /export async function GET/);
-  assert.match(conversationVideoRoute, /export async function PATCH/);
+  const parsedHostingConfig = JSON.parse(hostingJson);
+  assert.equal(parsedHostingConfig.d1, "DB");
+  assert.equal(typeof parsedHostingConfig.project_id, "string");
+  assert.equal("r2" in parsedHostingConfig, false);
+  assert.match(nextConfig, /bodySizeLimit:\s*"501mb"/);
   assert.match(databaseSchema, /sqliteTable\(\s*"conversations"/);
   assert.match(databaseSchema, /sqliteTable\(\s*"conversation_messages"/);
   assert.match(databaseSchema, /conversations_owner_updated_idx/);
   assert.match(databaseSchema, /conversation_messages_sequence_idx/);
   assert.match(databaseMigration, /CREATE TABLE `conversations`/);
   assert.match(databaseMigration, /CREATE TABLE `conversation_messages`/);
-  assert.doesNotMatch(workbench, /demoVideoEngine/);
-
-  await assert.rejects(
-    access(new URL("../app/_sites-preview/SkeletonPreview.tsx", import.meta.url)),
-  );
+  for (const deletedPath of [
+    "../app/_sites-preview/SkeletonPreview.tsx",
+    "../app/api/conversations/[conversationId]/video/route.ts",
+    "../lib/server/conversation-video-store.ts",
+    "../app/api/model/status/route.ts",
+    "../app/chatgpt-auth.ts",
+    "../db/index.ts",
+    "../examples/d1/app/api/notes/route.ts",
+    "../examples/d1/db/schema.ts",
+  ]) {
+    await assert.rejects(access(new URL(deletedPath, import.meta.url)));
+  }
 });

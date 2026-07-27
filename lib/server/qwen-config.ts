@@ -26,7 +26,3 @@ export function getQwenConfig(): QwenConfig {
     ),
   };
 }
-
-export function isQwenConfigured() {
-  return Boolean(getQwenConfig().apiKey);
-}

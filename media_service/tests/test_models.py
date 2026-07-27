@@ -3,10 +3,12 @@ from __future__ import annotations
 import unittest
 
 from media_service.service.models import (
+    CreateJobRequest,
     ErrorResponse,
     JobResponse,
     SourceResponse,
 )
+from pydantic import ValidationError
 
 
 class JobResponseTests(unittest.TestCase):
@@ -35,6 +37,22 @@ class JobResponseTests(unittest.TestCase):
                 "retryable": True,
             },
         )
+
+    def test_direct_summary_threshold_accepts_zero_through_nine_hundred(self) -> None:
+        for value in (0, 360, 900):
+            request = CreateJobRequest(
+                bvid="BV1xx411c7mD",
+                variant="analysis",
+                directSummaryMaxSeconds=value,
+            )
+            self.assertEqual(request.directSummaryMaxSeconds, value)
+
+        with self.assertRaises(ValidationError):
+            CreateJobRequest(
+                bvid="BV1xx411c7mD",
+                variant="analysis",
+                directSummaryMaxSeconds=901,
+            )
 
 
 if __name__ == "__main__":

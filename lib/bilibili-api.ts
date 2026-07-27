@@ -11,12 +11,14 @@ export type BilibiliJobPhase =
   | "resolving"
   | "downloading"
   | "merging"
+  | "analyzing"
   | "ready";
 
 export interface BilibiliJobSource {
   bvid: string;
   title?: string;
   durationSeconds?: number;
+  description?: string;
 }
 
 export type BilibiliDownloadVariant = "preview" | "analysis";
@@ -25,6 +27,7 @@ export const DEFAULT_BILIBILI_DOWNLOAD_VARIANT: BilibiliDownloadVariant = "previ
 export const BILIBILI_ANALYSIS_DOWNLOAD_VARIANT: BilibiliDownloadVariant = "analysis";
 
 export interface BilibiliArtifact {
+  playbackUrl: string;
   downloadUrl: string;
   filename: string;
   mimeType: string;
@@ -33,6 +36,38 @@ export interface BilibiliArtifact {
   expiresAt: string;
   width?: number;
   height?: number;
+}
+
+export interface BilibiliAnalysisFrame {
+  url: string;
+  timestampSeconds: number;
+  score: number;
+  sizeBytes: number;
+}
+
+export interface BilibiliTranscriptCue {
+  startSeconds: number;
+  endSeconds: number;
+  text: string;
+}
+
+export interface BilibiliTranscript {
+  status: "pending" | "ready" | "unavailable";
+  text: string;
+  cues: BilibiliTranscriptCue[];
+  language?: string;
+  error?: string;
+}
+
+export interface BilibiliAnalysis {
+  mode: "direct" | "keyframes";
+  audio?: {
+    url: string;
+    mimeType: string;
+    sizeBytes: number;
+  };
+  frames: BilibiliAnalysisFrame[];
+  transcript: BilibiliTranscript;
 }
 
 export interface BilibiliJobError {
@@ -48,12 +83,14 @@ export interface BilibiliJobSnapshot {
   progress: number;
   source: BilibiliJobSource;
   artifact?: BilibiliArtifact;
+  analysis?: BilibiliAnalysis;
   error?: BilibiliJobError;
 }
 
 export interface CreateBilibiliJobRequest {
   bvid: string;
   variant: BilibiliDownloadVariant;
+  directSummaryMaxSeconds?: number;
 }
 
 export interface BilibiliApiErrorBody {

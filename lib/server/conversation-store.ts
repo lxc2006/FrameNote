@@ -5,8 +5,8 @@ import type {
   CreateConversationInput,
 } from "../conversation";
 import type {
-  PersistedVideoDescriptor,
   SourceKind,
+  VideoTranscript,
   VideoSourceDescriptor,
   VideoSummary,
 } from "../video-engine";
@@ -18,7 +18,7 @@ import { runtimeBinding } from "./runtime-env";
 
 const USER_EMAIL_HEADER = "oai-authenticated-user-email";
 const LOCAL_OWNER_ID = "local-development-user";
-const MAX_REQUEST_BYTES = 1024 * 1024;
+const MAX_REQUEST_BYTES = 2 * 1024 * 1024;
 const MAX_MESSAGES_PER_WRITE = 20;
 const MAX_MESSAGE_CHARACTERS = 12_000;
 const MAX_SUMMARY_BYTES = 512 * 1024;
@@ -26,6 +26,7 @@ const MAX_KEY_POINTS = 32;
 const MAX_CHAPTERS = 256;
 const MAX_EVIDENCE = 24;
 const MAX_AUDIO_CHANGES = 16;
+const MAX_TRANSCRIPT_BYTES = 1024 * 1024;
 
 const CONVERSATION_SCHEMA_STATEMENTS = [
   `CREATE TABLE IF NOT EXISTS conversations (
@@ -52,6 +53,11 @@ const CONVERSATION_SCHEMA_STATEMENTS = [
    )`,
   `CREATE UNIQUE INDEX IF NOT EXISTS conversation_messages_sequence_idx
    ON conversation_messages (conversation_id, sequence)`,
+  `CREATE TABLE IF NOT EXISTS conversation_transcripts (
+     conversation_id TEXT PRIMARY KEY NOT NULL,
+     transcript_json TEXT NOT NULL,
+     FOREIGN KEY (conversation_id) REFERENCES conversations(id) ON DELETE CASCADE
+   )`,
 ] as const;
 
 const initializedConversationDatabases = new WeakMap<
@@ -66,19 +72,10 @@ const SOURCE_KEYS = [
   "durationLabel",
   "bvid",
   "sourceUrl",
+  "description",
+  // 兼容旧记录：允许读取这些字段，但 parseSource 会主动丢弃。
   "downloadFirst",
   "persistedVideo",
-] as const;
-
-const PERSISTED_VIDEO_KEYS = [
-  "filename",
-  "mimeType",
-  "sizeBytes",
-  "title",
-  "description",
-  "durationLabel",
-  "qualityLabel",
-  "sourceLabel",
 ] as const;
 
 interface ConversationRow {
@@ -187,7 +184,7 @@ export function parseCreateConversationInput(
   const object = recordValue(value, "请求体");
   assertOnlyKeys(
     object,
-    ["source", "summary", "messages", "activeModel"],
+    ["source", "summary", "messages", "activeModel", "transcript"],
     "请求体",
   );
   const source = parseSource(object.source);
@@ -198,12 +195,16 @@ export function parseCreateConversationInput(
     "activeModel",
     200,
   );
+  const transcript = object.transcript === undefined
+    ? undefined
+    : parseTranscript(object.transcript);
 
   return {
     source,
     summary,
     messages,
     ...(object.activeModel !== undefined ? { activeModel: activeModel ?? null } : {}),
+    ...(transcript ? { transcript } : {}),
   };
 }
 
@@ -301,6 +302,17 @@ export async function createConversation(
           message.createdAt,
         ),
     ),
+    ...(input.transcript
+      ? [
+          databaseBinding
+            .prepare(
+              `INSERT INTO conversation_transcripts (
+                 conversation_id, transcript_json
+               ) VALUES (?, ?)`,
+            )
+            .bind(conversationId, JSON.stringify(input.transcript)),
+        ]
+      : []),
   ];
 
   const results = await databaseBinding.batch(statements);
@@ -314,6 +326,7 @@ export async function createConversation(
     summary: input.summary,
     messages: messageRecords,
     activeModel: input.activeModel ?? null,
+    ...(input.transcript ? { transcript: input.transcript } : {}),
     createdAt: now,
     updatedAt,
   };
@@ -343,6 +356,13 @@ export async function getConversation(
   )
     .bind(conversationId)
     .all<MessageRow>();
+  const transcriptRow = await databaseBinding.prepare(
+    `SELECT transcript_json
+     FROM conversation_transcripts
+     WHERE conversation_id = ?`,
+  )
+    .bind(conversationId)
+    .first<{ transcript_json: string }>();
 
   try {
     const source = parseSource(JSON.parse(row.source_json));
@@ -353,6 +373,9 @@ export async function getConversation(
       summary,
       messages: messageResult.results.map(messageFromRow),
       activeModel: row.active_model,
+      ...(transcriptRow
+        ? { transcript: parseTranscript(JSON.parse(transcriptRow.transcript_json)) }
+        : {}),
     };
   } catch (error) {
     if (error instanceof ConversationRouteError) {
@@ -391,37 +414,6 @@ export async function renameConversation(
   return listItemFromRow(row);
 }
 
-export async function saveConversationVideoMetadata(
-  ownerId: string,
-  conversationId: string,
-  video: PersistedVideoDescriptor,
-): Promise<VideoSourceDescriptor> {
-  const databaseBinding = await database();
-  const row = await databaseBinding
-    .prepare(
-      `SELECT source_json
-       FROM conversations
-       WHERE id = ? AND owner_id = ?`,
-    )
-    .bind(conversationId, ownerId)
-    .first<{ source_json: string }>();
-  if (!row) throw conversationNotFound();
-
-  const source = parseSource(JSON.parse(row.source_json));
-  const persistedVideo = parsePersistedVideo(video, "source.persistedVideo");
-  const nextSource: VideoSourceDescriptor = { ...source, persistedVideo };
-  const result = await databaseBinding
-    .prepare(
-      `UPDATE conversations
-       SET source_json = ?, updated_at = ?
-       WHERE id = ? AND owner_id = ?`,
-    )
-    .bind(JSON.stringify(nextSource), Date.now(), conversationId, ownerId)
-    .run();
-  assertStatementSucceeded(result);
-  return nextSource;
-}
-
 export async function deleteConversation(
   ownerId: string,
   conversationId: string,
@@ -429,6 +421,14 @@ export async function deleteConversation(
   await requireOwnedConversation(ownerId, conversationId);
   const databaseBinding = await database();
   const results = await databaseBinding.batch([
+    databaseBinding
+      .prepare(
+        `DELETE FROM conversation_transcripts
+         WHERE conversation_id IN (
+           SELECT id FROM conversations WHERE id = ? AND owner_id = ?
+         )`,
+      )
+      .bind(conversationId, ownerId),
     databaseBinding
       .prepare(
         `DELETE FROM conversation_messages
@@ -587,28 +587,21 @@ function parseSource(value: unknown): VideoSourceDescriptor {
     "source.durationLabel",
     100,
   );
-  const downloadFirst = booleanValue(
-    object.downloadFirst,
-    "source.downloadFirst",
+  const description = optionalString(
+    object.description,
+    "source.description",
+    20_000,
   );
-  const persistedVideo = object.persistedVideo === undefined
-    ? undefined
-    : parsePersistedVideo(object.persistedVideo, "source.persistedVideo");
-
   if (kind === "upload") {
     if (object.bvid !== undefined || object.sourceUrl !== undefined) {
       throw invalidInput("本地上传来源不能保存 bvid 或 sourceUrl。");
-    }
-    if (downloadFirst) {
-      throw invalidInput("本地上传来源的 downloadFirst 必须为 false。");
     }
     return {
       kind,
       title,
       subtitle,
-      downloadFirst,
       ...(durationLabel ? { durationLabel } : {}),
-      ...(persistedVideo ? { persistedVideo } : {}),
+      ...(description ? { description } : {}),
     };
   }
 
@@ -616,9 +609,6 @@ function parseSource(value: unknown): VideoSourceDescriptor {
     const bvid = stringValue(object.bvid, "source.bvid", 20);
     if (!/^BV[0-9A-Za-z]{10}$/.test(bvid)) {
       throw invalidInput("source.bvid 格式无效。");
-    }
-    if (!downloadFirst) {
-      throw invalidInput("B站来源的 downloadFirst 必须为 true。");
     }
     if (object.sourceUrl !== undefined) {
       const suppliedUrl = stableHttpsUrl(
@@ -639,17 +629,13 @@ function parseSource(value: unknown): VideoSourceDescriptor {
       subtitle,
       bvid,
       sourceUrl: `https://www.bilibili.com/video/${bvid}`,
-      downloadFirst,
       ...(durationLabel ? { durationLabel } : {}),
-      ...(persistedVideo ? { persistedVideo } : {}),
+      ...(description ? { description } : {}),
     };
   }
 
   if (object.bvid !== undefined) {
     throw invalidInput("HTTPS 视频直链来源不能包含 bvid。");
-  }
-  if (downloadFirst) {
-    throw invalidInput("HTTPS 视频直链来源的 downloadFirst 必须为 false。");
   }
   const sourceUrl = stableHttpsUrl(
     stringValue(object.sourceUrl, "source.sourceUrl", 2_048),
@@ -660,61 +646,8 @@ function parseSource(value: unknown): VideoSourceDescriptor {
     title,
     subtitle,
     sourceUrl,
-    downloadFirst,
     ...(durationLabel ? { durationLabel } : {}),
-    ...(persistedVideo ? { persistedVideo } : {}),
-  };
-}
-
-function parsePersistedVideo(
-  value: unknown,
-  field: string,
-): PersistedVideoDescriptor {
-  const object = recordValue(value, field);
-  assertOnlyKeys(object, [...PERSISTED_VIDEO_KEYS], field);
-  const mimeType = stringValue(object.mimeType, `${field}.mimeType`, 100);
-  if (!/^video\/[a-z0-9.+-]+$/i.test(mimeType)) {
-    throw invalidInput(`${field}.mimeType 必须是视频 MIME 类型。`);
-  }
-  const sizeBytes = object.sizeBytes;
-  if (
-    typeof sizeBytes !== "number" ||
-    !Number.isSafeInteger(sizeBytes) ||
-    sizeBytes <= 0 ||
-    sizeBytes > 150 * 1024 * 1024
-  ) {
-    throw invalidInput(`${field}.sizeBytes 超出视频存储限制。`);
-  }
-
-  const title = optionalString(object.title, `${field}.title`, 300);
-  const durationLabel = optionalString(
-    object.durationLabel,
-    `${field}.durationLabel`,
-    100,
-  );
-  const qualityLabel = optionalString(
-    object.qualityLabel,
-    `${field}.qualityLabel`,
-    200,
-  );
-  const sourceLabel = optionalString(
-    object.sourceLabel,
-    `${field}.sourceLabel`,
-    200,
-  );
-  return {
-    filename: stringValue(object.filename, `${field}.filename`, 255),
-    mimeType,
-    sizeBytes,
-    description: stringValue(
-      object.description,
-      `${field}.description`,
-      1_000,
-    ),
-    ...(title ? { title } : {}),
-    ...(durationLabel ? { durationLabel } : {}),
-    ...(qualityLabel ? { qualityLabel } : {}),
-    ...(sourceLabel ? { sourceLabel } : {}),
+    ...(description ? { description } : {}),
   };
 }
 
@@ -821,6 +754,68 @@ function parseSummary(value: unknown, fallbackTitle: string): VideoSummary {
   }
 }
 
+function parseTranscript(value: unknown): VideoTranscript {
+  const object = recordValue(value, "transcript");
+  assertOnlyKeys(
+    object,
+    ["status", "text", "cues", "language", "error"],
+    "transcript",
+  );
+  if (object.status !== "ready" && object.status !== "unavailable") {
+    throw invalidInput("transcript.status 格式无效。");
+  }
+  const text = typeof object.text === "string" ? object.text : "";
+  const language = optionalString(object.language, "transcript.language", 32);
+  const error = optionalString(object.error, "transcript.error", 1_000);
+  const cues = validateTranscriptCues(object.cues);
+  const result: VideoTranscript = {
+    status: object.status,
+    text,
+    cues,
+    ...(language ? { language } : {}),
+    ...(error ? { error } : {}),
+  };
+  if (
+    new TextEncoder().encode(JSON.stringify(result)).byteLength >
+    MAX_TRANSCRIPT_BYTES
+  ) {
+    throw invalidInput("transcript 超过 D1 存储限制。");
+  }
+  return result;
+}
+
+function validateTranscriptCues(value: unknown) {
+  if (!Array.isArray(value) || value.length > 20_000) {
+    throw invalidInput("transcript.cues 格式无效。");
+  }
+  let previous = -1;
+  return value.map((item, index) => {
+    const cue = recordValue(item, `transcript.cues[${index}]`);
+    assertOnlyKeys(
+      cue,
+      ["startSeconds", "endSeconds", "text"],
+      `transcript.cues[${index}]`,
+    );
+    const startSeconds = finiteNumber(
+      cue.startSeconds,
+      `transcript.cues[${index}].startSeconds`,
+    );
+    const endSeconds = finiteNumber(
+      cue.endSeconds,
+      `transcript.cues[${index}].endSeconds`,
+    );
+    if (startSeconds < 0 || endSeconds < startSeconds || startSeconds < previous) {
+      throw invalidInput(`transcript.cues[${index}] 时间范围无效。`);
+    }
+    previous = startSeconds;
+    return {
+      startSeconds,
+      endSeconds,
+      text: stringValue(cue.text, `transcript.cues[${index}].text`, 4_000),
+    };
+  });
+}
+
 function validateAudioAnalysis(value: unknown) {
   const object = recordValue(value, "summary.audioAnalysis");
   assertOnlyKeys(
@@ -838,7 +833,10 @@ function validateAudioAnalysis(value: unknown) {
   );
   stringValue(object.status, "summary.audioAnalysis.status", 20);
   stringValue(object.summary, "summary.audioAnalysis.summary", 20_000);
-  nullableStringValue(object.speech, "summary.audioAnalysis.speech", 20_000);
+  // 旧对话可能包含已废弃的 speech 字段；只做兼容校验，规范化后会丢弃。
+  if (object.speech !== undefined) {
+    nullableStringValue(object.speech, "summary.audioAnalysis.speech", 20_000);
+  }
   nullableStringValue(object.music, "summary.audioAnalysis.music", 20_000);
   nullableStringValue(
     object.soundscape,
@@ -1000,16 +998,16 @@ function nullableStringValue(value: unknown, field: string, maxLength: number) {
   stringValue(value, field, maxLength);
 }
 
-function booleanValue(value: unknown, field: string): boolean {
-  if (typeof value !== "boolean") {
-    throw invalidInput(`${field} 必须是布尔值。`);
+function integerValue(value: unknown, field: string): number {
+  if (typeof value !== "number" || !Number.isSafeInteger(value) || value < 0) {
+    throw new Error(`D1 字段 ${field} 不是有效整数。`);
   }
   return value;
 }
 
-function integerValue(value: unknown, field: string): number {
-  if (typeof value !== "number" || !Number.isSafeInteger(value) || value < 0) {
-    throw new Error(`D1 字段 ${field} 不是有效整数。`);
+function finiteNumber(value: unknown, field: string): number {
+  if (typeof value !== "number" || !Number.isFinite(value)) {
+    throw invalidInput(`${field} 必须是有限数字。`);
   }
   return value;
 }

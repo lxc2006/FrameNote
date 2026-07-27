@@ -1,5 +1,6 @@
 import type {
   SourceKind,
+  VideoTranscript,
   VideoSourceDescriptor,
   VideoSummary,
 } from "./video-engine";
@@ -24,6 +25,7 @@ export interface ConversationDetail extends ConversationListItem {
   summary: VideoSummary;
   messages: ConversationMessage[];
   activeModel: string | null;
+  transcript?: VideoTranscript;
 }
 
 export interface CreateConversationInput {
@@ -31,4 +33,5 @@ export interface CreateConversationInput {
   summary: VideoSummary;
   messages: Array<Pick<ConversationMessage, "role" | "content">>;
   activeModel?: string | null;
+  transcript?: VideoTranscript;
 }

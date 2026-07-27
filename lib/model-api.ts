@@ -18,18 +18,6 @@ export interface AskVideoRequest {
   history?: VideoConversationMessage[];
 }
 
-export interface ModelStatusResponse {
-  provider: "qwen";
-  configured: boolean;
-  model: string;
-  acceptedInputs: Array<"video_url" | "frames" | "audio" | "transcript">;
-  conversation: {
-    provider: "deepseek";
-    configured: boolean;
-    model: string;
-  };
-}
-
 export interface AnalyzeVideoResponse {
   provider: "qwen";
   model: string;

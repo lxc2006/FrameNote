@@ -23,6 +23,8 @@ const MAX_TRANSCRIPT_CHARACTERS = 1_500_000;
 const MAX_HISTORY_MESSAGES = 20;
 const MAX_FRAME_URLS = 256;
 const AUDIO_FORMATS = ["mp3", "wav", "aac", "m4a", "ogg", "webm"] as const;
+const JOB_ID_PATTERN =
+  /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 
 export async function readJsonRequest(request: Request): Promise<unknown> {
   const contentType = request.headers.get("content-type") ?? "";
@@ -51,9 +53,14 @@ export function parseAnalyzeVideoRequest(value: unknown): AnalyzeVideoRequest {
   const object = recordValue(value, "请求体");
   const source = parseSource(object.source);
   const context = parseContext(object.context, true);
-  if (source.kind === "bilibili" && !context.audioUrl) {
+  if (
+    source.kind === "bilibili" &&
+    !context.audioUrl &&
+    !context.videoUrl &&
+    !context.mediaJobId
+  ) {
     throw new QwenInputError(
-      "B站视频总结必须包含已提取的音轨，不能仅用关键帧生成纯画面总结。",
+      "B站视频总结必须包含完整视频或已提取音轨，不能仅用关键帧生成纯画面总结。",
     );
   }
   return {
@@ -159,7 +166,6 @@ function parseSource(value: unknown): VideoSourceDescriptor {
     kind,
     title: stringValue(object.title, "source.title", 300),
     subtitle: stringValue(object.subtitle, "source.subtitle", 1_000),
-    downloadFirst: booleanValue(object.downloadFirst, "source.downloadFirst"),
     ...(optionalString(object.durationLabel, "source.durationLabel", 100)
       ? { durationLabel: optionalString(object.durationLabel, "source.durationLabel", 100) }
       : {}),
@@ -168,6 +174,9 @@ function parseSource(value: unknown): VideoSourceDescriptor {
       : {}),
     ...(optionalString(object.sourceUrl, "source.sourceUrl", 2_048)
       ? { sourceUrl: optionalString(object.sourceUrl, "source.sourceUrl", 2_048) }
+      : {}),
+    ...(optionalString(object.description, "source.description", 20_000)
+      ? { description: optionalString(object.description, "source.description", 20_000) }
       : {}),
   };
 }
@@ -191,6 +200,14 @@ function parseContext(value: unknown, required: boolean): VideoModelContext {
     ? undefined
     : parseAudioFormat(object.audioFormat);
   const fps = object.fps === undefined ? undefined : numberValue(object.fps, "context.fps");
+  const durationSeconds = object.durationSeconds === undefined
+    ? undefined
+    : numberValue(object.durationSeconds, "context.durationSeconds");
+  const mediaJobId = optionalString(
+    object.mediaJobId,
+    "context.mediaJobId",
+    36,
+  );
 
   if (videoUrl) validateMediaUrl(videoUrl, "context.videoUrl", "video");
   if (audioUrl) validateMediaUrl(audioUrl, "context.audioUrl", "audio");
@@ -200,7 +217,28 @@ function parseContext(value: unknown, required: boolean): VideoModelContext {
   if (fps !== undefined && (fps < 0.1 || fps > 10)) {
     throw new QwenInputError("context.fps 必须在 0.1 到 10 之间。");
   }
-  if (required && !videoUrl && !frameUrls?.length && !audioUrl && !transcript) {
+  if (durationSeconds !== undefined && (durationSeconds <= 0 || durationSeconds > 3_601)) {
+    throw new QwenInputError("context.durationSeconds 必须在 0 到 3601 秒之间。");
+  }
+  if (mediaJobId && !JOB_ID_PATTERN.test(mediaJobId)) {
+    throw new QwenInputError("context.mediaJobId 格式无效。");
+  }
+  if (
+    mediaJobId &&
+    (videoUrl || frameUrls?.length || audioUrl || transcript)
+  ) {
+    throw new QwenInputError(
+      "context.mediaJobId 必须作为独立的直接视频输入使用。",
+    );
+  }
+  if (
+    required &&
+    !videoUrl &&
+    !frameUrls?.length &&
+    !audioUrl &&
+    !transcript &&
+    !mediaJobId
+  ) {
     throw new QwenInputError(
       "context 至少需要 videoUrl、frameUrls、audioUrl 或 transcript 之一。",
     );
@@ -214,6 +252,8 @@ function parseContext(value: unknown, required: boolean): VideoModelContext {
     ...(audioFormat ? { audioFormat } : {}),
     ...(transcript ? { transcript } : {}),
     ...(fps !== undefined ? { fps } : {}),
+    ...(durationSeconds !== undefined ? { durationSeconds } : {}),
+    ...(mediaJobId ? { mediaJobId: mediaJobId.toLowerCase() } : {}),
   };
 }
 
@@ -327,13 +367,6 @@ function stringValue(value: unknown, field: string, maxLength: number) {
 function optionalString(value: unknown, field: string, maxLength: number) {
   if (value === undefined || value === null || value === "") return undefined;
   return stringValue(value, field, maxLength);
-}
-
-function booleanValue(value: unknown, field: string) {
-  if (typeof value !== "boolean") {
-    throw new QwenInputError(`${field} 必须是布尔值。`);
-  }
-  return value;
 }
 
 function numberValue(value: unknown, field: string) {

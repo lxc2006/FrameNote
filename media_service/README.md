@@ -1,21 +1,22 @@
-# FrameNote B 站媒体服务
+# FrameNote 媒体服务
 
-这是 FrameNote 的独立媒体获取服务。它只接收严格的 12 位 BVID，在服务器端使用 `yt-dlp` 获取 B 站公开视频最高 720p 的 H.264 视频流与 AAC 音频流，再由 FFmpeg 合并、`ffprobe` 复核，最终返回短时有效的签名下载 URL。
+这是 FrameNote 的独立媒体服务，统一处理本地上传、HTTPS 视频直链分析和 B 站公开 UGC。所有 `analysis` 任务都会先生成最长边不超过 854px 的 H.264/AAC 素材，再按视频时长选择“直接视频”或“最多 64 张关键帧 + 独立音轨”。Qwen 完成后，网页可以按设置异步启动 FunASR；Nano 负责识别文字与字符级时间戳，CT-Punc 重新恢复整段标点，最终只按句号、问号和感叹号合并为整句字幕。
 
-服务不会接收任意 URL，不读取 Cookie，不登录 B 站，也不尝试访问会员、私有、付费或地区受限内容。请只处理你拥有或已获授权使用的公开视频。
+B 站 `preview` 任务准备默认最高兼容画质，网页通过 HTTP Range 内联播放 URL 边播放边缓存，并可使用附件 URL 手动下载。B 站任务只接收严格的 12 位 BVID，不读取 Cookie，不登录 B 站，也不尝试访问会员、私有、付费或地区受限内容。HTTPS 直链由网页下载后作为文件上传到本服务，媒体服务本身不会对用户提供的 URL 发起请求。请只处理你拥有或已获授权使用的视频。
 
 ## 固定限制
 
-- 单视频、禁止播放列表；
-- 最高 720p；
+- 单视频、禁止播放列表；本地与 HTTPS 分析上传最大 500 MB；
+- 手动下载选择默认最高兼容画质，默认最大 1 GB；
+- 分析素材最长边不超过 854px（约 480p），最大 500 MB；
 - 最终媒体固定为 MP4 容器、H.264 视频与 AAC 音频；
 - 最长 60 分钟；
-- 最终文件及下载过程默认最大 150 MB；
 - 2 个并行下载 worker；
 - 最多 20 个等待中的任务；
 - 默认任务超时 20 分钟（网页总等待上限为 22 分钟）；
 - 下载文件默认保留 1 小时；
-- 签名下载 URL 默认有效 10 分钟。
+- `preview` 播放/下载 URL 默认随文件保留 1 小时，`analysis` 签名 URL 默认有效 10 分钟。
+- 关键帧固定锚点间隔为 `max(1 秒, 视频时长 / 50)`；每个锚点及 AdaptiveDetector 场景点前后取 5 个候选，按清晰度、曝光、对比度、信息熵与独特性评分，并用 pHash 去重。
 
 这些安全上限固定在服务端，不能由请求覆盖。
 
@@ -30,6 +31,8 @@ python -m venv .venv
 .\.venv\Scripts\python.exe -m pip install -r media_service\requirements.txt
 .\.venv\Scripts\python.exe media_service\app.py
 ```
+
+依赖安装会包含 PyTorch、PySceneDetect、OpenCV、ImageHash 与 FunASR，体积明显大于基础下载服务。FunASR 第一次识别时还会从 ModelScope 下载模型并写入用户缓存；之后会复用缓存。
 
 默认未设置 API Token 时，服务只接受 loopback 请求，并拒绝带 `Forwarded`、`X-Forwarded-For` 或 `X-Real-IP` 的请求。因此本机开发可以直接访问 `http://127.0.0.1:8788`，不能以无 Token 模式对公网开放。
 
@@ -69,14 +72,21 @@ docker run --rm -p 8788:8788 `
 | `FRAMENOTE_MEDIA_PUBLIC_BASE_URL` | 当前请求 Origin | 返回下载链接使用的公网 HTTPS Origin |
 | `FRAMENOTE_MEDIA_CORS_ORIGINS` | `http://localhost:3000,http://127.0.0.1:3000` | 精确 Origin 的逗号分隔列表；不允许 `*`，生产环境应显式覆盖 |
 | `FRAMENOTE_MEDIA_STATE_DIR` | `media_service/data` | 任务元数据及临时视频目录；容器默认 `/data` |
-| `FRAMENOTE_MEDIA_MAX_BYTES` | `157286400`（150 MB） | 媒体服务上限，可在 1–300 MB 范围覆盖；FrameNote 网页仍会拒绝超过 150 MB 的下载结果 |
+| `FRAMENOTE_MEDIA_MAX_BYTES` | `524288000`（500 MB） | AI 分析素材上限，可在 1–500 MB 范围覆盖 |
+| `FRAMENOTE_MEDIA_DOWNLOAD_MAX_BYTES` | `1073741824`（1 GB） | 媒体服务的 preview 临时成品安全上限，可在 1 MB–2 GB 范围覆盖；网页不再设置整文件下载上限 |
 | `FRAMENOTE_MEDIA_JOB_TIMEOUT_SECONDS` | `1200` | 单任务执行超时，范围 60–7200 秒；网页额外预留排队与传输时间 |
 | `FRAMENOTE_MEDIA_ARTIFACT_TTL_SECONDS` | `3600` | 成品保留时间，范围 60–86400 秒 |
-| `FRAMENOTE_MEDIA_SIGNED_URL_TTL_SECONDS` | `600` | 单个签名 URL 有效期，范围 30–3600 秒 |
+| `FRAMENOTE_MEDIA_SIGNED_URL_TTL_SECONDS` | `600` | AI 分析签名 URL 有效期，范围 30–3600 秒；预览 URL 跟随成品保留期 |
 | `FRAMENOTE_MEDIA_TERMINAL_RETENTION_SECONDS` | `3600` | 失败、取消及过期记录的保留时间 |
 | `FRAMENOTE_MEDIA_CLEANUP_INTERVAL_SECONDS` | `60` | 过期目录扫描间隔 |
+| `FRAMENOTE_FUNASR_MODEL` | `FunAudioLLM/Fun-ASR-Nano-2512` | FunASR 主识别模型名称或本地模型目录 |
+| `FRAMENOTE_FUNASR_HUB` | `ms` | 模型来源；中国大陆默认使用 ModelScope，也可设为 `hf` |
+| `FRAMENOTE_FUNASR_LANGUAGE` | `中文` | Fun-ASR-Nano 的识别语言 |
+| `FRAMENOTE_FUNASR_VAD_MODEL` | `fsmn-vad` | 长音频语音活动检测模型 |
+| `FRAMENOTE_FUNASR_PUNC_MODEL` | `ct-punc` | Nano 识别完成后的独立标点恢复模型；设置为空可回退到 Nano 原生标点 |
+| `FRAMENOTE_FUNASR_DEVICE` | `cpu` | 推理设备，例如 `cpu` 或 `cuda:0` |
 
-如果 Qwen 需要直接读取 `downloadUrl`，`FRAMENOTE_MEDIA_PUBLIC_BASE_URL` 必须是 Qwen 服务能够访问的公网 HTTPS 地址；`127.0.0.1` 只适合本机接口联调。
+`playbackUrl` 与 `downloadUrl` 由浏览器直接访问，因此 `FRAMENOTE_MEDIA_PUBLIC_BASE_URL` 必须是浏览器能够访问的 HTTPS Origin；`127.0.0.1` 只适合本机联调。
 
 默认 CORS 只放行两种常见的本地前端 Origin。生产部署时应把 `FRAMENOTE_MEDIA_CORS_ORIGINS` 覆盖为 FrameNote 网站的准确 HTTPS Origin；如果始终由网站服务端调用媒体服务，也可以把它设置为空字符串来关闭 CORS 中间件。
 
@@ -88,13 +98,33 @@ docker run --rm -p 8788:8788 `
 Authorization: Bearer <FRAMENOTE_MEDIA_API_TOKEN>
 ```
 
-### 创建任务
+### 创建本地或 HTTPS 分析任务
+
+```http
+POST /v1/media/jobs
+Content-Type: multipart/form-data
+
+file=<video bytes>
+sourceKind=upload | url
+directSummaryMaxSeconds=360
+sourceUrl=https://example.com/video.mp4   # 仅作为 HTTPS 来源元数据
+```
+
+服务以流式方式把上传内容写入单独任务目录，超过 500 MB 时立即拒绝。任务始终为 `analysis`：先用 `ffprobe` 校验时长和音视频轨，再用 FFmpeg 转码为最长边不超过 854px 的 MP4，最后按阈值生成直接视频或关键帧证据。对应控制接口为：
+
+```http
+GET /v1/media/jobs/{jobId}
+POST /v1/media/jobs/{jobId}/transcript
+DELETE /v1/media/jobs/{jobId}
+```
+
+### 创建 B 站任务
 
 ```http
 POST /v1/bilibili/jobs
 Content-Type: application/json
 
-{"bvid":"BV1xx411c7mD"}
+{"bvid":"BV1xx411c7mD","variant":"analysis","directSummaryMaxSeconds":360}
 ```
 
 成功返回 `202 Accepted`，并附带 `Location` 响应头：
@@ -105,20 +135,26 @@ Content-Type: application/json
   "status": "queued",
   "phase": "queued",
   "progress": 0,
-  "source": {"bvid": "BV1xx411c7mD"}
+  "source": {"kind": "bilibili", "bvid": "BV1xx411c7mD"}
 }
 ```
 
-请求体只允许 `bvid` 字段。完整 URL、短链、AV 号、首尾空格及额外字段都会返回 `422`。
+请求体允许 `bvid`、`variant` 和 `directSummaryMaxSeconds`；`variant` 为 `preview`（手动下载最高兼容画质）或 `analysis`（AI 总结约 480p 素材），省略时默认为 `preview`。直接总结阈值只适用于 `analysis`，范围为 0–900 秒，0 表示关闭直接视频路径。
 
-### 查询任务
+### 查询 B 站任务
 
 ```http
 GET /v1/bilibili/jobs/{jobId}
 GET /v1/bilibili/jobs?limit=50
 ```
 
-状态为 `queued | running | succeeded | failed | cancelled | expired`，阶段为 `queued | resolving | downloading | merging | ready`。失败任务会携带结构化 `error`；成功后响应包含：
+状态为 `queued | running | succeeded | failed | cancelled | expired`，阶段为 `queued | resolving | downloading | merging | analyzing | ready`。失败任务会携带结构化 `error`；成功后响应包含视频 `artifact`；`analysis.mode` 为 `direct` 或 `keyframes`。直接路径不返回音轨或关键帧，长视频路径返回带签名 URL 的 `analysis.audio` 与 `analysis.frames`；初始 `analysis.transcript.status` 为 `pending`。
+
+Qwen 总结完成后，网站调用以下接口启动 FunASR，并继续查询任务，直到字幕状态变为 `ready` 或 `unavailable`：
+
+```http
+POST /v1/bilibili/jobs/{jobId}/transcript
+```
 
 ```json
 {
@@ -132,7 +168,8 @@ GET /v1/bilibili/jobs?limit=50
     "durationSeconds": 93.4
   },
   "artifact": {
-    "downloadUrl": "https://media.example.com/v1/bilibili/jobs/.../artifact?expires=...&signature=...",
+    "playbackUrl": "https://media.example.com/v1/bilibili/jobs/.../artifact?expires=...&signature=...&download=0",
+    "downloadUrl": "https://media.example.com/v1/bilibili/jobs/.../artifact?expires=...&signature=...&download=1",
     "filename": "示例视频 [BV1xx411c7mD].mp4",
     "mimeType": "video/mp4",
     "sizeBytes": 12345678,
@@ -142,9 +179,9 @@ GET /v1/bilibili/jobs?limit=50
 }
 ```
 
-每次查询成功任务都会生成一个新的短时签名 URL；`expiresAt` 对应该 URL 的过期时间。文件保留期结束后任务转为 `expired` 并自动清理。
+每次查询成功任务都会生成新的签名 URL；`playbackUrl` 使用 `Content-Disposition: inline` 并支持字节范围请求，`downloadUrl` 使用 `Content-Disposition: attachment`。`expiresAt` 对应该 URL 的过期时间，文件保留期结束后任务转为 `expired` 并自动清理。
 
-### 取消或删除结果
+### 取消或删除 B 站结果
 
 ```http
 DELETE /v1/bilibili/jobs/{jobId}
@@ -162,12 +199,13 @@ GET /health
 
 ## 实现原理
 
-1. API 对 BVID、鉴权和队列容量做入口校验，只拼接固定的 `https://www.bilibili.com/video/{BVID}`，因此用户不能利用该服务请求任意站点。
+1. API 对文件体积、来源类型、BVID、鉴权和队列容量做入口校验。B 站只拼接固定的 `https://www.bilibili.com/video/{BVID}`；HTTPS 直链则由浏览器下载后作为普通文件上传，媒体服务不会成为任意 URL 代理。
 2. 两个异步消费者各自以参数数组（不经过 shell）和 `-I -u -X utf8=1` 启动隔离的 `worker.py` 子进程。worker 使用 UTF-8 JSON Lines 输出进度与错误，主进程负责状态机、超时和取消。
-3. worker 先用 `yt-dlp` 只解析元数据，拒绝直播、未知时长、超过 60 分钟或预计超过配置大小上限的内容；格式选择器的每个 fallback 都硬性要求不高于 720p 的 AVC/H.264 视频与 AAC 音频，不会回退到 AV1、HEVC 或 Opus。
+3. B 站 worker 先用 `yt-dlp` 只解析元数据，拒绝直播、未知时长、超过 60 分钟或预计超过对应任务大小上限的内容；`preview` 选择最高兼容画质，B 站 `analysis` 的每个 fallback 都硬性要求最长边不超过 854px。上传文件先用 `ffprobe` 校验，再由 FFmpeg 转码为同样的 H.264/AAC 低分辨率分析素材。
 4. B 站通常使用 DASH，把画面与声音作为两个流返回。`yt-dlp` 下载后调用 FFmpeg 合并/重封装为 MP4，过程中持续检查累计字节数；重封装不负责把不兼容编码转码为 H.264/AAC。
-5. 下载结束后用 `ffprobe` 再次核对实际时长、文件大小、MP4 容器以及全部音视频轨的 H.264/AAC 白名单，并计算 SHA-256。校验失败的文件不会进入成功状态。
-6. API 使用 HMAC-SHA256 为 `jobId + 过期时间` 签名。媒体路由验证签名、有效期和规范化路径后才发送文件，后台清理器按 TTL 删除临时内容。
+5. 下载结束后用 `ffprobe` 再次核对实际时长、文件大小、MP4 容器以及全部音视频轨的 H.264/AAC 白名单，并计算 SHA-256。`analysis` 任务随后根据阈值决定：短视频立即就绪；长视频再运行 AdaptiveDetector、候选帧质量评分、pHash 去重和音轨提取。
+6. Qwen 总结完成后，单独的 transcript 请求才在后台执行 FunASR，并原子更新分析清单；字幕暂不作为 Qwen 总结输入。
+7. API 使用 HMAC-SHA256 为 `jobId + 过期时间` 签名。媒体与分析素材路由验证签名、有效期和规范化路径后返回文件；后台清理器按 TTL 删除临时内容。
 
 常见失败会映射为结构化的 `error: {code, message, retryable}`，例如 `VIDEO_TOO_LONG`、`VIDEO_TOO_LARGE`、`UNSUPPORTED_VIDEO_CODEC`、`UNSUPPORTED_AUDIO_CODEC`、`ACCESS_RESTRICTED`、`TIMEOUT` 和 `DOWNLOAD_FAILED`。
 
@@ -180,4 +218,4 @@ GET /health
 .\.venv\Scripts\python.exe -m compileall -q media_service
 ```
 
-单元测试覆盖严格 BVID、HMAC 防篡改、loopback 鉴权基础逻辑、路径逃逸防护、精确 CORS、队列上限/取消释放、时长与体积校验、yt-dlp 的 H.264/AAC 选择语义，以及 ffprobe 对 AV1、HEVC、Opus、缺失音轨和非 MP4 产物的拒绝。真实 B 站端到端测试需要安装 requirements 和 FFmpeg，并使用你有权处理的公开视频单独执行。
+单元测试覆盖严格 BVID、通用上传任务命令、HMAC 防篡改、Range/206/Content-Range、内联与附件响应、loopback 鉴权、路径逃逸防护、精确 CORS、队列上限/取消释放、时长与体积校验、yt-dlp 的 H.264/AAC 选择语义，以及 ffprobe 对 AV1、HEVC、Opus、缺失音轨和非 MP4 产物的拒绝。真实端到端测试需要安装 requirements 和 FFmpeg，并使用你有权处理的视频单独执行。

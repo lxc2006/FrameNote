@@ -10,14 +10,17 @@ from unittest.mock import patch
 from yt_dlp import YoutubeDL
 
 from media_service.worker import (
-    BROWSER_COMPATIBLE_FORMAT,
     DOWNLOAD_FRAGMENT_CONCURRENCY,
     WorkerFailure,
     browser_compatible_format,
     classify_download_error,
     estimate_download_bytes,
+    load_analysis_builder,
+    probe_source_media,
     safe_download_filename,
+    transcode_analysis_video,
     validate_artifact_probe,
+    validate_runtime_limits,
     validate_video_info,
     verify_artifact,
 )
@@ -52,14 +55,17 @@ class WorkerValidationTests(unittest.TestCase):
     def test_downloads_four_fragments_concurrently(self) -> None:
         self.assertEqual(DOWNLOAD_FRAGMENT_CONCURRENCY, 4)
 
+    def test_analysis_pipeline_loads_from_the_isolated_worker(self) -> None:
+        self.assertTrue(callable(load_analysis_builder()))
+
     def test_browser_format_restricts_every_fallback_to_avc_and_aac(self) -> None:
-        branches = BROWSER_COMPATIBLE_FORMAT.split("/")
+        branches = browser_compatible_format("analysis").split("/")
         self.assertEqual(len(branches), 2)
         for branch in branches:
             with self.subTest(branch=branch):
                 self.assertIn("[ext=mp4]", branch)
-                self.assertIn("[width<=1280]", branch)
-                self.assertIn("[height<=1280]", branch)
+                self.assertIn("[width<=854]", branch)
+                self.assertIn("[height<=854]", branch)
                 self.assertIn(
                     "[vcodec~='^(?:h264|avc[13](?:\\.|$))']", branch
                 )
@@ -82,7 +88,24 @@ class WorkerValidationTests(unittest.TestCase):
                     "[acodec~='^(?:aac|mp4a\\.40\\.)']", branch
                 )
 
-    def test_analysis_format_keeps_portrait_720_by_1280_streams(self) -> None:
+        formats = [
+            self.format_info("avc-480", "mp4", 480, "avc1.640033", "none"),
+            self.format_info("avc-720", "mp4", 720, "avc1.640033", "none"),
+            self.format_info("avc-1080", "mp4", 1080, "avc1.640033", "none"),
+            self.format_info("aac", "m4a", None, "none", "mp4a.40.2"),
+        ]
+        downloader = YoutubeDL({"quiet": True, "no_warnings": True})
+        selected = downloader._select_formats(
+            formats,
+            downloader.build_format_selector(format_selector),
+        )
+        self.assertEqual(len(selected), 1)
+        self.assertEqual(
+            [item["format_id"] for item in selected[0]["requested_formats"]],
+            ["avc-1080", "aac"],
+        )
+
+    def test_analysis_format_uses_480p_equivalent_streams(self) -> None:
         formats = [
             self.format_info(
                 "portrait-852", "mp4", 852, "avc1.640033", "none", width=480
@@ -98,19 +121,19 @@ class WorkerValidationTests(unittest.TestCase):
         downloader = YoutubeDL({"quiet": True, "no_warnings": True})
         selected = downloader._select_formats(
             formats,
-            downloader.build_format_selector(BROWSER_COMPATIBLE_FORMAT),
+            downloader.build_format_selector(browser_compatible_format("analysis")),
         )
 
         self.assertEqual(len(selected), 1)
         self.assertEqual(
             [item["format_id"] for item in selected[0]["requested_formats"]],
-            ["portrait-1280", "aac"],
+            ["portrait-852", "aac"],
         )
 
     def test_browser_format_semantically_prefers_avc_and_aac(self) -> None:
         formats = [
-            self.format_info("avc-720", "mp4", 720, "avc1.640033", "none"),
-            self.format_info("av1-720", "mp4", 720, "av01.0.08M.08", "none"),
+            self.format_info("avc-480", "mp4", 480, "avc1.640033", "none"),
+            self.format_info("av1-480", "mp4", 480, "av01.0.08M.08", "none"),
             self.format_info("opus", "webm", None, "none", "opus"),
             self.format_info("mp4a-mp3", "m4a", None, "none", "mp4a.69"),
             self.format_info("aac", "m4a", None, "none", "mp4a.40.2"),
@@ -118,13 +141,13 @@ class WorkerValidationTests(unittest.TestCase):
         downloader = YoutubeDL({"quiet": True, "no_warnings": True})
         selected = downloader._select_formats(
             formats,
-            downloader.build_format_selector(BROWSER_COMPATIBLE_FORMAT),
+            downloader.build_format_selector(browser_compatible_format("analysis")),
         )
 
         self.assertEqual(len(selected), 1)
         self.assertEqual(
             [item["format_id"] for item in selected[0]["requested_formats"]],
-            ["avc-720", "aac"],
+            ["avc-480", "aac"],
         )
 
     def test_browser_format_has_no_av1_or_opus_fallback(self) -> None:
@@ -137,7 +160,9 @@ class WorkerValidationTests(unittest.TestCase):
         self.assertEqual(
             downloader._select_formats(
                 formats,
-                downloader.build_format_selector(BROWSER_COMPATIBLE_FORMAT),
+                downloader.build_format_selector(
+                    browser_compatible_format("analysis")
+                ),
             ),
             [],
         )
@@ -154,7 +179,7 @@ class WorkerValidationTests(unittest.TestCase):
         downloader = YoutubeDL({"quiet": True, "no_warnings": True})
         selected = downloader._select_formats(
             formats,
-            downloader.build_format_selector(BROWSER_COMPATIBLE_FORMAT),
+            downloader.build_format_selector(browser_compatible_format("analysis")),
         )
 
         self.assertEqual([item["format_id"] for item in selected], ["progressive-avc"])
@@ -307,6 +332,61 @@ class WorkerValidationTests(unittest.TestCase):
             self.assertEqual(caught.exception.code, "UNSUPPORTED_CONTAINER")
             run.assert_not_called()
 
+    def test_uploaded_source_requires_video_and_audio_tracks(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            source = Path(temporary) / "source-media"
+            source.write_bytes(b"uploaded-video")
+            probe_result = subprocess.CompletedProcess(
+                ["ffprobe"],
+                0,
+                stdout=json.dumps(
+                    {
+                        "format": {"duration": "12.5"},
+                        "streams": [{"codec_type": "video"}],
+                    }
+                ),
+                stderr="",
+            )
+            with patch("media_service.worker.subprocess.run", return_value=probe_result):
+                with self.assertRaises(WorkerFailure) as caught:
+                    probe_source_media(
+                        "ffprobe",
+                        source,
+                        max_duration=60,
+                        max_bytes=1024,
+                    )
+
+        self.assertEqual(caught.exception.code, "AUDIO_MISSING")
+
+    def test_uploaded_source_is_transcoded_to_the_shared_analysis_profile(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            source = Path(temporary) / "source-media"
+            artifact = Path(temporary) / "artifact.mp4"
+            source.write_bytes(b"uploaded-video")
+
+            def complete_transcode(command, **_kwargs):
+                artifact.write_bytes(b"analysis-video")
+                return subprocess.CompletedProcess(command, 0, stderr="")
+
+            with patch(
+                "media_service.worker.subprocess.run",
+                side_effect=complete_transcode,
+            ) as run:
+                transcode_analysis_video(
+                    "ffmpeg",
+                    source,
+                    artifact,
+                    duration=12.5,
+                )
+
+            command = run.call_args.args[0]
+            self.assertIn(
+                "scale=854:854:force_original_aspect_ratio=decrease:force_divisible_by=2",
+                command,
+            )
+            self.assertEqual(command[command.index("-c:v") + 1], "libx264")
+            self.assertEqual(command[command.index("-c:a") + 1], "aac")
+
     def test_missing_compatible_format_is_not_retryable(self) -> None:
         for resolving in (False, True):
             with self.subTest(resolving=resolving):
@@ -364,13 +444,27 @@ class WorkerValidationTests(unittest.TestCase):
                 self.assertEqual(caught.exception.code, expected_code)
 
     def test_accepts_video_at_the_limits(self) -> None:
-        title, duration = validate_video_info(
+        title, duration, description = validate_video_info(
             self.public_info(duration=3_600, title="sample", filesize=300),
             max_duration=3_600,
             max_bytes=300,
         )
         self.assertEqual(title, "sample")
         self.assertEqual(duration, 3_600)
+        self.assertIsNone(description)
+
+    def test_preview_and_analysis_use_distinct_runtime_size_limits(self) -> None:
+        validate_runtime_limits("preview", 3_600, 1024 * 1024 * 1024)
+        analysis_limit = 500 * 1024 * 1024
+        validate_runtime_limits("analysis", 3_600, analysis_limit, 900)
+
+        with self.assertRaises(WorkerFailure) as caught:
+            validate_runtime_limits("analysis", 3_600, analysis_limit + 1)
+        self.assertEqual(caught.exception.code, "INVALID_LIMIT")
+
+        with self.assertRaises(WorkerFailure) as caught:
+            validate_runtime_limits("analysis", 3_600, analysis_limit, 901)
+        self.assertEqual(caught.exception.code, "INVALID_LIMIT")
 
     def test_download_filename_removes_path_and_control_characters(self) -> None:
         filename = safe_download_filename(

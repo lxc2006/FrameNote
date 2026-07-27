@@ -11,8 +11,11 @@ from .security import is_valid_bvid
 JobStatus = Literal[
     "queued", "running", "succeeded", "failed", "cancelled", "expired"
 ]
-JobPhase = Literal["queued", "resolving", "downloading", "merging", "ready"]
+JobPhase = Literal[
+    "queued", "resolving", "downloading", "merging", "analyzing", "ready"
+]
 BilibiliDownloadVariant = Literal["preview", "analysis"]
+MediaSourceKind = Literal["upload", "bilibili", "url"]
 
 
 def utc_iso(timestamp: float) -> str:
@@ -28,6 +31,7 @@ class CreateJobRequest(BaseModel):
 
     bvid: str = Field(min_length=12, max_length=12)
     variant: BilibiliDownloadVariant = "preview"
+    directSummaryMaxSeconds: int = Field(default=0, ge=0, le=900)
 
     @field_validator("bvid")
     @classmethod
@@ -38,12 +42,17 @@ class CreateJobRequest(BaseModel):
 
 
 class SourceResponse(BaseModel):
-    bvid: str
+    kind: MediaSourceKind = "bilibili"
+    bvid: str | None = None
+    filename: str | None = None
+    sourceUrl: str | None = None
     title: str | None = None
     durationSeconds: float | None = None
+    description: str | None = None
 
 
 class ArtifactResponse(BaseModel):
+    playbackUrl: str
     downloadUrl: str
     filename: str
     mimeType: str
@@ -60,6 +69,40 @@ class ErrorResponse(BaseModel):
     retryable: bool
 
 
+class AnalysisFrameResponse(BaseModel):
+    url: str
+    timestampSeconds: float = Field(ge=0)
+    score: float
+    sizeBytes: int = Field(gt=0)
+
+
+class AnalysisAudioResponse(BaseModel):
+    url: str
+    mimeType: str
+    sizeBytes: int = Field(gt=0)
+
+
+class TranscriptCueResponse(BaseModel):
+    startSeconds: float = Field(ge=0)
+    endSeconds: float = Field(ge=0)
+    text: str
+
+
+class TranscriptResponse(BaseModel):
+    status: Literal["pending", "ready", "unavailable"]
+    text: str
+    cues: list[TranscriptCueResponse]
+    language: str | None = None
+    error: str | None = None
+
+
+class AnalysisResponse(BaseModel):
+    mode: Literal["direct", "keyframes"]
+    audio: AnalysisAudioResponse | None = None
+    frames: list[AnalysisFrameResponse] = Field(max_length=64)
+    transcript: TranscriptResponse
+
+
 class JobResponse(BaseModel):
     jobId: str
     status: JobStatus
@@ -67,6 +110,7 @@ class JobResponse(BaseModel):
     progress: float = Field(ge=0, le=1)
     source: SourceResponse
     artifact: ArtifactResponse | None = None
+    analysis: AnalysisResponse | None = None
     error: ErrorResponse | None = None
 
 

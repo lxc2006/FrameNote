@@ -26,6 +26,7 @@ const JOB_PHASES = new Set([
   "resolving",
   "downloading",
   "merging",
+  "analyzing",
   "ready",
 ]);
 const SUPPORTED_DOWNLOAD_VARIANTS = new Set<BilibiliDownloadVariant>([
@@ -84,10 +85,35 @@ export async function readCreateBilibiliJobRequest(
   ) {
     throw new BilibiliInputError("variant 只支持 preview 或 analysis。");
   }
+  const directSummaryMaxSecondsValue = (
+    value as Record<string, unknown>
+  ).directSummaryMaxSeconds;
+  const directSummaryMaxSeconds =
+    directSummaryMaxSecondsValue === undefined
+      ? 0
+      : directSummaryMaxSecondsValue;
+  if (
+    typeof directSummaryMaxSeconds !== "number" ||
+    !Number.isInteger(directSummaryMaxSeconds) ||
+    directSummaryMaxSeconds < 0 ||
+    directSummaryMaxSeconds > 900
+  ) {
+    throw new BilibiliInputError(
+      "directSummaryMaxSeconds 必须是 0 到 900 之间的整数。",
+    );
+  }
+  if (variant === "preview" && directSummaryMaxSeconds !== 0) {
+    throw new BilibiliInputError(
+      "preview 任务不能设置直接总结时长。",
+    );
+  }
 
   return {
     bvid: `BV${bvid.trim().slice(2)}`,
     variant: variant as CreateBilibiliJobRequest["variant"],
+    ...(directSummaryMaxSeconds > 0
+      ? { directSummaryMaxSeconds }
+      : {}),
   };
 }
 
@@ -101,6 +127,7 @@ export function validateBilibiliJobId(value: string) {
 export async function requestBilibiliService(
   path: string,
   init: RequestInit,
+  timeoutOverrideMs?: number,
 ): Promise<Response> {
   const config = getBilibiliServiceConfig();
   if (!config.baseURL) {
@@ -113,14 +140,18 @@ export async function requestBilibiliService(
   headers.set("accept", "application/json");
   if (config.token) headers.set("authorization", `Bearer ${config.token}`);
 
-  const timeoutSignal = AbortSignal.timeout(config.timeoutMs);
+  const timeoutSignal = AbortSignal.timeout(timeoutOverrideMs ?? config.timeoutMs);
   const signals = init.signal ? [init.signal, timeoutSignal] : [timeoutSignal];
+  const requestInit = {
+    ...init,
+    headers,
+    signal: signals.length === 1 ? signals[0] : AbortSignal.any(signals),
+    ...(init.body instanceof ReadableStream ? { duplex: "half" as const } : {}),
+  };
 
   try {
     return await fetch(`${config.baseURL}${path}`, {
-      ...init,
-      headers,
-      signal: signals.length === 1 ? signals[0] : AbortSignal.any(signals),
+      ...requestInit,
     });
   } catch (error) {
     if (init.signal?.aborted) throw error;
@@ -133,6 +164,34 @@ export async function requestBilibiliService(
       "无法连接 B站媒体服务，请确认 Python 服务已经启动。",
     );
   }
+}
+
+export async function proxyMediaJson(response: Response) {
+  const raw = await response.text();
+  let body: unknown = null;
+  try {
+    body = raw ? JSON.parse(raw) : null;
+  } catch {
+    body = null;
+  }
+  if (!response.ok) {
+    const upstream = parseUpstreamError(body);
+    return bilibiliErrorResponse(
+      normalizeUpstreamStatus(response.status),
+      upstream.code,
+      upstream.message,
+      upstream.retryable,
+    );
+  }
+  if (!isMediaJobSnapshot(body)) {
+    return bilibiliErrorResponse(
+      502,
+      "INVALID_MEDIA_RESPONSE",
+      "媒体服务返回了无效任务状态。",
+      true,
+    );
+  }
+  return noStoreJson(body, { status: response.status });
 }
 
 export async function proxyBilibiliJson(response: Response) {
@@ -250,6 +309,10 @@ function isJobSnapshot(value: unknown): value is BilibiliJobSnapshot {
   if (typeof source.bvid !== "string" || !BVID_PATTERN.test(source.bvid)) return false;
   if (source.title !== undefined && typeof source.title !== "string") return false;
   if (
+    source.description !== undefined &&
+    (typeof source.description !== "string" || source.description.length > 20_000)
+  ) return false;
+  if (
     source.durationSeconds !== undefined &&
     (typeof source.durationSeconds !== "number" ||
       !Number.isFinite(source.durationSeconds) ||
@@ -260,8 +323,95 @@ function isJobSnapshot(value: unknown): value is BilibiliJobSnapshot {
 
   if (record.artifact !== undefined && !isArtifact(record.artifact)) return false;
   if (record.status === "succeeded" && !isArtifact(record.artifact)) return false;
+  if (record.analysis !== undefined && !isAnalysis(record.analysis)) return false;
   if (record.error !== undefined && !isJobError(record.error)) return false;
   return true;
+}
+
+function isMediaJobSnapshot(value: unknown) {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return false;
+  const record = value as Record<string, unknown>;
+  const source = record.source;
+  return (
+    typeof record.jobId === "string" &&
+    JOB_ID_PATTERN.test(record.jobId) &&
+    typeof record.status === "string" &&
+    JOB_STATUSES.has(record.status) &&
+    typeof record.phase === "string" &&
+    JOB_PHASES.has(record.phase) &&
+    typeof record.progress === "number" &&
+    Number.isFinite(record.progress) &&
+    record.progress >= 0 &&
+    record.progress <= 1 &&
+    Boolean(source) &&
+    typeof source === "object" &&
+    !Array.isArray(source) &&
+    ["upload", "url"].includes(
+      String((source as Record<string, unknown>).kind),
+    ) &&
+    (record.artifact === undefined || isArtifact(record.artifact)) &&
+    (record.analysis === undefined || isAnalysis(record.analysis)) &&
+    (record.error === undefined || isJobError(record.error))
+  );
+}
+
+function isAnalysis(value: unknown) {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return false;
+  const analysis = value as Record<string, unknown>;
+  if (analysis.mode !== "direct" && analysis.mode !== "keyframes") return false;
+  if (analysis.audio !== undefined) {
+    if (!analysis.audio || typeof analysis.audio !== "object") return false;
+    const audio = analysis.audio as Record<string, unknown>;
+    if (
+      typeof audio.url !== "string" ||
+      !/^https?:\/\//i.test(audio.url) ||
+      typeof audio.mimeType !== "string" ||
+      !audio.mimeType.startsWith("audio/") ||
+      typeof audio.sizeBytes !== "number" ||
+      !Number.isSafeInteger(audio.sizeBytes) ||
+      audio.sizeBytes <= 0
+    ) {
+      return false;
+    }
+  }
+  if (!Array.isArray(analysis.frames) || analysis.frames.length > 64) return false;
+  if (analysis.mode === "direct" && analysis.frames.length !== 0) return false;
+  if (
+    analysis.mode === "keyframes" &&
+    (analysis.frames.length < 3 || analysis.audio === undefined)
+  ) return false;
+  for (const frameValue of analysis.frames) {
+    if (!frameValue || typeof frameValue !== "object" || Array.isArray(frameValue)) {
+      return false;
+    }
+    const frame = frameValue as Record<string, unknown>;
+    if (
+      typeof frame.url !== "string" ||
+      !/^https?:\/\//i.test(frame.url) ||
+      typeof frame.timestampSeconds !== "number" ||
+      !Number.isFinite(frame.timestampSeconds) ||
+      frame.timestampSeconds < 0 ||
+      typeof frame.score !== "number" ||
+      !Number.isFinite(frame.score) ||
+      typeof frame.sizeBytes !== "number" ||
+      !Number.isSafeInteger(frame.sizeBytes) ||
+      frame.sizeBytes <= 0
+    ) {
+      return false;
+    }
+  }
+  const transcript = analysis.transcript;
+  if (!transcript || typeof transcript !== "object" || Array.isArray(transcript)) {
+    return false;
+  }
+  const transcriptRecord = transcript as Record<string, unknown>;
+  return (
+    (transcriptRecord.status === "ready" ||
+      transcriptRecord.status === "pending" ||
+      transcriptRecord.status === "unavailable") &&
+    typeof transcriptRecord.text === "string" &&
+    Array.isArray(transcriptRecord.cues)
+  );
 }
 
 function isArtifact(value: unknown) {
@@ -286,6 +436,8 @@ function isArtifact(value: unknown) {
     return false;
   }
   return (
+    typeof artifact.playbackUrl === "string" &&
+    /^https?:\/\//i.test(artifact.playbackUrl) &&
     typeof artifact.downloadUrl === "string" &&
     /^https?:\/\//i.test(artifact.downloadUrl) &&
     typeof artifact.filename === "string" &&

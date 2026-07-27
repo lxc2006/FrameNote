@@ -1,99 +1,154 @@
 # 帧记 FrameNote
 
-一个面向长视频的 AI 总结与持续问答工作台。当前版本优先验证完整产品体验，同时把视频处理、B站素材获取和 AI 模型隔离为可替换的适配器。
+帧记把本地视频、B 站公开视频或 HTTPS 视频直链整理成带时间点的 AI 总结，并允许围绕总结、视频信息和字幕继续对话。
 
-## 当前可用
+## 现在可以做什么
 
-- 导入 MP4、MOV、WebM、MKV、M4V 视频，读取文件名、大小和时长并本地预览。
-- 在浏览器内使用 FFmpeg 提取压缩 MP3 音轨和带原视频时间索引的代表性关键帧，原视频不经过应用服务器；B站来源若未得到有效音轨会明确失败，不会静默退化为纯画面总结。
-- 粘贴含 BV 号的 B站视频链接或直接输入 BV 号，下载无需登录即可访问的公开 UGC。
-- B站下载采用异步任务与短期签名地址；媒体服务只交付 MP4/H.264/AAC 成品，浏览器直取后再抽取证据，不让大视频穿过 Sites Worker。
-- B站成品传入浏览器后会立即显示带控制条的预览，并提供手动下载按钮；即使总结仍在处理，也可以先播放或保存当前成品。
-- HTTPS 视频直链可直接预览并提供打开/下载入口；跨域直链是否强制保存仍由源站的响应头与浏览器策略决定。
-- 展示素材校验、媒体读取、音轨与画面理解、总结生成等处理阶段。
-- 生成结构化 AI 总结：概览、独立“声音与音乐”分析、关键观点、章节时间线和一句话结论。
-- 在独立会话区围绕视频继续追问；每个视频对应一条 D1 对话，可在左栏新建、切换、重命名和删除。
-- 支持浅色/黑灰暗色界面；UI 与总结/对话文本可分别选择中英文字体及 12–28px 精确字号，显示偏好保存在当前浏览器。
-- 响应式桌面与移动端布局，并支持键盘操作和减少动画偏好。
+- 导入 MP4、MOV、WebM、MKV、M4V 本地视频，或输入 BV 号、B 站链接、HTTPS 视频直链。
+- 使用网页内置播放器预览视频；B 站预览默认准备最高兼容画质。
+- 所有来源使用同一套分析流程：
+  1. 准备一份最长边不超过 854px 的 H.264/AAC 分析视频，横屏通常约为 854x480，竖屏通常约为 480x854。
+  2. 根据“Qwen 直接总结时长”设置判断分析方式。阈值内以 1 FPS 提交整段视频；超过阈值则提取音轨，并使用 AdaptiveDetector、定时锚点、画质评分和 pHash 去重生成最多 64 张关键帧。
+  3. Qwen 生成带真实视频时间点的结构化总结。
+  4. 如果开启“字幕提取”，再运行 FunASR Nano 和 CT-Punc，生成按完整句子合并的字幕。
+- DeepSeek 对话始终以视频信息、总结和字幕为基础上下文。
+- 对话和总结会保存；原始本地视频不会保存。重新进入本地视频对话后，可重新选择任意本地文件进行预览和时间点跳转。
+- 支持浅色和暗色主题，以及总结/对话字体与字号设置。
 
-> 当前使用 **Qwen + DeepSeek 双模型适配器**：Qwen 负责视频理解和结构化总结，DeepSeek V4 Pro 负责基于总结、证据与历史消息继续对话。本地与 B站视频会先在浏览器中压缩为音轨与关键帧证据；本地文件上限为 300 MB，B站浏览器下载上限为 150 MB，时长均不超过 60 分钟。带正确媒体响应头的 HTTPS 视频直链仍可由 Qwen 直接读取。
+## 分析设置
 
-> B站输入目前只支持直接 BV 号，或正文中明确包含 BV 号的链接；不解析不含 BV 号的 `b23.tv` 短链。本机需同时启动 Python 媒体服务。公开站点还需单独部署 HTTPS 媒体容器并配置运行时变量；媒体服务的真实 H.264/AAC 下载、合并与校验已通过，完整浏览器总结链路仍需使用你有权处理的公开视频复测。
+“生成 AI 总结”按钮旁边的齿轮用于设置本次及后续分析：
 
-## 模型接口
-
-服务端已经接入阿里云百炼的 OpenAI 兼容接口，默认使用 `qwen3.5-omni-plus` 同时理解视频画面、语音和音效。模型层提供：
-
-- `GET /api/model/status`：检查服务端是否已经配置模型。
-- `POST /api/model/analyze`：接收视频公网 URL、音频、关键帧列表或转写文本，返回包含讲话、音乐、环境声及声音变化的结构化总结。
-- `POST /api/model/ask`：使用 `deepseek-v4-pro`，基于结构化总结、事实索引和历史消息继续问答。
-
-复制 `.env.example` 为 `.env.local`，填写 `DASHSCOPE_API_KEY` 和 `DEEPSEEK_API_KEY`。如果百炼控制台提供了带 Workspace ID 的专属兼容地址，同时修改 `DASHSCOPE_BASE_URL`。两种 API Key 都只在服务端读取，不会打包到浏览器。
-
-模型调用层与媒体获取层保持分离。B站页面解析、DASH 音视频下载与 FFmpeg 合并由 `media_service/app.py` 独立完成；网站只创建/查询/取消任务，媒体文件通过短期签名 URL 由浏览器直接读取。浏览器预处理适合个人使用和中等体积视频；超出本地限制、需要页面恢复或多人并发时，仍应把原视频写入对象存储，再由后台处理器生成音轨和关键帧。
+- **字幕提取**：默认开启。开启后，所有视频来源都会在 Qwen 总结完成后运行 FunASR Nano＋CT-Punc；关闭后跳过字幕步骤。
+- **Qwen 直接总结时长**：在页面右上角设置中调整，默认 360 秒，范围为 0～900 秒。设置为 0 表示始终使用关键帧＋音轨。
 
 ## 本地运行
 
-网站要求 Node.js `>=22.13.0` 与 pnpm。
+### 1. 准备环境
 
-```bash
-pnpm install
-pnpm dev
-```
+需要：
 
-首次处理本地视频时，浏览器会从固定版本的 jsDelivr 地址加载 FFmpeg WebAssembly 核心；随后由浏览器缓存。处理期间需要保持页面打开。
+- Node.js 22.13 或更高版本
+- pnpm
+- Python 3.11 或更高版本
+- 可从命令行找到的原生 `ffmpeg` 和 `ffprobe`
 
-默认预览地址为 `http://localhost:3000`。
-
-使用 B站下载功能时，还需 Python 3.11+、原生 FFmpeg/ffprobe，并在另一个终端启动媒体服务：
+先确认：
 
 ```powershell
-python -m venv .venv
-.\.venv\Scripts\python.exe -m pip install -r media_service\requirements.txt
-.\.venv\Scripts\python.exe media_service\app.py
+node --version
+pnpm --version
+python --version
+ffmpeg -version
+ffprobe -version
 ```
 
-媒体服务默认监听 `http://127.0.0.1:8788`。在网站的 `.env.local` 增加：
+### 2. 安装依赖
+
+```powershell
+pnpm install
+python -m venv .venv
+.\.venv\Scripts\python.exe -m pip install -r media_service\requirements.txt
+```
+
+FunASR、PyTorch、PySceneDetect、OpenCV 和 ImageHash 都由 Python requirements 安装。第一次提取字幕时，FunASR 还会从 ModelScope 下载模型；之后复用本机缓存。
+
+### 3. 配置密钥
+
+复制 `.env.example` 为 `.env.local`，至少填写：
 
 ```dotenv
+DASHSCOPE_API_KEY=
+DEEPSEEK_API_KEY=
 BILIBILI_MEDIA_SERVICE_URL=http://127.0.0.1:8788
 BILIBILI_MEDIA_SERVICE_TOKEN=
 ```
 
-本机回环调用可以暂时不设令牌；部署到网络后，网站与媒体服务必须配置同一个高强度令牌，并为媒体服务启用 HTTPS。媒体服务的全部限制与容器运行方式见 [`media_service/README.md`](media_service/README.md)。
+本机回环开发可以暂时不设置媒体服务 Token。公开部署时，网站和媒体服务必须配置相同的高强度 Token，并让媒体服务使用 HTTPS。
 
-```bash
+### 4. 启动两个服务
+
+终端一：
+
+```powershell
+.\.venv\Scripts\python.exe media_service\app.py
+```
+
+终端二：
+
+```powershell
+pnpm dev
+```
+
+打开 `http://localhost:3000`。网站和 Python 媒体服务必须同时运行；本地上传、HTTPS 直链、B 站下载、视频压缩、关键帧和字幕都依赖媒体服务。
+
+## 使用说明
+
+### 本地视频
+
+选择文件后即可本地预览，左侧会显示文件大小、时长和原视频分辨率。生成总结时，浏览器把原文件传给本机媒体服务；媒体服务只保留任务期间所需的临时文件，并先转码为低分辨率分析素材。
+
+重新进入已保存的本地视频对话时，原视频不会自动恢复。点击“选择视频文件”恢复预览；预览卡片中的“更改”可重新选择。系统不会强制校验新文件是否与原总结一致；如果总结时间点超出当前视频时长，点击后不会跳转。
+
+### HTTPS 视频直链
+
+点击“获取视频”可直接用浏览器播放器预览。生成总结时，浏览器需要能跨域读取该地址并下载视频；源站如果没有正确的 CORS 响应头，页面会提示无法读取。原视频上限为 500 MB。
+
+### B 站视频
+
+“获取视频”与“生成 AI 总结”是两个独立任务：
+
+- 获取视频：准备最高兼容画质的浏览器预览，不先把整段视频读入网页内存。
+- 生成总结：另行下载最长边不超过 854px、最大 500 MB 的分析素材。
+
+只支持无需登录即可访问、且你有权下载或分析的公开 UGC。当前不使用账号 Cookie，也不处理会员、私有、付费或地区受限内容。
+
+## 数据与限制
+
+- 单个分析源文件最大 500 MB。
+- 视频最长 60 分钟。
+- 直接视频提交与关键帧路径都使用压缩后的分析视频。
+- 本地视频字节不会保存到对话数据库。
+- 媒体任务和分析文件默认按 TTL 自动清理；具体限制见 [媒体服务说明](media_service/README.md)。
+- 字幕不参与同一次 Qwen 总结，但会保存到对话，并作为后续 DeepSeek 问答的基础上下文。
+
+## 常见问题
+
+### `Unable to fetch the Request.cf object`
+
+这是 Miniflare 本地环境尝试获取 Cloudflare 请求信息失败后的回退提示。只要随后出现 `Local: http://localhost:3000/`，通常不影响本地使用。
+
+### `fetch failed` 或 `ECONNRESET`
+
+先确认 Python 服务仍在 `127.0.0.1:8788` 运行，再检查 `.env.local`、系统代理、防火墙和目标视频站点的连接。HTTPS 直链还必须允许浏览器跨域读取。
+
+### 字幕第一次很慢
+
+第一次运行需要下载并加载 FunASR Nano、VAD 和 CT-Punc 模型。CPU 推理速度也会随视频长度和硬件差异明显变化。
+
+### `Ignored build scripts`
+
+项目通过 `pnpm-workspace.yaml` 只允许 `esbuild`、`sharp`、`unrs-resolver` 和 `workerd` 的安装脚本。重新执行 `pnpm install` 即可按当前策略安装。
+
+## 开发与验证
+
+```powershell
 pnpm build
 pnpm test
 pnpm lint
+.\.venv\Scripts\python.exe -m unittest discover -s media_service\tests -v
+.\.venv\Scripts\python.exe -m compileall -q media_service
 ```
 
-## 代码结构
+主要模块：
 
-- `app/VideoWorkbench.tsx`：上传、B站输入、处理进度、总结与追问的完整交互。
-- `app/api/conversations`、`lib/server/conversation-store.ts`：按登录用户隔离的 D1 对话、总结与消息持久化。
-- `lib/client/video-preprocessor.ts`：浏览器端 FFmpeg 加载、音轨压缩、关键帧抽取和输入体积控制。
-- `lib/client/bilibili-client.ts`：创建/轮询下载任务、直取媒体和下载进度。
-- `lib/bilibili-api.ts`：网站与媒体任务共用的状态和产物类型。
-- `app/api/bilibili/jobs`：B站任务控制面，不代理媒体字节。
-- `lib/server/bilibili-route.ts`：B站控制面输入校验、鉴权代理和上游响应校验。
-- `media_service/app.py`：FastAPI 媒体服务入口；通过受控 yt-dlp 子进程与原生 FFmpeg 下载、合并和校验媒体。
-- `media_service/service/job_manager.py`：任务状态机、队列、超时、取消与临时文件清理。
-- `lib/video-engine.ts`：共享视频来源、总结类型及未被当前 UI 使用的 Demo 引擎。
-- `lib/server/qwen-video-engine.ts`、`lib/server/deepseek-conversation-engine.ts`：真实总结与追问模型入口。
-- `worker/index.ts`：Cloudflare Worker 入口。
-- `.openai/hosting.json`：已绑定 Sites 项目和逻辑 D1 绑定 `DB`；R2 当前未启用。
-- `docs/architecture.md`：生产化架构、API 契约、模型与部署选择建议。
+- `app/VideoWorkbench.tsx`：视频来源、预览、进度、总结、字幕与对话界面。
+- `lib/client/media-analysis-client.ts`：本地文件和 HTTPS 视频的分析任务客户端。
+- `lib/client/bilibili-client.ts`：B 站预览、分析和字幕任务客户端。
+- `media_service/main.py`：媒体任务 API。
+- `media_service/worker.py`：B 站下载、通用视频探测与低分辨率转码。
+- `media_service/analysis_pipeline.py`：场景检测、关键帧评分去重、音轨和 FunASR 字幕。
+- `lib/server/qwen-video-engine.ts`：Qwen 视频总结。
+- `lib/server/deepseek-conversation-engine.ts`：带固定视频上下文的后续对话。
 
-## 下一阶段
-
-1. 实现浏览器直传 R2 multipart，避免大视频穿过普通 Worker 请求体。
-2. 将本机媒体服务部署为 HTTPS 容器，并把临时产物迁移到 R2/S3。
-3. 将单实例本地任务状态迁移到 D1/Redis，并把轮询升级为 SSE。
-4. 给总结与回答增加更细粒度的时间戳引用和证据检索。
-
-## B站能力边界
-
-公开部署前，不应默认开放“下载任意 B站视频”。当前适配器只接受 BV 号并拼接标准 B站地址，不接受任意 URL、账号 Cookie 或用户自定义 yt-dlp 参数；只处理用户有权分析且无需登录即可访问的公开 UGC。固定上限为 720p、150 MB、60 分钟，并从源头只选择 H.264 视频与 AAC 音频；最终 MP4 会由 ffprobe 再做编码白名单校验。服务执行超时 20 分钟、网页总等待 22 分钟。不支持会员、付费、番剧、私密、直播或受地区限制的内容，也不绕过验证码和风控。
-
-详细约束与生产化拓扑见 [docs/architecture.md](docs/architecture.md)。
+更完整的接口与部署约束见 [架构文档](docs/architecture.md)。

@@ -20,7 +20,14 @@ from .security import is_valid_bvid, is_valid_job_id, safe_artifact_path, safe_j
 
 
 LOGGER = logging.getLogger("media_service.jobs")
-PHASE_SEQUENCE = ("queued", "resolving", "downloading", "merging", "ready")
+PHASE_SEQUENCE = (
+    "queued",
+    "resolving",
+    "downloading",
+    "merging",
+    "analyzing",
+    "ready",
+)
 VALID_PHASES = set(PHASE_SEQUENCE)
 PHASE_ORDER = {name: index for index, name in enumerate(PHASE_SEQUENCE)}
 TERMINAL_STATUSES = {"succeeded", "failed", "cancelled", "expired"}
@@ -41,14 +48,19 @@ class JobError:
 @dataclass(slots=True)
 class JobRecord:
     job_id: str
-    bvid: str
+    bvid: str = ""
+    source_kind: str = "bilibili"
+    source_name: str | None = None
+    source_url: str | None = None
     variant: str = "preview"
+    direct_summary_max_seconds: int = 0
     status: str = "queued"
     phase: str = "queued"
     progress: float = 0.0
     created_at: float = field(default_factory=time.time)
     updated_at: float = field(default_factory=time.time)
     title: str | None = None
+    description: str | None = None
     duration_seconds: float | None = None
     artifact_file: str | None = None
     artifact_filename: str | None = None
@@ -58,6 +70,7 @@ class JobRecord:
     artifact_width: int | None = None
     artifact_height: int | None = None
     artifact_expires_at: float | None = None
+    analysis_manifest_file: str | None = None
     error: JobError | None = None
     queue_slot_held: bool = True
     process: asyncio.subprocess.Process | None = field(default=None, repr=False)
@@ -158,16 +171,66 @@ class JobManager:
         for job_id in purge_ids:
             self._purge_work_files(job_id)
 
-    async def create(self, bvid: str, variant: str = "preview") -> JobRecord:
+    async def create(
+        self,
+        bvid: str,
+        variant: str = "preview",
+        direct_summary_max_seconds: int = 0,
+    ) -> JobRecord:
         async with self._lock:
             if self._stopping:
                 raise RuntimeError("service is stopping")
             if self._queued_slots >= self.settings.max_queued:
                 raise QueueCapacityError("job queue is full")
             job_id = str(uuid.uuid4())
-            job = JobRecord(job_id=job_id, bvid=bvid, variant=variant)
+            job = JobRecord(
+                job_id=job_id,
+                bvid=bvid,
+                source_kind="bilibili",
+                variant=variant,
+                direct_summary_max_seconds=direct_summary_max_seconds,
+            )
             job_dir = safe_job_dir(self.settings.state_root, job_id)
             job_dir.mkdir(parents=False, exist_ok=False)
+            self._jobs[job_id] = job
+            self._queued_slots += 1
+            self._persist(job)
+            self._queue.put_nowait(job_id)
+            return self._copy(job)
+
+    async def create_media_file(
+        self,
+        source_file: Path,
+        filename: str,
+        source_kind: str,
+        direct_summary_max_seconds: int,
+        source_url: str | None = None,
+    ) -> JobRecord:
+        if source_kind not in {"upload", "url"}:
+            raise ValueError("unsupported media source kind")
+        if not source_file.is_file() or source_file.is_symlink():
+            raise ValueError("uploaded media file is unavailable")
+        async with self._lock:
+            if self._stopping:
+                raise RuntimeError("service is stopping")
+            if self._queued_slots >= self.settings.max_queued:
+                raise QueueCapacityError("job queue is full")
+            job_id = str(uuid.uuid4())
+            job_dir = safe_job_dir(self.settings.state_root, job_id)
+            job_dir.mkdir(parents=False, exist_ok=False)
+            try:
+                shutil.move(str(source_file), str(job_dir / "source-media"))
+            except Exception:
+                shutil.rmtree(job_dir, ignore_errors=True)
+                raise
+            job = JobRecord(
+                job_id=job_id,
+                source_kind=source_kind,
+                source_name=filename,
+                source_url=source_url,
+                variant="analysis",
+                direct_summary_max_seconds=direct_summary_max_seconds,
+            )
             self._jobs[job_id] = job
             self._queued_slots += 1
             self._persist(job)
@@ -257,35 +320,53 @@ class JobManager:
                 self._queue.task_done()
 
     def _worker_command(
-        self, job_id: str, bvid: str, variant: str = "preview"
+        self,
+        job: JobRecord,
     ) -> list[str]:
-        return [
+        command = [
             sys.executable,
             *WORKER_PYTHON_OPTIONS,
             str(self._worker_script),
             "--state-root",
             str(self.settings.state_root),
             "--job-id",
-            job_id,
-            "--bvid",
-            bvid,
+            job.job_id,
+            "--source-kind",
+            job.source_kind,
+            "--source-name",
+            job.source_name or job.bvid or "video",
             "--variant",
-            variant,
+            job.variant,
             "--max-duration",
             str(self.settings.max_duration_seconds),
             "--max-bytes",
-            str(self.settings.max_bytes),
+            str(self._max_bytes_for_variant(job.variant)),
+            "--direct-summary-max-seconds",
+            str(job.direct_summary_max_seconds),
         ]
+        if job.source_kind == "bilibili":
+            command.extend(("--bvid", job.bvid))
+        else:
+            command.extend(("--input-file", "source-media"))
+            if job.source_url:
+                command.extend(("--source-url", job.source_url))
+        return command
+
+    def _max_bytes_for_variant(self, variant: str) -> int:
+        return (
+            self.settings.max_bytes
+            if variant == "analysis"
+            else self.settings.download_max_bytes
+        )
 
     async def _run_worker(self, job_id: str) -> None:
         async with self._lock:
             job = self._jobs.get(job_id)
             if not job or job.status != "running":
                 return
-            bvid = job.bvid
-            variant = job.variant
+            worker_job = self._copy(job)
 
-        command = self._worker_command(job_id, bvid, variant)
+        command = self._worker_command(worker_job)
         environment = self._worker_environment()
         process_options: dict[str, Any] = {}
         if os.name == "nt":
@@ -436,8 +517,11 @@ class JobManager:
             if event == "source":
                 title = payload.get("title")
                 duration = payload.get("durationSeconds")
+                description = payload.get("description")
                 if isinstance(title, str):
                     job.title = title.strip()[:300] or None
+                if isinstance(description, str):
+                    job.description = description.strip()[:20_000] or None
                 if isinstance(duration, (int, float)) and math.isfinite(duration):
                     job.duration_seconds = round(float(duration), 3)
             elif event == "progress":
@@ -447,6 +531,23 @@ class JobManager:
                     job.phase = phase
                 if isinstance(progress, (int, float)) and math.isfinite(progress):
                     job.progress = max(job.progress, min(0.99, max(0.0, float(progress))))
+            elif event == "analysis":
+                manifest_file = payload.get("manifestFile")
+                if (
+                    job.variant == "analysis"
+                    and isinstance(manifest_file, str)
+                    and manifest_file == "analysis-manifest.json"
+                ):
+                    try:
+                        job_dir = safe_job_dir(self.settings.state_root, job.job_id)
+                        manifest_path = safe_artifact_path(job_dir, manifest_file)
+                        if (
+                            manifest_path.is_file()
+                            and 0 < manifest_path.stat().st_size <= 2 * 1024 * 1024
+                        ):
+                            job.analysis_manifest_file = manifest_file
+                    except (OSError, ValueError):
+                        job.analysis_manifest_file = None
             elif event == "artifact":
                 artifact_file = payload.get("artifactFile")
                 filename = payload.get("filename")
@@ -463,7 +564,7 @@ class JobManager:
                     and isinstance(mime_type, str)
                     and mime_type.startswith("video/")
                     and isinstance(size, int)
-                    and 0 < size <= self.settings.max_bytes
+                    and 0 < size <= self._max_bytes_for_variant(job.variant)
                     and isinstance(sha256, str)
                     and len(sha256) == 64
                     and all(char in "0123456789abcdef" for char in sha256)
@@ -537,12 +638,25 @@ class JobManager:
             stat = artifact.stat()
         except (OSError, ValueError):
             return False
-        return (
+        artifact_valid = (
             artifact.is_file()
             and not artifact.is_symlink()
             and stat.st_size == job.artifact_size_bytes
-            and stat.st_size <= self.settings.max_bytes
+            and stat.st_size <= self._max_bytes_for_variant(job.variant)
         )
+        if not artifact_valid or job.variant != "analysis":
+            return artifact_valid
+        if job.analysis_manifest_file != "analysis-manifest.json":
+            return False
+        try:
+            manifest = safe_artifact_path(job_dir, job.analysis_manifest_file)
+            return (
+                manifest.is_file()
+                and not manifest.is_symlink()
+                and 0 < manifest.stat().st_size <= 2 * 1024 * 1024
+            )
+        except (OSError, ValueError):
+            return False
 
     async def _load_records(self) -> None:
         now = time.time()
@@ -556,7 +670,12 @@ class JobManager:
                     raise ValueError("metadata too large")
                 raw = json.loads(metadata.read_text(encoding="utf-8"))
                 job = JobRecord.from_disk(raw)
-                if job.job_id != entry.name or not is_valid_bvid(job.bvid):
+                valid_source = (
+                    job.source_kind == "bilibili" and is_valid_bvid(job.bvid)
+                ) or (
+                    job.source_kind in {"upload", "url"} and not job.bvid
+                )
+                if job.job_id != entry.name or not valid_source:
                     raise ValueError("invalid persisted job")
                 if job.status not in {
                     "queued", "running", "succeeded", "failed", "cancelled", "expired"
@@ -786,6 +905,18 @@ class JobManager:
             "LANG",
             "LC_ALL",
             "TZ",
+            "USERPROFILE",
+            "HOMEDRIVE",
+            "HOMEPATH",
+            "LOCALAPPDATA",
+            "APPDATA",
+            "MODELSCOPE_CACHE",
+            "HF_HOME",
+            "TORCH_HOME",
+            "FRAMENOTE_FUNASR_MODEL",
+            "FRAMENOTE_FUNASR_VAD_MODEL",
+            "FRAMENOTE_FUNASR_PUNC_MODEL",
+            "FRAMENOTE_FUNASR_DEVICE",
         }
         environment = {
             key: value for key, value in os.environ.items() if key.upper() in allowed
@@ -810,3 +941,4 @@ class JobManager:
         job.artifact_width = None
         job.artifact_height = None
         job.artifact_expires_at = None
+        job.analysis_manifest_file = None

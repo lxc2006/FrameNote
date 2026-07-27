@@ -1,16 +1,5 @@
 export type SourceKind = "upload" | "bilibili" | "url";
 
-export interface PersistedVideoDescriptor {
-  filename: string;
-  mimeType: string;
-  sizeBytes: number;
-  title?: string;
-  description: string;
-  durationLabel?: string;
-  qualityLabel?: string;
-  sourceLabel?: string;
-}
-
 export interface VideoSourceDescriptor {
   kind: SourceKind;
   title: string;
@@ -18,8 +7,22 @@ export interface VideoSourceDescriptor {
   durationLabel?: string;
   bvid?: string;
   sourceUrl?: string;
-  downloadFirst: boolean;
-  persistedVideo?: PersistedVideoDescriptor;
+  /** B站视频页公开简介。 */
+  description?: string;
+}
+
+export interface VideoTranscriptCue {
+  startSeconds: number;
+  endSeconds: number;
+  text: string;
+}
+
+export interface VideoTranscript {
+  status: "ready" | "unavailable";
+  text: string;
+  cues: VideoTranscriptCue[];
+  language?: string;
+  error?: string;
 }
 
 export interface SummaryPoint {
@@ -50,7 +53,6 @@ export interface SummaryAudioAnalysis {
   /** analyzed=已听取并分析；silent=已检查但没有可辨声音；unavailable=没有可靠音频证据。 */
   status: SummaryAudioStatus;
   summary: string;
-  speech: string | null;
   music: string | null;
   soundscape: string | null;
   temporalChanges: SummaryAudioChange[];
@@ -78,6 +80,11 @@ export interface VideoSummary {
 export interface VideoModelContext {
   /** Qwen 可读取的公网 HTTPS 视频地址或受支持的 data URL。 */
   videoUrl?: string;
+  /**
+   * 本地媒体分析任务。模型路由会从受信任的媒体服务读取低清成品并上传到
+   * DashScope 临时存储；浏览器不会接触 API Key，也不用转发大文件。
+   */
+  mediaJobId?: string;
   /** 已按时间顺序抽取的关键帧 URL；适用于已有媒体处理流水线的场景。 */
   frameUrls?: string[];
   /** 与 frameUrls 一一对应的原视频时间（秒）。 */
@@ -90,6 +97,8 @@ export interface VideoModelContext {
   transcript?: string;
   /** 视频抽帧频率。长视频建议使用较低值。 */
   fps?: number;
+  /** 原视频实际时长，用于约束并校正模型返回的时间点。 */
+  durationSeconds?: number;
 }
 
 export interface VideoConversationMessage {
@@ -98,88 +107,11 @@ export interface VideoConversationMessage {
 }
 
 export interface VideoEngine {
-  readonly mode: "demo" | "remote";
   analyze(
     source: VideoSourceDescriptor,
     context?: VideoModelContext,
   ): Promise<VideoSummary>;
 }
-
-const wait = (milliseconds: number) =>
-  new Promise<void>((resolve) => globalThis.setTimeout(resolve, milliseconds));
-
-function createDemoSummary(source: VideoSourceDescriptor): VideoSummary {
-  const origin =
-    source.kind === "bilibili"
-      ? `${source.bvid ?? "该 BV 号"} 对应的 B 站视频`
-      : source.kind === "url"
-        ? `视频直链《${source.title}》`
-      : `本地视频《${source.title}》`;
-
-  return {
-    title: source.title,
-    overview: `这是一份用于验证产品流程的演示总结。当前尚未连接真实的转写与多模态模型，因此系统没有读取 ${origin} 的实际语义；接入视频理解服务后，这里会替换为视频主旨、论证路径与结论的真实概览。`,
-    keyPoints: [
-      {
-        title: "先识别视频上下文",
-        detail:
-          "提取标题、时长、画面变化和音轨信息，建立后续转写与视觉理解所需的素材索引。",
-      },
-      {
-        title: "把长视频拆成可追踪片段",
-        detail:
-          "依据语义转折与场景变化切分章节，让每条总结都能回到对应时间点进行核对。",
-      },
-      {
-        title: "合并语音与画面证据",
-        detail:
-          "将字幕、语音识别结果和关键帧描述统一交给模型，减少只听音频造成的信息遗漏。",
-      },
-      {
-        title: "输出结构化结论",
-        detail:
-          "生成概览、关键观点、章节和行动项，同时保留会话上下文供用户继续追问。",
-      },
-      {
-        title: "模型与部署保持可替换",
-        detail:
-          "页面只依赖统一的视频分析接口，后续可切换云端 API、自托管模型或混合处理方案。",
-      },
-    ],
-    chapters: [
-      {
-        time: "00:00",
-        title: "引入与问题定义",
-        description: "识别视频主题、目标受众和创作者希望解决的问题。",
-      },
-      {
-        time: "02:18",
-        title: "核心内容展开",
-        description: "聚合主要论点、示例以及画面中出现的补充信息。",
-      },
-      {
-        time: "06:42",
-        title: "关键转折与验证",
-        description: "定位观点变化、反例、数据或演示结果。",
-      },
-      {
-        time: "10:05",
-        title: "结论与下一步",
-        description: "提炼最终结论、适用条件和可执行建议。",
-      },
-    ],
-    takeaway:
-      "首版产品的核心是让“素材获取—内容理解—总结—追问”形成一条可观察、可恢复的链路；模型选择只影响适配器，不影响用户工作流。",
-  };
-}
-
-export const demoVideoEngine: VideoEngine = {
-  mode: "demo",
-  async analyze(source) {
-    await wait(260);
-    return createDemoSummary(source);
-  },
-};
 
 export function extractBvid(value: string): string | null {
   const match = value.trim().match(/BV[0-9A-Za-z]{10}/i);

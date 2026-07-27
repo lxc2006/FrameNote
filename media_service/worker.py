@@ -23,7 +23,9 @@ JOB_ID_RE = re.compile(
 )
 FINAL_ARTIFACT_RE = re.compile(r"^artifact\.mp4$", re.IGNORECASE)
 SUPPORTED_VARIANTS = frozenset({"preview", "analysis"})
-ANALYSIS_MAX_EDGE = 1280
+ANALYSIS_MAX_EDGE = 854
+ANALYSIS_MAX_BYTES = 500 * 1024 * 1024
+PREVIEW_MAX_BYTES = 2 * 1024 * 1024 * 1024
 DOWNLOAD_FRAGMENT_CONCURRENCY = 4
 BROWSER_VIDEO_CODECS = frozenset({"h264"})
 BROWSER_AUDIO_CODECS = frozenset({"aac"})
@@ -44,6 +46,16 @@ def emit(event: str, **values: Any) -> None:
     sys.stdout.flush()
 
 
+def load_analysis_builder():
+    """Load the trusted sibling module even when the worker uses Python ``-I``."""
+    package_root = str(Path(__file__).resolve().parent.parent)
+    if package_root not in sys.path:
+        sys.path.insert(0, package_root)
+    from media_service.analysis_pipeline import build_analysis_manifest
+
+    return build_analysis_manifest
+
+
 def browser_compatible_format(variant: str) -> str:
     dimension_filter = (
         rf"[width<={ANALYSIS_MAX_EDGE}][height<={ANALYSIS_MAX_EDGE}]"
@@ -56,10 +68,6 @@ def browser_compatible_format(variant: str) -> str:
         rf"b{dimension_filter}[ext=mp4][vcodec~='^(?:h264|avc[13](?:\.|$))']"
         r"[acodec~='^(?:aac|mp4a\.40\.)']"
     )
-
-
-BROWSER_COMPATIBLE_FORMAT = browser_compatible_format("analysis")
-
 
 def resolve_job_dir(state_root: Path, job_id: str) -> Path:
     if not JOB_ID_RE.fullmatch(job_id):
@@ -91,7 +99,7 @@ def estimate_download_bytes(info: dict[str, Any]) -> int | None:
 
 def validate_video_info(
     info: dict[str, Any], max_duration: int, max_bytes: int
-) -> tuple[str, float]:
+) -> tuple[str, float, str | None]:
     if not isinstance(info, dict) or info.get("_type") in {"playlist", "multi_video"}:
         raise WorkerFailure("PLAYLIST_NOT_ALLOWED", "只支持单个 B 站视频。", False)
     if info.get("extractor_key") != "BiliBili":
@@ -121,10 +129,25 @@ def validate_video_info(
     title = info.get("title")
     if not isinstance(title, str) or not title.strip():
         title = "Bilibili video"
-    return title.strip()[:300], float(duration)
+    description = info.get("description")
+    if not isinstance(description, str) or not description.strip():
+        description = None
+    else:
+        description = description.strip()[:20_000]
+    return title.strip()[:300], float(duration), description
 
 
 def safe_download_filename(title: str, bvid: str, suffix: str) -> str:
+    normalized = safe_filename_stem(title)
+    return f"{normalized[:120].rstrip(' .')} [{bvid}]{suffix.lower()}"
+
+
+def safe_media_filename(title: str, suffix: str = ".mp4") -> str:
+    normalized = safe_filename_stem(Path(title).stem or title)
+    return f"{normalized[:160].rstrip(' .')}{suffix.lower()}"
+
+
+def safe_filename_stem(title: str) -> str:
     normalized = unicodedata.normalize("NFKC", title)
     normalized = "".join(char for char in normalized if ord(char) >= 32)
     normalized = re.sub(r'[<>:"/\\|?*]+', "_", normalized)
@@ -137,7 +160,7 @@ def safe_download_filename(title: str, bvid: str, suffix: str) -> str:
         *(f"LPT{number}" for number in range(1, 10)),
     }:
         normalized = f"_{normalized}"
-    return f"{normalized[:120].rstrip(' .')} [{bvid}]{suffix.lower()}"
+    return normalized
 
 
 def directory_size(directory: Path) -> int:
@@ -352,6 +375,245 @@ def verify_artifact(
     return stat.st_size, digest.hexdigest(), width, height
 
 
+def probe_source_media(
+    ffprobe: str,
+    source: Path,
+    max_duration: int,
+    max_bytes: int,
+) -> float:
+    try:
+        stat = source.stat()
+    except OSError as exc:
+        raise WorkerFailure("SOURCE_MISSING", "无法读取上传的视频。", False) from exc
+    if (
+        not source.is_file()
+        or source.is_symlink()
+        or stat.st_size <= 0
+        or stat.st_size > max_bytes
+    ):
+        raise WorkerFailure(
+            "VIDEO_TOO_LARGE",
+            "上传的视频为空或超过 500 MB 分析上限。",
+            False,
+        )
+    command = [
+        ffprobe,
+        "-v",
+        "error",
+        "-show_entries",
+        "format=duration:stream=codec_type",
+        "-of",
+        "json",
+        str(source),
+    ]
+    try:
+        result = subprocess.run(
+            command,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            check=False,
+            timeout=45,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            shell=False,
+        )
+        payload = json.loads(result.stdout) if result.returncode == 0 else {}
+        duration = float(payload["format"]["duration"])
+        stream_types = {
+            stream.get("codec_type")
+            for stream in payload.get("streams", [])
+            if isinstance(stream, dict)
+        }
+    except (OSError, subprocess.TimeoutExpired, KeyError, TypeError, ValueError, json.JSONDecodeError) as exc:
+        raise WorkerFailure(
+            "PROBE_FAILED",
+            "无法读取视频时长或媒体轨道。",
+            False,
+        ) from exc
+    if not math.isfinite(duration) or duration <= 0:
+        raise WorkerFailure("DURATION_UNKNOWN", "无法确认视频时长。", False)
+    if duration > max_duration:
+        raise WorkerFailure("VIDEO_TOO_LONG", "视频超过 60 分钟限制。", False)
+    if "video" not in stream_types:
+        raise WorkerFailure("PROBE_FAILED", "文件不包含视频轨道。", False)
+    if "audio" not in stream_types:
+        raise WorkerFailure(
+            "AUDIO_MISSING",
+            "视频不包含音频轨道，无法执行完整的视频总结与字幕提取。",
+            False,
+        )
+    return duration
+
+
+def transcode_analysis_video(
+    ffmpeg: str,
+    source: Path,
+    artifact: Path,
+    duration: float,
+) -> None:
+    command = [
+        ffmpeg,
+        "-hide_banner",
+        "-loglevel",
+        "error",
+        "-nostdin",
+        "-i",
+        str(source),
+        "-map",
+        "0:v:0",
+        "-map",
+        "0:a:0",
+        "-vf",
+        (
+            f"scale={ANALYSIS_MAX_EDGE}:{ANALYSIS_MAX_EDGE}:"
+            "force_original_aspect_ratio=decrease:force_divisible_by=2"
+        ),
+        "-c:v",
+        "libx264",
+        "-preset",
+        "veryfast",
+        "-crf",
+        "28",
+        "-pix_fmt",
+        "yuv420p",
+        "-c:a",
+        "aac",
+        "-b:a",
+        "96k",
+        "-movflags",
+        "+faststart",
+        "-y",
+        str(artifact),
+    ]
+    try:
+        result = subprocess.run(
+            command,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.PIPE,
+            check=False,
+            timeout=max(180, min(3_600, math.ceil(duration * 4))),
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            shell=False,
+        )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        raise WorkerFailure(
+            "TRANSCODE_FAILED",
+            "低分辨率分析视频生成超时或 FFmpeg 不可用。",
+            True,
+        ) from exc
+    if result.returncode != 0 or not artifact.is_file():
+        raise WorkerFailure(
+            "TRANSCODE_FAILED",
+            f"低分辨率分析视频生成失败：{result.stderr[-180:]}",
+            True,
+        )
+
+
+def build_and_emit_analysis(
+    args: argparse.Namespace,
+    artifact: Path,
+    job_dir: Path,
+    duration: float,
+) -> None:
+    emit("progress", phase="analyzing", progress=0.92)
+    try:
+        build_analysis_manifest = load_analysis_builder()
+        ffmpeg = shutil.which("ffmpeg")
+        if not ffmpeg:
+            raise RuntimeError("FFmpeg 不可用。")
+        use_direct_video = (
+            args.direct_summary_max_seconds > 0
+            and duration <= args.direct_summary_max_seconds
+        )
+        manifest_path, manifest = build_analysis_manifest(
+            artifact,
+            job_dir,
+            duration,
+            ffmpeg,
+            include_keyframes=not use_direct_video,
+            on_progress=lambda _stage, progress: emit(
+                "progress",
+                phase="analyzing",
+                progress=round(0.92 + min(1.0, max(0.0, progress)) * 0.07, 4),
+            ),
+        )
+    except Exception as exc:
+        raise WorkerFailure(
+            "ANALYSIS_FAILED",
+            f"Qwen 分析素材准备失败：{str(exc)[:220]}",
+            True,
+        ) from exc
+    emit(
+        "analysis",
+        manifestFile=manifest_path.name,
+        mode=manifest["mode"],
+        frameCount=len(manifest["frames"]),
+        transcriptStatus=manifest["transcript"]["status"],
+    )
+
+
+def run_uploaded_media(args: argparse.Namespace) -> None:
+    validate_runtime_limits(
+        args.variant,
+        args.max_duration,
+        args.max_bytes,
+        args.direct_summary_max_seconds,
+    )
+    if args.variant != "analysis" or args.source_kind not in {"upload", "url"}:
+        raise WorkerFailure("INVALID_SOURCE", "媒体分析来源无效。", False)
+    state_root = Path(args.state_root)
+    job_dir = resolve_job_dir(state_root, args.job_id)
+    if not isinstance(args.input_file, str) or not args.input_file:
+        raise WorkerFailure("INVALID_SOURCE", "上传视频路径无效。", False)
+    source = (job_dir / args.input_file).resolve()
+    if source.parent != job_dir.resolve() or source.name != args.input_file:
+        raise WorkerFailure("INVALID_SOURCE", "上传视频路径无效。", False)
+    ffmpeg_location, ffprobe = locate_ffmpeg()
+    ffmpeg = str(Path(ffmpeg_location) / ("ffmpeg.exe" if os.name == "nt" else "ffmpeg"))
+
+    emit("progress", phase="resolving", progress=0.05)
+    duration = probe_source_media(
+        ffprobe,
+        source,
+        args.max_duration,
+        args.max_bytes,
+    )
+    title = Path(args.source_name).stem.strip() or "本地视频"
+    emit(
+        "source",
+        title=title[:300],
+        durationSeconds=round(duration, 3),
+        description=None,
+    )
+    emit("progress", phase="merging", progress=0.15)
+    artifact = job_dir / "artifact.mp4"
+    transcode_analysis_video(ffmpeg, source, artifact, duration)
+    source.unlink(missing_ok=True)
+    emit("progress", phase="merging", progress=0.88)
+    size, sha256, width, height = verify_artifact(
+        ffprobe,
+        artifact,
+        args.max_duration,
+        args.max_bytes,
+    )
+    build_and_emit_analysis(args, artifact, job_dir, duration)
+    emit(
+        "artifact",
+        artifactFile=artifact.name,
+        filename=safe_media_filename(args.source_name),
+        mimeType="video/mp4",
+        sizeBytes=size,
+        sha256=sha256,
+        width=width,
+        height=height,
+    )
+
+
 def classify_download_error(message: str, resolving: bool) -> WorkerFailure:
     lowered = message.lower()
     if any(
@@ -383,15 +645,41 @@ def classify_download_error(message: str, resolving: bool) -> WorkerFailure:
     return WorkerFailure("DOWNLOAD_FAILED", "B 站视频下载失败，请稍后重试。", True)
 
 
-def run(args: argparse.Namespace) -> None:
-    if not BVID_RE.fullmatch(args.bvid):
-        raise WorkerFailure("INVALID_BVID", "BVID 格式无效。", False)
-    if not 1 <= args.max_duration <= 3_600:
+def validate_runtime_limits(
+    variant: str,
+    max_duration: int,
+    max_bytes: int,
+    direct_summary_max_seconds: int = 0,
+) -> None:
+    if variant not in SUPPORTED_VARIANTS:
+        raise WorkerFailure(
+            "INVALID_LIMIT",
+            "下载用途只支持 preview 或 analysis。",
+            False,
+        )
+    if not 1 <= max_duration <= 3_600:
         raise WorkerFailure("INVALID_LIMIT", "时长限制无效。", False)
-    if not 1 <= args.max_bytes <= 300 * 1024 * 1024:
+    maximum_bytes = (
+        ANALYSIS_MAX_BYTES if variant == "analysis" else PREVIEW_MAX_BYTES
+    )
+    if not 1 <= max_bytes <= maximum_bytes:
         raise WorkerFailure("INVALID_LIMIT", "文件限制无效。", False)
-    if args.variant not in SUPPORTED_VARIANTS:
-        raise WorkerFailure("INVALID_LIMIT", "下载用途只支持 preview 或 analysis。", False)
+    if not 0 <= direct_summary_max_seconds <= 900:
+        raise WorkerFailure("INVALID_LIMIT", "Qwen 直接总结时长限制无效。", False)
+
+
+def run(args: argparse.Namespace) -> None:
+    if args.source_kind != "bilibili":
+        run_uploaded_media(args)
+        return
+    if not isinstance(args.bvid, str) or not BVID_RE.fullmatch(args.bvid):
+        raise WorkerFailure("INVALID_BVID", "BVID 格式无效。", False)
+    validate_runtime_limits(
+        args.variant,
+        args.max_duration,
+        args.max_bytes,
+        args.direct_summary_max_seconds,
+    )
     state_root = Path(args.state_root)
     job_dir = resolve_job_dir(state_root, args.job_id)
     ffmpeg_location, ffprobe = locate_ffmpeg()
@@ -456,10 +744,15 @@ def run(args: argparse.Namespace) -> None:
             info = downloader.extract_info(url, download=False)
             if not isinstance(info, dict):
                 raise WorkerFailure("METADATA_FAILED", "B 站视频信息无效。", True)
-            title, duration = validate_video_info(
+            title, duration, description = validate_video_info(
                 info, args.max_duration, args.max_bytes
             )
-            emit("source", title=title, durationSeconds=round(duration, 3))
+            emit(
+                "source",
+                title=title,
+                durationSeconds=round(duration, 3),
+                description=description,
+            )
             emit("progress", phase="downloading", progress=0.08)
             resolving = False
             downloader.process_ie_result(info, download=True)
@@ -483,6 +776,8 @@ def run(args: argparse.Namespace) -> None:
     size, sha256, width, height = verify_artifact(
         ffprobe, artifact, args.max_duration, args.max_bytes
     )
+    if args.variant == "analysis":
+        build_and_emit_analysis(args, artifact, job_dir, duration)
     mime_type = mimetypes.guess_type(artifact.name)[0] or "video/mp4"
     if not mime_type.startswith("video/"):
         mime_type = "video/mp4"
@@ -503,10 +798,23 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(add_help=False, allow_abbrev=False)
     parser.add_argument("--state-root", required=True)
     parser.add_argument("--job-id", required=True)
-    parser.add_argument("--bvid", required=True)
+    parser.add_argument(
+        "--source-kind",
+        default="bilibili",
+        choices=("upload", "bilibili", "url"),
+    )
+    parser.add_argument("--source-name", default="video")
+    parser.add_argument("--source-url")
+    parser.add_argument("--input-file")
+    parser.add_argument("--bvid")
     parser.add_argument("--variant", required=True, choices=sorted(SUPPORTED_VARIANTS))
     parser.add_argument("--max-duration", required=True, type=int)
     parser.add_argument("--max-bytes", required=True, type=int)
+    parser.add_argument(
+        "--direct-summary-max-seconds",
+        default=0,
+        type=int,
+    )
     return parser.parse_args()
 
 

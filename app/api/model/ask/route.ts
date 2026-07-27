@@ -18,6 +18,7 @@ export async function POST(request: Request) {
       payload.question,
       payload.source,
       payload.summary,
+      payload.context?.transcript,
       payload.history,
     );
     const body: AskVideoResponse = {

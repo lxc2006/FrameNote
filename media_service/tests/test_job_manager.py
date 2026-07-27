@@ -31,7 +31,8 @@ def settings_for(root: Path, max_queued: int = 2) -> Settings:
         concurrency=2,
         max_queued=max_queued,
         max_duration_seconds=3_600,
-        max_bytes=300 * 1024 * 1024,
+        max_bytes=500 * 1024 * 1024,
+        download_max_bytes=1024 * 1024 * 1024,
         job_timeout_seconds=60,
         artifact_ttl_seconds=60,
         signed_url_ttl_seconds=30,
@@ -57,14 +58,59 @@ class JobRecordTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temporary:
             manager = JobManager(settings_for(Path(temporary)))
             command = manager._worker_command(
-                "01111111-1111-4111-8111-111111111111",
-                "BV1xx411c7mD",
+                JobRecord(
+                    job_id="01111111-1111-4111-8111-111111111111",
+                    bvid="BV1xx411c7mD",
+                ),
             )
             self.assertEqual(
                 command[:5],
                 [sys.executable, "-I", "-u", "-X", "utf8=1"],
             )
             self.assertEqual(command[command.index("--variant") + 1], "preview")
+            self.assertEqual(
+                command[command.index("--direct-summary-max-seconds") + 1],
+                "0",
+            )
+            self.assertEqual(
+                command[command.index("--max-bytes") + 1],
+                str(1024 * 1024 * 1024),
+            )
+            analysis_command = manager._worker_command(
+                JobRecord(
+                    job_id="01111111-1111-4111-8111-111111111111",
+                    bvid="BV1xx411c7mD",
+                    variant="analysis",
+                    direct_summary_max_seconds=360,
+                ),
+            )
+            self.assertEqual(
+                analysis_command[analysis_command.index("--max-bytes") + 1],
+                str(500 * 1024 * 1024),
+            )
+            self.assertEqual(
+                analysis_command[
+                    analysis_command.index("--direct-summary-max-seconds") + 1
+                ],
+                "360",
+            )
+            upload_command = manager._worker_command(
+                JobRecord(
+                    job_id="01111111-1111-4111-8111-111111111111",
+                    source_kind="upload",
+                    source_name="sample.mov",
+                    variant="analysis",
+                    direct_summary_max_seconds=120,
+                ),
+            )
+            self.assertEqual(
+                upload_command[upload_command.index("--source-kind") + 1],
+                "upload",
+            )
+            self.assertEqual(
+                upload_command[upload_command.index("--input-file") + 1],
+                "source-media",
+            )
             environment = manager._worker_environment()
             self.assertEqual(environment["PYTHONIOENCODING"], "utf-8")
             self.assertEqual(environment["PYTHONUTF8"], "1")

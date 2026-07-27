@@ -21,71 +21,66 @@ interface AskVideoRequest {
 
 当前已初步拆为三层，后续生产版再将其抽象为可替换接口：
 
-- B站来源层：BVID 标准化、受控下载任务与签名产物。
-- 处理层：任务排队、DASH 合并、浏览器音轨/关键帧提取。
+- 来源层：本地上传、HTTPS 直链下载，以及 BVID 标准化和受控 B 站预览。
+- 处理层：任务排队、DASH 合并、低分辨率转码、音轨与关键帧提取。
 - 模型层：Qwen 结构化总结与 DeepSeek 持续问答。
 
 页面与公共 API 不感知具体模型，只消费标准化的任务状态、总结和回答。
 
-当前本地上传提供一条浏览器快速路径：FFmpeg WebAssembly 直接读取用户文件，将单声道 MP3 音轨压缩到目标体积，并按原视频时长均匀抽取最多 24 张 JPEG 关键帧；服务端只接收这些模型证据，不接收完整原视频。该路径适合不超过 300 MB、60 分钟的个人处理，不承担生产环境的大文件持久化、断点续传和后台恢复。
+本地上传和 HTTPS 直链先由网页把原始文件流式提交到独立媒体服务。媒体服务使用 `ffprobe` 校验时长和轨道，再由原生 FFmpeg 转成最长边不超过 854px 的 H.264/AAC 临时素材。原始上传在转码完成后删除，分析素材在任务结束或 TTL 到期时删除；它们都不会写入对话数据库。
 
-当前 B站来源也已接入这条快速路径：Sites Worker 只代理创建、查询与取消任务的小型 JSON；独立 FastAPI 服务以受控子进程运行 yt-dlp，并调用原生 FFmpeg 合并 B站 DASH 音视频。由于浏览器 FFmpeg WebAssembly 不包含 AV1 解码能力，媒体边界契约固定为 MP4 容器、H.264 视频与 AAC 音频：yt-dlp 从源头硬筛选兼容流，合并后再由 ffprobe 校验全部音视频轨，不能依赖重封装改变编码。任务成功后，浏览器通过短期 HMAC 签名 URL 直接下载临时媒体，再复用同一套 FFmpeg WebAssembly 证据抽取。B站分析把音轨作为必需证据：FFmpeg WASM 音频提取非零退出、读取失败或产生零字节文件时立即终止，API 也拒绝只有关键帧而没有 `audioUrl` 的 B站分析请求，避免静默产出纯画面总结。媒体字节不会经过 Sites Worker。由于网络响应需要先形成浏览器 `File`，首版 B站上限收紧为 150 MB；更大来源应改为媒体服务直接抽取证据或写入对象存储。
+当前 B站媒体分成两类任务：用户点击“获取视频”时，`preview` 任务准备默认最高兼容画质 MP4，网页使用签名播放 URL 通过 HTTP Range 边播放边缓存，并提供附件下载 URL；AI 总结另建 `analysis` 任务，只准备约 480p、最大 500 MB 的素材，绝不复用最高画质文件。
 
-浏览器收到完整 B站 `File` 后会立即创建任务级 Blob URL，播放器与下载按钮复用该 URL，因此可以在证据抽取和模型总结尚未完成时预览或保存合并视频。媒体服务任务随后仍可按原策略清理；Blob URL 在新任务、重置或页面卸载时释放。HTTPS 视频直链当前不经过应用下载：浏览器直接用源 URL 流式预览，并提供打开/下载入口；跨域 `download` 是否生效由源站响应头与浏览器策略决定，不能视为持久化产物。
+获取视频和生成总结时，Sites Worker 代理任务控制数据及本地/HTTPS 上传流；独立 FastAPI 服务以受控子进程运行 yt-dlp 和原生 FFmpeg。所有来源在得到低分辨率分析视频后按时长分流：短视频由服务端流式上传 DashScope 临时存储并直接交给 Qwen；长视频由媒体服务提取音轨和关键帧。Qwen 完成后再按用户设置启动 FunASR，字幕独立保存但不进入本次总结提示。B站对话保存 BV 号并自动恢复预览；本地对话不保存视频，恢复后由用户重新选择预览文件。
 
 ## 2. 推荐拓扑
 
 ```text
 浏览器
-  ├─ 本地视频分片直传 ──────────────> R2
-  └─ 创建任务 / 查询状态 / 继续提问 ─> Sites + vinext Worker
-                                           ├─ D1：任务、总结、对话、文件元数据
-                                           ├─ R2：视频、音频、字幕、中间产物
-                                           └─ 外部媒体处理器 / Container
-                                                ├─ yt-dlp（受控场景）
-                                                ├─ FFmpeg / ffprobe
-                                                ├─ ASR
-                                                └─ VideoAIAdapter
+  ├─ 本地视频 / HTTPS 下载流 ────────────────┐
+  └─ 创建任务 / 查询状态 / 继续提问 ────> Sites + vinext Worker
+                                              ├─ D1：来源、总结、字幕、对话
+                                              └─ 外部媒体处理器 / Container
+                                                   ├─ 临时磁盘/带 TTL 对象
+                                                   ├─ yt-dlp（受控 B 站场景）
+                                                   ├─ FFmpeg / ffprobe
+                                                   └─ PySceneDetect / FunASR
 ```
 
 站点 Worker 适合做鉴权、任务 API、状态与存储门面，不适合直接运行 FFmpeg 或 yt-dlp。当前 `media_service/` 可在本机或单个容器中运行；生产长任务应部署到 Docker 媒体 Worker、Cloudflare Container，或其他具有持久计算和临时磁盘的服务中。
 
 ## 3. “先下载视频”的服务端语义
 
-当前首版固定采用“临时下载后分析”：合并文件只在独立媒体服务的任务目录中短期存在，浏览器完整读取后会主动取消/清理任务，服务端 TTL 清理器负责兜底；它不会自动把视频保存到用户下载目录，也不承诺长期保留。
+当前采用临时任务文件：本地和 HTTPS 原始上传在低分辨率转码完成后删除；AI 分析素材在 Qwen/字幕步骤结束后由网页主动清理，异常时由 TTL 兜底。最高兼容画质 B 站文件在媒体服务保留期内通过签名 URL 提供 Range 播放和附件下载。B站对话不保存视频副本，恢复历史时依赖保存的 BV 号重新创建临时预览，因此不会持久化过期签名 URL。
 
-后续加入对象存储后，UI 中的保留选项在服务端建议命名为 `retainOriginal`：
-
-- `true`：处理完成后保留用户有权保存的视频副本，并提供受鉴权的下载入口。
-- `false`：分析过程仍可能临时获取字幕或音频，但任务完成后删除原始媒体。
-- 若模型支持直接读取受支持的媒体 URL，可完全不保存源视频。
-
-这比把它解释为“是否发生任何下载”更准确，因为转写和总结通常仍需临时读取媒体数据。
+如果后续为了多实例共享而接入对象存储，对象也只作为带 TTL 的任务临时产物，不写入对话作为长期恢复依据。转写和总结可以临时读取媒体，但任务完成或 TTL 到期后必须删除。
 
 ## 4. 推荐 API
 
 | 方法与路径 | 状态 | 作用 |
 | --- | --- | --- |
-| `POST /api/bilibili/jobs` | 已实现 | 以 `{"bvid":"BV..."}` 创建受控下载任务，返回 `202` |
+| `POST /api/bilibili/jobs` | 已实现 | 以 `{"bvid":"BV...","variant":"preview\|analysis"}` 创建受控下载任务，返回 `202` |
 | `GET /api/bilibili/jobs/:id` | 已实现 | 查询解析、下载、合并与就绪状态 |
+| `POST /api/bilibili/jobs/:id/transcript` | 已实现 | Qwen 完成后异步启动 FunASR 字幕提取 |
 | `DELETE /api/bilibili/jobs/:id` | 已实现 | 取消任务并清理临时媒体 |
+| `POST /api/media/jobs` | 已实现 | 流式上传本地或 HTTPS 视频，生成低分辨率分析任务 |
+| `GET/DELETE /api/media/jobs/:id` | 已实现 | 查询或清理通用媒体分析任务 |
+| `POST /api/media/jobs/:id/transcript` | 已实现 | 为通用媒体任务启动 FunASR 字幕提取 |
 | `POST /api/model/analyze` | 已实现 | 使用 Qwen 生成结构化视频总结 |
 | `POST /api/model/ask` | 已实现 | 使用 DeepSeek 基于总结、证据和历史追问 |
-| `POST /api/uploads` 与 multipart 分片路由 | 规划 | 初始化、写入、完成或放弃大文件上传 |
 | `POST /api/jobs`、`GET /api/jobs/:id` | 规划 | 创建并恢复持久化总结任务 |
-| `GET/POST /api/conversations/:id` | 规划 | 持久化总结与消息历史 |
-| `GET /api/artifacts/:id/download` | 规划 | 鉴权下载被允许长期保留的产物 |
+| `GET/POST /api/conversations`、`GET/PATCH/DELETE /api/conversations/:id` | 已实现 | 持久化来源、总结与消息历史，不保存视频 |
 
 当前 B站创建任务请求：
 
 ```json
-{"bvid":"BVxxxxxxxxxx"}
+{"bvid":"BVxxxxxxxxxx","variant":"preview"}
 ```
 
 当前 B站媒体任务契约：
 
 - `status`: `queued | running | succeeded | failed | cancelled | expired`
-- `phase`: `queued | resolving | downloading | merging | ready`
+- `phase`: `queued | resolving | downloading | merging | analyzing | ready`
 - `error`: `{ code, message, retryable } | null`
 
 规划中的通用持久化任务可在此基础上增加 `extracting | transcribing | summarizing` 阶段，但不能与当前媒体任务契约混用。
@@ -108,7 +103,6 @@ interface AskVideoRequest {
   "audioAnalysis": {
     "status": "analyzed",
     "summary": "声音整体概述",
-    "speech": null,
     "music": "可听见的音乐风格、节奏、音色和氛围",
     "soundscape": "可辨的环境声，若不存在则为 null",
     "temporalChanges": [
@@ -125,18 +119,15 @@ interface AskVideoRequest {
 
 D1 存结构化数据：
 
-- 来源、BV 号、R2 key、所有者与保留策略。
-- 上传会话、任务状态、阶段、进度与错误。
-- 总结、模型版本、提示词版本、对话和时间引用。
-- 可下载产物的元数据。
+- 稳定来源信息，例如 BVID 或用户提交的 HTTPS 原链接。
+- 总结、模型版本、对话、时间引用与所有者。
 
-R2 存大对象：
+媒体服务临时目录存任务产物：
 
-- 原视频、合并后视频和抽取音频。
-- 完整字幕 JSON/VTT。
-- 大型模型中间产物。
+- `preview` MP4：在 TTL 内提供 Range 播放和附件下载。
+- `analysis` MP4：短视频由网站服务端流式上传到模型临时存储；长视频只向浏览器返回音轨与关键帧证据。任务结束后主动清理，异常时由 TTL 兜底。
 
-视频和完整字幕不能放入 D1。上传过程必须流式或 multipart，不能在 Worker 中对整个视频调用 `arrayBuffer()`。
+视频字节、临时签名 URL 和对象 key 都不能放入 D1。字幕作为文本随对话保存。网站 Worker 不应把整个视频读入 `arrayBuffer()`。
 
 ## 6. 模型选择标准
 
@@ -152,8 +143,8 @@ R2 存大对象：
 
 当前已经采用两条真实输入路径：
 
-- **HTTPS 视频直链 → Qwen 多模态模型**：链路短，适合模型可直接访问的媒体。
-- **音轨 + 关键帧 → Qwen 多模态模型**：适合本地上传与 B站下载，便于控制请求体和证据时间索引。
+- **压缩后的短视频 → Qwen 多模态模型**：适合阈值内的本地、HTTPS 和 B站视频，统一按 1 FPS 读取。
+- **音轨 + 关键帧 → Qwen 多模态模型**：适合超过阈值的视频，便于控制请求体和证据时间索引。
 
 后续长视频优化方向是服务端 ASR、分段关键帧、证据检索与文本模型合并；重点验证成本、时间引用和可恢复性。
 
@@ -162,7 +153,8 @@ R2 存大对象：
 ### A. 快速上线
 
 - Sites/vinext：页面与任务 API。
-- D1/R2：任务与文件。
+- D1：来源、总结与对话。
+- 临时磁盘或带 TTL 的对象存储：媒体任务产物。
 - 托管容器：FFmpeg、ASR、视频源适配器。
 - 云端多模态或文本模型：总结与问答。
 
@@ -171,7 +163,7 @@ R2 存大对象：
 ### B. Cloudflare 为主
 
 - Worker 做控制面。
-- R2/D1 做数据层。
+- D1 做持久化数据层；R2 如启用只保存带 TTL 的临时产物。
 - Queues/Workflows 做调度。
 - Cloudflare Containers 跑媒体处理。
 
@@ -185,7 +177,7 @@ R2 存大对象：
 ## 8. B站合规与安全边界
 
 - BV 号第一层格式校验可用 `^BV[0-9A-Za-z]{10}$`，语法通过不代表视频存在或允许下载。
-- 当前不抓取用户提交的任意 URL：前端只提取 BVID，服务端固定拼接 B站 HTTPS UGC 地址，因此不支持不含 BVID 的短链。
+- B 站适配器不抓取用户提交的任意 URL：服务端固定拼接 B站 HTTPS UGC 地址，因此不支持不含 BVID 的短链。HTTPS 直链由浏览器按 CORS 规则读取后作为文件上传，媒体服务本身不发起该 URL 请求。
 - 如后续支持短链，只允许 HTTPS 和明确域名白名单，并在每次跳转后重新校验，防止 SSRF。
 - 默认只处理无需登录即可访问的公开 UGC。
 - 不支持会员、付费、番剧、课堂、私密、地区限制内容，也不绕过验证码和风控。
@@ -199,13 +191,12 @@ R2 存大对象：
 - [B站开放平台](https://open.bilibili.com/doc)
 - [yt-dlp Bilibili 提取器](https://github.com/yt-dlp/yt-dlp/blob/master/yt_dlp/extractor/bilibili.py)
 - [Cloudflare Workers 限制](https://developers.cloudflare.com/workers/platform/limits/)
-- [R2 multipart](https://developers.cloudflare.com/r2/api/workers/workers-multipart-usage/)
 
 ## 9. 推荐实施顺序
 
 1. 用用户有权处理的公开 BVID 完成真实下载、证据抽取、Qwen 总结和 DeepSeek 追问烟测。
 2. 将媒体服务部署为单实例 HTTPS 容器，配置 Token、签名密钥、精确 CORS 和临时数据卷。
-3. 接入 D1/R2 与 multipart 直传，将浏览器整文件处理迁移为服务端证据抽取。
+3. 如需多实例，将临时媒体迁移到带 TTL 的对象存储，并把任务状态迁移到共享队列。
 4. 增加持久队列、任务恢复、SSE、幂等重试和数据删除。
 5. 增加服务端 ASR、分段总结与证据检索，提升长视频质量。
 6. 完成用户鉴权、限流、配额、版权授权与风控评估后，再开放生产环境 B站能力。

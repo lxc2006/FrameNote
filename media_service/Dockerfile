@@ -3,7 +3,8 @@ FROM python:3.12-slim
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
     FRAMENOTE_MEDIA_STATE_DIR=/data \
-    FRAMENOTE_MEDIA_ALLOW_TOKENLESS_LOOPBACK=0
+    FRAMENOTE_MEDIA_ALLOW_TOKENLESS_LOOPBACK=0 \
+    MODELSCOPE_CACHE=/data/model-cache
 
 RUN apt-get update \
     && apt-get install --yes --no-install-recommends ca-certificates ffmpeg \

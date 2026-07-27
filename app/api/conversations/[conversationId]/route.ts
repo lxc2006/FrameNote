@@ -9,7 +9,6 @@ import {
   readConversationJson,
   renameConversation,
 } from "@/lib/server/conversation-store";
-import { deleteConversationVideo } from "@/lib/server/conversation-video-store";
 
 export const dynamic = "force-dynamic";
 
@@ -55,7 +54,6 @@ export async function DELETE(request: Request, context: RouteContext) {
   try {
     const ownerId = ownerIdFromRequest(request);
     const conversationId = await conversationIdFrom(context);
-    await deleteConversationVideo(ownerId, conversationId);
     await deleteConversation(ownerId, conversationId);
     return new Response(null, {
       status: 204,

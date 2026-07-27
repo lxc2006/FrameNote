@@ -27,6 +27,7 @@ interface UserPreferences {
   uiFontSize: number;
   textFont: FontPreference;
   textFontSize: number;
+  qwenDirectSummaryMaxSeconds: number;
 }
 
 interface LegacyUserPreferences {
@@ -39,8 +40,10 @@ interface LegacyUserPreferences {
   fontSize?: "small" | "standard" | "comfortable" | "large";
 }
 
-const STORAGE_KEY = "framenote.user-preferences.v1";
-const PREFERENCES_CHANGE_EVENT = "framenote:preferences-change";
+export const USER_PREFERENCES_STORAGE_KEY = "framenote.user-preferences.v1";
+export const USER_PREFERENCES_CHANGE_EVENT = "framenote:preferences-change";
+export const DEFAULT_QWEN_DIRECT_SUMMARY_MAX_SECONDS = 360;
+export const MAX_QWEN_DIRECT_SUMMARY_MAX_SECONDS = 900;
 const MIN_FONT_SIZE = 12;
 const MAX_FONT_SIZE = 28;
 const DEFAULT_FONT_SIZE = 16;
@@ -51,6 +54,7 @@ const DEFAULT_PREFERENCES: UserPreferences = {
   uiFontSize: DEFAULT_FONT_SIZE,
   textFont: "system",
   textFontSize: DEFAULT_FONT_SIZE,
+  qwenDirectSummaryMaxSeconds: DEFAULT_QWEN_DIRECT_SUMMARY_MAX_SECONDS,
 };
 
 const FONT_STACKS: Record<FontPreference, string> = {
@@ -112,7 +116,16 @@ function normalizeFontSize(value: unknown, fallback: number) {
     : fallback;
 }
 
-function parsePreferences(storedValue: string): UserPreferences {
+function normalizeDirectSummarySeconds(value: unknown) {
+  return typeof value === "number" && Number.isFinite(value)
+    ? Math.min(
+        MAX_QWEN_DIRECT_SUMMARY_MAX_SECONDS,
+        Math.max(0, Math.round(value)),
+      )
+    : DEFAULT_QWEN_DIRECT_SUMMARY_MAX_SECONDS;
+}
+
+export function parseUserPreferences(storedValue: string): UserPreferences {
   try {
     if (!storedValue) {
       return DEFAULT_PREFERENCES;
@@ -148,6 +161,9 @@ function parsePreferences(storedValue: string): UserPreferences {
         ? parsed.textFont
         : legacyTextFont,
       textFontSize: normalizeFontSize(parsed.textFontSize, legacyFontSize),
+      qwenDirectSummaryMaxSeconds: normalizeDirectSummarySeconds(
+        parsed.qwenDirectSummaryMaxSeconds,
+      ),
     };
   } catch {
     return DEFAULT_PREFERENCES;
@@ -156,7 +172,7 @@ function parsePreferences(storedValue: string): UserPreferences {
 
 function readPreferenceStorage() {
   try {
-    return window.localStorage.getItem(STORAGE_KEY) ?? "";
+    return window.localStorage.getItem(USER_PREFERENCES_STORAGE_KEY) ?? "";
   } catch {
     return "";
   }
@@ -168,17 +184,17 @@ function getServerPreferenceStorage() {
 
 function subscribeToPreferenceStorage(onStoreChange: () => void) {
   const handleStorage = (event: StorageEvent) => {
-    if (event.key === STORAGE_KEY || event.key === null) {
+    if (event.key === USER_PREFERENCES_STORAGE_KEY || event.key === null) {
       onStoreChange();
     }
   };
 
   window.addEventListener("storage", handleStorage);
-  window.addEventListener(PREFERENCES_CHANGE_EVENT, onStoreChange);
+  window.addEventListener(USER_PREFERENCES_CHANGE_EVENT, onStoreChange);
 
   return () => {
     window.removeEventListener("storage", handleStorage);
-    window.removeEventListener(PREFERENCES_CHANGE_EVENT, onStoreChange);
+    window.removeEventListener(USER_PREFERENCES_CHANGE_EVENT, onStoreChange);
   };
 }
 
@@ -197,8 +213,11 @@ function applyPreferences(preferences: UserPreferences) {
 
 function savePreferences(preferences: UserPreferences) {
   try {
-    window.localStorage.setItem(STORAGE_KEY, JSON.stringify(preferences));
-    window.dispatchEvent(new Event(PREFERENCES_CHANGE_EVENT));
+    window.localStorage.setItem(
+      USER_PREFERENCES_STORAGE_KEY,
+      JSON.stringify(preferences),
+    );
+    window.dispatchEvent(new Event(USER_PREFERENCES_CHANGE_EVENT));
   } catch {
     // Browsers can disable local storage. Applied settings still work this visit.
   }
@@ -294,7 +313,7 @@ export default function UserSettingsMenu() {
     getServerPreferenceStorage,
   );
   const preferences = useMemo(
-    () => parsePreferences(storedPreferences),
+    () => parseUserPreferences(storedPreferences),
     [storedPreferences],
   );
   const containerRef = useRef<HTMLDivElement>(null);
@@ -380,7 +399,7 @@ export default function UserSettingsMenu() {
           <div className="settings-popover-header">
             <div>
               <span>个性化</span>
-              <h2 id={titleId}>显示设置</h2>
+              <h2 id={titleId}>设置</h2>
             </div>
             <button
               type="button"
@@ -430,7 +449,50 @@ export default function UserSettingsMenu() {
             onFontSizeChange={(value) => updatePreference("textFontSize", value)}
           />
 
-          <p className="settings-hint">显示偏好会保存在当前浏览器。</p>
+          <fieldset className="settings-group">
+            <legend>视频分析</legend>
+            <p>
+              视频不超过此时长时，优先让 Qwen 直接读取视频；设为 0
+              可关闭直接总结。
+            </p>
+            <label className="settings-field">
+              <span>直接总结上限</span>
+              <span className="settings-number-input">
+                <input
+                  type="number"
+                  inputMode="numeric"
+                  min={0}
+                  max={MAX_QWEN_DIRECT_SUMMARY_MAX_SECONDS}
+                  step={1}
+                  value={preferences.qwenDirectSummaryMaxSeconds}
+                  aria-label="Qwen 直接总结时长上限，单位秒"
+                  onChange={(event) => {
+                    if (Number.isFinite(event.target.valueAsNumber)) {
+                      updatePreference(
+                        "qwenDirectSummaryMaxSeconds",
+                        normalizeDirectSummarySeconds(
+                          event.target.valueAsNumber,
+                        ),
+                      );
+                    }
+                  }}
+                  onBlur={(event) => {
+                    if (!Number.isFinite(event.target.valueAsNumber)) {
+                      event.currentTarget.value = String(
+                        preferences.qwenDirectSummaryMaxSeconds,
+                      );
+                    }
+                  }}
+                />
+                <b aria-hidden="true">秒</b>
+              </span>
+            </label>
+            <span className="settings-size-range">
+              可输入 0–{MAX_QWEN_DIRECT_SUMMARY_MAX_SECONDS} 秒
+            </span>
+          </fieldset>
+
+          <p className="settings-hint">这些偏好会保存在当前浏览器。</p>
         </section>
       ) : null}
     </div>

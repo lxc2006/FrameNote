@@ -14,7 +14,7 @@ import {
   extractBvid,
   formatDuration,
   formatFileSize,
-  type PersistedVideoDescriptor,
+  type VideoTranscript,
   type VideoModelContext,
   type VideoSourceDescriptor,
   type VideoSummary,
@@ -25,32 +25,36 @@ import {
   askVideo,
 } from "@/lib/model-client";
 import {
-  LOCAL_VIDEO_PREPROCESSING_LIMITS,
-  extractVideoEvidence,
-  type VideoPreprocessingResult,
-  type VideoPreprocessingStage,
-} from "@/lib/client/video-preprocessor";
-import {
-  MAX_BILIBILI_BROWSER_BYTES,
   downloadBilibiliVideo,
-  isReusableBilibiliDownload,
+  extractBilibiliTranscript,
+  prepareBilibiliVideoDownload,
+  releaseBilibiliAnalysis,
   type BilibiliDownloadResult,
+  type BilibiliPreparedDownloadResult,
 } from "@/lib/client/bilibili-client";
 import {
+  extractMediaTranscript,
+  prepareMediaAnalysis,
+  releaseMediaAnalysis,
+} from "@/lib/client/media-analysis-client";
+import {
   appendConversationMessages,
-  conversationVideoUrl,
   createConversation,
   deleteConversation,
   getConversation,
   listConversations,
   renameConversation,
-  storeConversationVideo,
 } from "@/lib/client/conversation-client";
 import type {
   ConversationListItem,
   ConversationMessage,
 } from "@/lib/conversation";
-import UserSettingsMenu from "@/app/UserSettingsMenu";
+import UserSettingsMenu, {
+  DEFAULT_QWEN_DIRECT_SUMMARY_MAX_SECONDS,
+  parseUserPreferences,
+  USER_PREFERENCES_CHANGE_EVENT,
+  USER_PREFERENCES_STORAGE_KEY,
+} from "@/app/UserSettingsMenu";
 
 type InputMode = "upload" | "bilibili";
 type Phase = "idle" | "processing" | "ready" | "error";
@@ -59,18 +63,21 @@ interface SelectedVideo {
   file: File;
   objectUrl: string;
   duration?: number;
+  width?: number;
+  height?: number;
 }
 
 interface VideoPreview {
-  kind: "downloaded" | "local" | "remote" | "stored";
+  kind: "bilibili" | "local" | "remote";
   playbackUrl: string;
   filename: string;
   title?: string;
-  description: string;
+  description?: string;
   sizeLabel?: string;
   durationLabel?: string;
-  qualityLabel?: string;
+  resolutionLabel?: string;
   sourceLabel?: string;
+  durationSeconds?: number;
 }
 
 interface InlineNotice {
@@ -81,14 +88,10 @@ interface InlineNotice {
 type ChatMessage = Pick<ConversationMessage, "id" | "role" | "content">;
 
 const acceptedExtensions = ["mp4", "mov", "webm", "mkv", "m4v"];
-const preprocessingStageIndexes: Record<VideoPreprocessingStage, number> = {
-  "loading-engine": 1,
-  "extracting-audio": 2,
-  "extracting-frames": 3,
-};
-
 const suggestions = ["这个视频的核心观点是什么？", "按时间线梳理章节", "给我三个行动建议"];
 const SUMMARY_READY_MESSAGE = "总结生成完毕，我还可以继续和你讨论相关内容 : )";
+const MAX_MEDIA_ANALYSIS_BYTES = 500 * 1024 * 1024;
+const ANALYSIS_SETTINGS_STORAGE_KEY = "framenote.analysis-settings.v1";
 
 function fileExtension(filename: string) {
   return filename.split(".").pop()?.toLowerCase() ?? "";
@@ -161,15 +164,6 @@ function summaryTimeline(summary: VideoSummary) {
   }));
 }
 
-function videoMimeType(file: File) {
-  if (/^video\//i.test(file.type)) return file.type.split(";")[0];
-  const extension = fileExtension(file.name);
-  if (extension === "mov") return "video/quicktime";
-  if (extension === "webm") return "video/webm";
-  if (extension === "mkv") return "video/x-matroska";
-  return "video/mp4";
-}
-
 function timestampToSeconds(value: string) {
   const normalized = value.trim();
   const colonParts = normalized.split(":");
@@ -192,6 +186,32 @@ function timestampToSeconds(value: string) {
       Number(chinese[3] ?? 0);
   }
   return null;
+}
+
+function formatPlaybackTimestamp(totalSeconds: number) {
+  const seconds = Math.max(0, Math.floor(totalSeconds));
+  const hours = Math.floor(seconds / 3600);
+  const minutes = Math.floor((seconds % 3600) / 60);
+  const remainder = seconds % 60;
+  return hours > 0
+    ? [hours, minutes, remainder]
+        .map((part) => String(part).padStart(2, "0"))
+        .join(":")
+    : [minutes, remainder]
+        .map((part) => String(part).padStart(2, "0"))
+        .join(":");
+}
+
+function transcriptForConversationContext(transcript: VideoTranscript | null) {
+  if (!transcript || transcript.status !== "ready") return undefined;
+  const timedTranscript = transcript.cues
+    .map(
+      (cue) =>
+        `[${formatPlaybackTimestamp(cue.startSeconds)}] ${cue.text.trim()}`,
+    )
+    .filter((line) => line.trim())
+    .join("\n");
+  return timedTranscript || transcript.text.trim() || undefined;
 }
 
 function renderInlineMarkdown(value: string, keyPrefix: string): ReactNode[] {
@@ -254,44 +274,107 @@ function MarkdownMessage({ content }: { content: string }) {
   );
 }
 
-function bilibiliPreviewQualityLabel(result: BilibiliDownloadResult) {
-  const dimensions = result.width && result.height
-    ? `实际 ${result.width}×${result.height}`
-    : "实际分辨率未知";
-  return `${dimensions} · 最高兼容清晰度`;
+function bilibiliAnalysisLabel(result: BilibiliDownloadResult) {
+  return result.width && result.height
+    ? `分析素材 ${result.width}×${result.height}`
+    : "480p 等价分析素材";
+}
+
+function bilibiliPreviewResolutionLabel(
+  result: Pick<BilibiliPreparedDownloadResult, "width" | "height">,
+) {
+  return result.width && result.height ? `${result.width}x${result.height}` : undefined;
+}
+
+async function downloadRemoteVideoFile(url: string, signal?: AbortSignal) {
+  let response: Response;
+  try {
+    response = await fetch(url, {
+      signal,
+      credentials: "omit",
+      headers: { accept: "video/*,application/octet-stream" },
+    });
+  } catch (error) {
+    if (error instanceof DOMException && error.name === "AbortError") throw error;
+    throw new Error(
+      "浏览器无法读取这个 HTTPS 视频直链；请确认地址允许跨域访问。",
+    );
+  }
+  if (!response.ok) {
+    throw new Error(`视频直链下载失败（HTTP ${response.status}）。`);
+  }
+  const blob = await response.blob();
+  if (blob.size > MAX_MEDIA_ANALYSIS_BYTES) {
+    throw new Error(
+      "视频直链超过 500 MB 分析上限。",
+    );
+  }
+  return new File([blob], titleFromUrl(url), {
+    type: blob.type || "video/mp4",
+    lastModified: Date.now(),
+  });
+}
+
+function readVideoMetadata(file: File, signal?: AbortSignal) {
+  return new Promise<{ duration: number; width: number; height: number }>(
+    (resolve, reject) => {
+      const video = document.createElement("video");
+      const objectUrl = URL.createObjectURL(file);
+      const finish = (callback: () => void) => {
+        signal?.removeEventListener("abort", onAbort);
+        video.removeAttribute("src");
+        video.load();
+        URL.revokeObjectURL(objectUrl);
+        callback();
+      };
+      const onAbort = () =>
+        finish(() =>
+          reject(new DOMException("视频读取已取消。", "AbortError")),
+        );
+      video.preload = "metadata";
+      video.onloadedmetadata = () => {
+        const duration = video.duration;
+        const width = video.videoWidth;
+        const height = video.videoHeight;
+        finish(() =>
+          Number.isFinite(duration) && duration > 0 && width > 0 && height > 0
+            ? resolve({ duration, width, height })
+            : reject(new Error("无法读取视频时长。")),
+        );
+      };
+      video.onerror = () =>
+        finish(() => reject(new Error("浏览器无法读取视频时长。")));
+      signal?.addEventListener("abort", onAbort, { once: true });
+      if (signal?.aborted) {
+        onAbort();
+        return;
+      }
+      video.src = objectUrl;
+    },
+  );
 }
 
 function stagesFor(
   source: VideoSourceDescriptor,
-  reusesBilibiliVideo = false,
+  transcriptEnabled: boolean,
 ) {
-  if (source.kind === "upload") {
-    return [
-      "校验视频文件",
-      "加载本地媒体引擎",
-      "抽取并压缩音轨",
-      "提取代表性关键帧",
-      "Qwen 融合音轨与画面",
-      "生成结构化总结",
-    ];
-  }
-
-  if (source.kind === "url") {
-    return [
-      "校验视频直链",
-      "提交视频地址",
-      "读取视频媒体",
-      "Qwen 理解画面与声音",
-      "生成结构化总结",
-    ];
-  }
-
+  const firstStage =
+    source.kind === "upload"
+      ? "上传本地视频"
+      : source.kind === "url"
+        ? "读取 HTTPS 视频直链"
+        : "下载 B站分析视频";
   return [
-    "校验 B 站视频地址",
-    reusesBilibiliVideo ? "复用已获取的视频" : "下载并合并公开视频",
-    "压缩画面并提取音轨与关键帧",
-    "Qwen 融合声音与画面",
-    "生成结构化总结",
+    firstStage,
+    source.kind === "bilibili"
+      ? "准备约 480p 分析视频"
+      : "压缩为约 480p 分析视频",
+    "按时长准备完整视频或关键帧",
+    "Qwen 理解画面与声音",
+    ...(transcriptEnabled
+      ? ["FunASR Nano＋CT-Punc 提取字幕"]
+      : []),
+    "保存总结与对话",
   ];
 }
 
@@ -305,19 +388,20 @@ export default function VideoWorkbench() {
   const [processingStages, setProcessingStages] = useState<string[]>([]);
   const [stageIndex, setStageIndex] = useState(-1);
   const [stageProgress, setStageProgress] = useState(0);
-  const [preprocessingResult, setPreprocessingResult] =
-    useState<VideoPreprocessingResult | null>(null);
   const [notice, setNotice] = useState<InlineNotice | null>(null);
   const [isDragging, setIsDragging] = useState(false);
   const [messages, setMessages] = useState<ChatMessage[]>([]);
   const [question, setQuestion] = useState("");
   const [isReplying, setIsReplying] = useState(false);
   const [activeModel, setActiveModel] = useState<string | null>(null);
-  const [previewBilibiliVideo, setPreviewBilibiliVideo] =
-    useState<BilibiliDownloadResult | null>(null);
+  const [transcript, setTranscript] = useState<VideoTranscript | null>(null);
+  const [qwenDirectSummaryMaxSeconds, setQwenDirectSummaryMaxSeconds] =
+    useState(DEFAULT_QWEN_DIRECT_SUMMARY_MAX_SECONDS);
+  const [transcriptExtractionEnabled, setTranscriptExtractionEnabled] =
+    useState(true);
+  const [isAnalysisSettingsOpen, setIsAnalysisSettingsOpen] = useState(false);
   const [isFetchingVideo, setIsFetchingVideo] = useState(false);
   const [videoPreview, setVideoPreview] = useState<VideoPreview | null>(null);
-  const [videoPreviewFailed, setVideoPreviewFailed] = useState(false);
   const [conversationItems, setConversationItems] = useState<ConversationListItem[]>([]);
   const [activeConversationId, setActiveConversationId] = useState<string | null>(null);
   const [isConversationListLoading, setIsConversationListLoading] = useState(true);
@@ -340,10 +424,10 @@ export default function VideoWorkbench() {
   const conversationLoadAbortRef = useRef<AbortController | null>(null);
   const restoreConversationRef = useRef<(id: string) => void>(() => undefined);
   const hasRestoredConversationRef = useRef(false);
-  const downloadedVideoUrlRef = useRef<string | null>(null);
   const videoPlayerRef = useRef<HTMLVideoElement>(null);
   const sideVideoPreviewRef = useRef<HTMLDivElement>(null);
   const pendingSeekSecondsRef = useRef<number | null>(null);
+  const analysisSettingsRef = useRef<HTMLDivElement>(null);
 
   const bvid = useMemo(() => extractBvid(bilibiliInput), [bilibiliInput]);
   const directVideoUrl = useMemo(
@@ -358,6 +442,74 @@ export default function VideoWorkbench() {
     () => (summary ? summaryTimeline(summary) : []),
     [summary],
   );
+
+  useEffect(() => {
+    const readSetting = () => {
+      try {
+        setQwenDirectSummaryMaxSeconds(
+          parseUserPreferences(
+            window.localStorage.getItem(USER_PREFERENCES_STORAGE_KEY) ?? "",
+          ).qwenDirectSummaryMaxSeconds,
+        );
+      } catch {
+        setQwenDirectSummaryMaxSeconds(
+          DEFAULT_QWEN_DIRECT_SUMMARY_MAX_SECONDS,
+        );
+      }
+    };
+    const handleStorage = (event: StorageEvent) => {
+      if (
+        event.key === USER_PREFERENCES_STORAGE_KEY ||
+        event.key === null
+      ) {
+        readSetting();
+      }
+    };
+    readSetting();
+    window.addEventListener("storage", handleStorage);
+    window.addEventListener(USER_PREFERENCES_CHANGE_EVENT, readSetting);
+    return () => {
+      window.removeEventListener("storage", handleStorage);
+      window.removeEventListener(USER_PREFERENCES_CHANGE_EVENT, readSetting);
+    };
+  }, []);
+
+  useEffect(() => {
+    try {
+      const stored = window.localStorage.getItem(
+        ANALYSIS_SETTINGS_STORAGE_KEY,
+      );
+      if (stored) {
+        const parsed = JSON.parse(stored) as { transcriptExtraction?: unknown };
+        if (typeof parsed.transcriptExtraction === "boolean") {
+          setTranscriptExtractionEnabled(parsed.transcriptExtraction);
+        }
+      }
+    } catch {
+      setTranscriptExtractionEnabled(true);
+    }
+  }, []);
+
+  useEffect(() => {
+    if (!isAnalysisSettingsOpen) return;
+    const closeOnPointerDown = (event: PointerEvent) => {
+      if (
+        event.target instanceof Node &&
+        !analysisSettingsRef.current?.contains(event.target)
+      ) {
+        setIsAnalysisSettingsOpen(false);
+      }
+    };
+    const closeOnEscape = (event: KeyboardEvent) => {
+      if (event.key === "Escape") setIsAnalysisSettingsOpen(false);
+    };
+    document.addEventListener("pointerdown", closeOnPointerDown);
+    document.addEventListener("keydown", closeOnEscape);
+    return () => {
+      document.removeEventListener("pointerdown", closeOnPointerDown);
+      document.removeEventListener("keydown", closeOnEscape);
+    };
+  }, [isAnalysisSettingsOpen]);
 
   const pendingSource = useMemo<VideoSourceDescriptor | null>(() => {
     if (mode === "upload") {
@@ -374,7 +526,6 @@ export default function VideoWorkbench() {
           selectedVideo.file.size,
         )} · ${durationLabel}`,
         durationLabel,
-        downloadFirst: false,
       };
     }
 
@@ -384,7 +535,6 @@ export default function VideoWorkbench() {
         title: titleFromUrl(directVideoUrl),
         subtitle: "HTTPS 视频直链 · 由 Qwen 直接读取",
         sourceUrl: directVideoUrl,
-        downloadFirst: false,
       };
     }
 
@@ -396,7 +546,6 @@ export default function VideoWorkbench() {
       subtitle: "公开 UGC · 等待读取视频信息",
       bvid,
       sourceUrl: `https://www.bilibili.com/video/${bvid}`,
-      downloadFirst: true,
     };
   }, [bvid, directVideoUrl, mode, selectedVideo]);
 
@@ -405,15 +554,6 @@ export default function VideoWorkbench() {
       if (selectedVideo?.objectUrl) URL.revokeObjectURL(selectedVideo.objectUrl);
     };
   }, [selectedVideo?.objectUrl]);
-
-  useEffect(() => {
-    return () => {
-      if (downloadedVideoUrlRef.current) {
-        URL.revokeObjectURL(downloadedVideoUrlRef.current);
-        downloadedVideoUrlRef.current = null;
-      }
-    };
-  }, []);
 
   useEffect(() => {
     const controller = new AbortController();
@@ -465,6 +605,18 @@ export default function VideoWorkbench() {
     setNotice({ message, tone });
   }
 
+  function updateTranscriptExtraction(enabled: boolean) {
+    setTranscriptExtractionEnabled(enabled);
+    try {
+      window.localStorage.setItem(
+        ANALYSIS_SETTINGS_STORAGE_KEY,
+        JSON.stringify({ transcriptExtraction: enabled }),
+      );
+    } catch {
+      // 无法写入浏览器偏好时，本次会话中的设置仍然生效。
+    }
+  }
+
   function upsertConversationItem(item: ConversationListItem) {
     setConversationItems((current) =>
       [item, ...current.filter((conversation) => conversation.id !== item.id)].sort(
@@ -483,102 +635,65 @@ export default function VideoWorkbench() {
     );
   }
 
-  function releaseDownloadedVideoUrl() {
-    if (!downloadedVideoUrlRef.current) return;
-    URL.revokeObjectURL(downloadedVideoUrlRef.current);
-    downloadedVideoUrlRef.current = null;
-  }
-
   function clearVideoPreview() {
-    releaseDownloadedVideoUrl();
     setVideoPreview(null);
-    setVideoPreviewFailed(false);
   }
 
   function showRemoteVideo(url: string) {
-    releaseDownloadedVideoUrl();
     setVideoPreview({
       kind: "remote",
       playbackUrl: url,
       filename: titleFromUrl(url),
       title: titleFromUrl(url),
-      description: "播放器直接读取 HTTPS 视频直链；是否能保存由源站响应设置决定。",
       sourceLabel: "HTTPS 视频直链",
     });
-    setVideoPreviewFailed(false);
   }
 
   function showLocalVideo(video: SelectedVideo) {
-    releaseDownloadedVideoUrl();
     setVideoPreview({
       kind: "local",
       playbackUrl: video.objectUrl,
       filename: video.file.name,
       title: titleFromFilename(video.file.name),
-      description: "本地原视频已用于本次分析；总结保存后会同步保存到当前视频对话。",
       sizeLabel: formatFileSize(video.file.size),
       durationLabel: video.duration ? formatDuration(video.duration) : undefined,
+      durationSeconds: video.duration,
+      resolutionLabel:
+        video.width && video.height
+          ? `${video.width}x${video.height}`
+          : undefined,
       sourceLabel: "本地上传",
     });
-    setVideoPreviewFailed(false);
   }
 
-  function showStoredVideo(
-    conversationId: string,
-    video: PersistedVideoDescriptor,
+  function showBilibiliVideo(
+    result: BilibiliPreparedDownloadResult,
+    fallbackDescription?: string,
   ) {
-    releaseDownloadedVideoUrl();
-    const url = conversationVideoUrl(conversationId);
     setVideoPreview({
-      kind: "stored",
-      playbackUrl: url,
-      filename: video.filename,
-      title: video.title,
-      description: video.description,
-      sizeLabel: formatFileSize(video.sizeBytes),
-      durationLabel: video.durationLabel,
-      qualityLabel: video.qualityLabel,
-      sourceLabel: video.sourceLabel,
-    });
-    setVideoPreviewFailed(false);
-  }
-
-  function showDownloadedVideo(result: BilibiliDownloadResult) {
-    releaseDownloadedVideoUrl();
-    const objectUrl = URL.createObjectURL(result.file);
-    downloadedVideoUrlRef.current = objectUrl;
-    setVideoPreview({
-      kind: "downloaded",
-      playbackUrl: objectUrl,
-      filename: result.file.name || "bilibili-video.mp4",
+      kind: "bilibili",
+      playbackUrl: result.playbackUrl,
+      filename: result.filename || "bilibili-video.mp4",
       title: result.title,
-      description: "视频已下载并合并，可直接预览；AI 总结会复用此视频，并在分析前压缩画面、音轨与关键帧。",
+      description: result.description ?? fallbackDescription,
       sizeLabel: formatFileSize(result.sizeBytes),
       durationLabel: formatDuration(result.durationSeconds),
-      qualityLabel: bilibiliPreviewQualityLabel(result),
+      durationSeconds: result.durationSeconds,
+      resolutionLabel: bilibiliPreviewResolutionLabel(result),
       sourceLabel: result.bvid,
     });
-    setVideoPreviewFailed(false);
-  }
-
-  function clearDownloadedBilibiliState() {
-    setPreviewBilibiliVideo(null);
-    if (videoPreview?.kind === "downloaded") {
-      clearVideoPreview();
-    }
   }
 
   function selectMode(nextMode: InputMode) {
-    if (phase === "processing") return;
+    if (phase === "processing" || isFetchingVideo) return;
     setMode(nextMode);
     if (nextMode === "upload") {
-      setPreviewBilibiliVideo(null);
-      if (videoPreview?.kind === "downloaded") clearVideoPreview();
+      if (videoPreview?.kind === "bilibili") clearVideoPreview();
     }
     setNotice(null);
   }
 
-  function acceptFile(file: File) {
+  async function acceptFile(file: File) {
     if (phase === "processing") return;
     const extension = fileExtension(file.name);
 
@@ -587,25 +702,43 @@ export default function VideoWorkbench() {
       return;
     }
 
-    if (file.size > LOCAL_VIDEO_PREPROCESSING_LIMITS.maxSourceBytes) {
-      showNotice(
-        `浏览器本地处理暂时支持不超过 ${Math.round(
-          LOCAL_VIDEO_PREPROCESSING_LIMITS.maxSourceBytes / 1024 / 1024,
-        )} MB 的视频；更大文件请使用 HTTPS 视频直链。`,
-      );
+    if (file.size > MAX_MEDIA_ANALYSIS_BYTES) {
+      showNotice("当前视频分析支持不超过 500 MB 的文件。");
       return;
     }
 
     const objectUrl = URL.createObjectURL(file);
-    setSelectedVideo({ file, objectUrl });
-    setPreviewBilibiliVideo(null);
-    setPreprocessingResult(null);
+    const nextVideo: SelectedVideo = { file, objectUrl };
+    setSelectedVideo(nextVideo);
     setNotice(null);
+    try {
+      const metadata = await readVideoMetadata(file);
+      const hydratedVideo = { ...nextVideo, ...metadata };
+      setSelectedVideo((current) =>
+        current?.objectUrl === objectUrl ? hydratedVideo : current,
+      );
+      if (
+        phase === "ready" &&
+        activeConversationId &&
+        activeSource?.kind === "upload"
+      ) {
+        showLocalVideo(hydratedVideo);
+        showNotice("已选择本地视频，可预览并跳转时间点。", "success");
+      }
+    } catch (error) {
+      setSelectedVideo((current) =>
+        current?.objectUrl === objectUrl ? null : current,
+      );
+      URL.revokeObjectURL(objectUrl);
+      showNotice(
+        error instanceof Error ? error.message : "无法读取本地视频信息。",
+      );
+    }
   }
 
   function handleFileChange(event: ChangeEvent<HTMLInputElement>) {
     const file = event.target.files?.[0];
-    if (file) acceptFile(file);
+    if (file) void acceptFile(file);
     event.target.value = "";
   }
 
@@ -613,42 +746,164 @@ export default function VideoWorkbench() {
     event.preventDefault();
     setIsDragging(false);
     const file = event.dataTransfer.files?.[0];
-    if (file) acceptFile(file);
+    if (file) void acceptFile(file);
   }
 
-  async function fetchBilibiliDownload(
+  function reportAnalysisPreparationProgress(progress: {
+    stage: string;
+    progress: number;
+    phase?: string;
+  }) {
+    if (progress.stage === "uploading") {
+      setStageIndex(0);
+      setStageProgress((current) => Math.max(current, progress.progress));
+      return;
+    }
+    if (progress.stage === "downloading") {
+      setStageIndex(2);
+      setStageProgress(progress.progress);
+      return;
+    }
+    if (progress.phase === "analyzing") {
+      setStageIndex(2);
+      setStageProgress(
+        Math.min(1, Math.max(0.05, (progress.progress - 0.9) / 0.1)),
+      );
+      return;
+    }
+    if (progress.phase === "merging") {
+      setStageIndex(1);
+      setStageProgress(Math.min(1, progress.progress / 0.9));
+      return;
+    }
+    setStageIndex(0);
+    setStageProgress(Math.min(1, progress.progress));
+  }
+
+  async function downloadBilibiliAnalysis(
     source: VideoSourceDescriptor,
     controller: AbortController,
     runToken: number,
-    options: { showPreview?: boolean } = {},
   ) {
     if (!source.bvid) {
       throw new Error("没有可下载的 BV 号。");
     }
-    const cached = previewBilibiliVideo;
-    if (isReusableBilibiliDownload(cached, source.bvid)) {
-      if (options.showPreview && cached) showDownloadedVideo(cached);
-      return cached as BilibiliDownloadResult;
-    }
 
     const downloaded = await downloadBilibiliVideo(source.bvid, {
-      variant: "preview",
+      signal: controller.signal,
+      directSummaryMaxSeconds: qwenDirectSummaryMaxSeconds,
+      onProgress: ({ stage, progress, phase }) => {
+        if (runTokenRef.current !== runToken) return;
+        reportAnalysisPreparationProgress({ stage, progress, phase });
+      },
+    });
+    if (runTokenRef.current !== runToken) return null;
+    return downloaded;
+  }
+
+  async function prepareBilibiliPreview(
+    source: VideoSourceDescriptor,
+    controller: AbortController,
+    runToken: number,
+  ) {
+    if (!source.bvid) {
+      throw new Error("没有可获取的 BV 号。");
+    }
+
+    const prepared = await prepareBilibiliVideoDownload(source.bvid, {
       signal: controller.signal,
       onProgress: ({ stage, progress }) => {
         if (runTokenRef.current !== runToken) return;
         setStageIndex(1);
         setStageProgress(
           stage === "preparing"
-            ? Math.min(0.78, progress * 0.78)
-            : 0.78 + progress * 0.22,
+            ? Math.min(0.95, progress * 0.95)
+            : 1,
         );
       },
     });
     if (runTokenRef.current !== runToken) return null;
 
-    setPreviewBilibiliVideo(downloaded);
-    if (options.showPreview) showDownloadedVideo(downloaded);
-    return downloaded;
+    showBilibiliVideo(prepared, source.description);
+    return prepared;
+  }
+
+  async function loadBilibiliConversationPreview(
+    source: VideoSourceDescriptor,
+    restoredBvid: string,
+    runToken: number,
+    reason: "restore" | "first-summary",
+  ) {
+    const restoring = reason === "restore";
+    fetchVideoAbortRef.current?.abort();
+    const controller = new AbortController();
+    fetchVideoAbortRef.current = controller;
+    setIsFetchingVideo(true);
+    setProcessingStages(["校验 B 站视频地址", "准备最高画质浏览器预览"]);
+    setStageIndex(0);
+    setStageProgress(0.15);
+    showNotice(
+      restoring
+        ? "总结和对话已恢复，正在自动恢复视频预览……"
+        : "总结已生成，正在自动获取视频预览……",
+      "success",
+    );
+
+    try {
+      const prepared = await prepareBilibiliPreview(
+        { ...source, bvid: restoredBvid },
+        controller,
+        runToken,
+      );
+      if (
+        !prepared ||
+        fetchVideoAbortRef.current !== controller ||
+        runTokenRef.current !== runToken
+      ) {
+        return;
+      }
+      setActiveSource({
+        ...source,
+        bvid: prepared.bvid,
+        sourceUrl:
+          source.sourceUrl ?? `https://www.bilibili.com/video/${prepared.bvid}`,
+        title: prepared.title,
+        description: prepared.description ?? source.description,
+        durationLabel: formatDuration(prepared.durationSeconds),
+        subtitle: `${prepared.bvid} · ${formatFileSize(
+          prepared.sizeBytes,
+        )} · ${formatDuration(prepared.durationSeconds)}`,
+      });
+      setStageIndex(2);
+      setStageProgress(1);
+      showNotice(
+        restoring
+          ? "总结、对话和视频预览已恢复。"
+          : "总结已生成，视频预览已准备好。",
+        "success",
+      );
+    } catch (error) {
+      if (
+        fetchVideoAbortRef.current !== controller ||
+        runTokenRef.current !== runToken ||
+        (error instanceof DOMException && error.name === "AbortError")
+      ) {
+        return;
+      }
+      showNotice(
+        error instanceof Error
+          ? `${restoring ? "总结和对话已恢复" : "总结已生成"}，但视频预览自动获取失败：${error.message}`
+          : `${restoring ? "总结和对话已恢复" : "总结已生成"}，但视频预览自动获取失败。`,
+      );
+    } finally {
+      if (
+        fetchVideoAbortRef.current === controller &&
+        runTokenRef.current === runToken
+      ) {
+        fetchVideoAbortRef.current = null;
+        setIsFetchingVideo(false);
+      }
+    }
   }
 
   async function handleFetchVideo() {
@@ -662,76 +917,108 @@ export default function VideoWorkbench() {
     runTokenRef.current = runToken;
     fetchVideoAbortRef.current?.abort();
     analyzeAbortRef.current?.abort();
-    askAbortRef.current?.abort();
-    askAbortRef.current = null;
+    stopReply();
     const controller = new AbortController();
     fetchVideoAbortRef.current = controller;
+    const preservesConversation =
+      phase === "ready" &&
+      Boolean(summary) &&
+      Boolean(activeConversationId) &&
+      activeSource?.kind === pendingSource.kind &&
+      (pendingSource.kind === "bilibili"
+        ? activeSource.bvid === pendingSource.bvid
+        : pendingSource.kind === "url"
+          ? activeSource.sourceUrl === pendingSource.sourceUrl
+          : false);
 
     setNotice(null);
-    setSummary(null);
-    setActiveModel(null);
-    setMessages([]);
-    setActiveConversationId(null);
-    setPreprocessingResult(null);
-    setActiveSource(pendingSource);
+    if (!preservesConversation) {
+      setSummary(null);
+      setTranscript(null);
+      setActiveModel(null);
+      setMessages([]);
+      setActiveConversationId(null);
+      setActiveSource(pendingSource);
+    }
 
     if (pendingSource.kind === "url" && pendingSource.sourceUrl) {
       showRemoteVideo(pendingSource.sourceUrl);
-      setPhase("idle");
+      setPhase(preservesConversation ? "ready" : "idle");
       showNotice(
-        "视频直链已准备好，可预览；点击生成 AI 总结后再开始分析。",
+        preservesConversation
+          ? "总结、对话和视频直链已恢复。"
+          : "视频直链已准备好，可预览；点击生成 AI 总结后再开始分析。",
         "success",
       );
-      if (fetchVideoAbortRef.current === controller) fetchVideoAbortRef.current = null;
+      if (fetchVideoAbortRef.current === controller) {
+        fetchVideoAbortRef.current = null;
+      }
       return;
     }
 
-    const stages = ["校验 B 站视频地址", "下载并合并公开视频"];
+    if (!pendingSource.bvid) {
+      showNotice("没有识别到可播放的 BV 号。");
+      if (fetchVideoAbortRef.current === controller) {
+        fetchVideoAbortRef.current = null;
+      }
+      return;
+    }
+
+    const stages = ["校验 B 站视频地址", "准备最高画质浏览器预览"];
     setIsFetchingVideo(true);
-    setPhase("processing");
+    if (!preservesConversation) setPhase("processing");
     setProcessingStages(stages);
     setStageIndex(0);
     setStageProgress(0.15);
+    if (!preservesConversation) clearVideoPreview();
 
     try {
-      const downloaded = await fetchBilibiliDownload(
+      const prepared = await prepareBilibiliPreview(
         pendingSource,
         controller,
         runToken,
-        { showPreview: true },
       );
-      if (!downloaded || runTokenRef.current !== runToken) return;
-      setActiveSource({
-        ...pendingSource,
-        title: downloaded.title,
-        durationLabel: formatDuration(downloaded.durationSeconds),
-        subtitle: `${downloaded.bvid} · ${formatFileSize(
-          downloaded.sizeBytes,
-        )} · ${formatDuration(downloaded.durationSeconds)} · ${bilibiliPreviewQualityLabel(
-          downloaded,
-        )}`,
-      });
+      if (!prepared || runTokenRef.current !== runToken) return;
+
+      const preparedSource: VideoSourceDescriptor = {
+        ...(preservesConversation && activeSource ? activeSource : pendingSource),
+        title: prepared.title,
+        description: prepared.description ?? pendingSource.description,
+        durationLabel: formatDuration(prepared.durationSeconds),
+        subtitle: `${prepared.bvid} · ${formatFileSize(
+          prepared.sizeBytes,
+        )} · ${formatDuration(prepared.durationSeconds)}`,
+      };
+      setActiveSource(preparedSource);
+
       setStageIndex(stages.length);
       setStageProgress(1);
-      setPhase("idle");
+      setPhase(preservesConversation ? "ready" : "idle");
       showNotice(
-        "视频已获取，可预览或下载；点击生成 AI 总结后再开始分析。",
+        preservesConversation
+          ? "总结、对话和视频预览已恢复。"
+          : "视频预览已准备好。",
         "success",
       );
     } catch (error) {
       if (runTokenRef.current !== runToken) return;
       if (error instanceof DOMException && error.name === "AbortError") return;
-      setPhase("error");
+      setPhase(preservesConversation ? "ready" : "error");
       showNotice(
         error instanceof Error ? error.message : "获取视频失败，请检查链接后重试。",
       );
     } finally {
-      if (fetchVideoAbortRef.current === controller) fetchVideoAbortRef.current = null;
-      if (runTokenRef.current === runToken) setIsFetchingVideo(false);
+      if (fetchVideoAbortRef.current === controller) {
+        fetchVideoAbortRef.current = null;
+      }
+      if (runTokenRef.current === runToken) {
+        setIsFetchingVideo(false);
+      }
     }
   }
 
   async function handleAnalyze() {
+    if (isFetchingVideo) return;
     if (!pendingSource) {
       showNotice(
         mode === "upload"
@@ -744,24 +1031,16 @@ export default function VideoWorkbench() {
     const runToken = runTokenRef.current + 1;
     runTokenRef.current = runToken;
     analyzeAbortRef.current?.abort();
-    fetchVideoAbortRef.current?.abort();
-    fetchVideoAbortRef.current = null;
-    setIsFetchingVideo(false);
-    askAbortRef.current?.abort();
-    askAbortRef.current = null;
-    pendingReplyRef.current = null;
+    stopReply();
     const controller = new AbortController();
     analyzeAbortRef.current = controller;
-    const reusableBilibiliVideo =
-      pendingSource.kind === "bilibili" &&
-      isReusableBilibiliDownload(previewBilibiliVideo, pendingSource.bvid)
-        ? previewBilibiliVideo
-        : null;
-    const stages = stagesFor(pendingSource, Boolean(reusableBilibiliVideo));
+    const stages = stagesFor(pendingSource, transcriptExtractionEnabled);
 
     setNotice(null);
+    setIsAnalysisSettingsOpen(false);
     setPhase("processing");
     setSummary(null);
+    setTranscript(null);
     setActiveModel(null);
     setMessages([]);
     setActiveConversationId(null);
@@ -769,92 +1048,110 @@ export default function VideoWorkbench() {
     setProcessingStages(stages);
     setStageIndex(0);
     setStageProgress(0.2);
-    setPreprocessingResult(null);
     if (pendingSource.kind === "url" && pendingSource.sourceUrl) {
       showRemoteVideo(pendingSource.sourceUrl);
     } else if (pendingSource.kind === "upload") {
       if (selectedVideo) showLocalVideo(selectedVideo);
     }
 
+    let bilibiliAnalysisJobId: string | null = null;
+    let mediaAnalysisJobId: string | null = null;
+    let analysisTranscript: VideoTranscript | null = null;
     try {
       let context: VideoModelContext;
       let analysisSource = pendingSource;
-      let analyzedBilibiliVideo: BilibiliDownloadResult | null = null;
       if (pendingSource.kind === "upload") {
-        if (!selectedVideo?.duration) {
-          throw new Error("尚未读取到视频时长，请稍后重试。");
+        if (!selectedVideo) {
+          throw new Error("请重新选择需要分析的本地视频。");
         }
-        const extracted = await extractVideoEvidence(selectedVideo.file, {
-          durationSeconds: selectedVideo.duration,
+        const prepared = await prepareMediaAnalysis(selectedVideo.file, {
+          sourceKind: "upload",
+          directSummaryMaxSeconds: qwenDirectSummaryMaxSeconds,
           signal: controller.signal,
-          onProgress: ({ stage, progress }) => {
+          onProgress: (progress) => {
             if (runTokenRef.current !== runToken) return;
-            setStageIndex(preprocessingStageIndexes[stage]);
-            setStageProgress(progress);
+            reportAnalysisPreparationProgress(progress);
           },
         });
-        context = extracted.context;
-        setPreprocessingResult(extracted);
+        mediaAnalysisJobId = prepared.jobId;
+        context = prepared.context;
+        analysisTranscript = prepared.transcript ?? null;
+        analysisSource = {
+          ...pendingSource,
+          title: titleFromFilename(selectedVideo.file.name),
+          durationLabel: formatDuration(prepared.durationSeconds),
+        };
+        setActiveSource(analysisSource);
       } else if (pendingSource.kind === "bilibili") {
         if (!pendingSource.bvid) {
           throw new Error("没有可下载的 BV 号。");
         }
         setStageIndex(1);
         setStageProgress(0);
-        if (reusableBilibiliVideo) {
-          setStageProgress(1);
-        }
-        const downloaded = reusableBilibiliVideo ?? await fetchBilibiliDownload(
+        const downloaded = await downloadBilibiliAnalysis(
           pendingSource,
           controller,
           runToken,
         );
         if (!downloaded) return;
+        bilibiliAnalysisJobId = downloaded.jobId;
         if (runTokenRef.current !== runToken) return;
-        analyzedBilibiliVideo = downloaded;
 
         analysisSource = {
           ...pendingSource,
           title: downloaded.title,
+          description: downloaded.description ?? pendingSource.description,
           durationLabel: formatDuration(downloaded.durationSeconds),
           subtitle: `${downloaded.bvid} · ${formatFileSize(
             downloaded.sizeBytes,
-          )} · ${formatDuration(downloaded.durationSeconds)} · ${bilibiliPreviewQualityLabel(
+          )} · ${formatDuration(downloaded.durationSeconds)} · ${bilibiliAnalysisLabel(
             downloaded,
-          )} · 分析时压缩画面`,
+          )}`,
         };
         setActiveSource(analysisSource);
+        analysisTranscript = downloaded.transcript ?? null;
+        setTranscript(analysisTranscript);
         setStageIndex(2);
-        setStageProgress(0);
-        const extracted = await extractVideoEvidence(downloaded.file, {
+        setStageProgress(1);
+        context = {
+          ...downloaded.context,
           durationSeconds: downloaded.durationSeconds,
-          requireAudio: true,
-          signal: controller.signal,
-          onProgress: ({ stage, progress }) => {
-            if (runTokenRef.current !== runToken) return;
-            setStageIndex(2);
-            if (stage === "loading-engine") {
-              setStageProgress(progress * 0.1);
-            } else if (stage === "extracting-audio") {
-              setStageProgress(0.1 + progress * 0.45);
-            } else {
-              setStageProgress(0.55 + progress * 0.45);
-            }
-          },
-        });
-        context = extracted.context;
-        setPreprocessingResult(extracted);
+        };
       } else {
         const videoUrl = pendingSource.sourceUrl;
         if (!videoUrl) throw new Error("没有可提交给模型的视频输入。");
-        setStageIndex(1);
-        setStageProgress(1);
-        setStageIndex(2);
-        setStageProgress(1);
-        context = { videoUrl, fps: 0.5 };
+        setStageIndex(0);
+        setStageProgress(0.1);
+        const remoteFile = await downloadRemoteVideoFile(
+          videoUrl,
+          controller.signal,
+        );
+        setStageProgress(0.45);
+        const prepared = await prepareMediaAnalysis(remoteFile, {
+          sourceKind: "url",
+          sourceUrl: videoUrl,
+          directSummaryMaxSeconds: qwenDirectSummaryMaxSeconds,
+          signal: controller.signal,
+          onProgress: (progress) => {
+            if (runTokenRef.current !== runToken) return;
+            reportAnalysisPreparationProgress(progress);
+          },
+        });
+        mediaAnalysisJobId = prepared.jobId;
+        context = prepared.context;
+        analysisTranscript = prepared.transcript ?? null;
+        analysisSource = {
+          ...pendingSource,
+          title: prepared.title || pendingSource.title,
+          durationLabel: formatDuration(prepared.durationSeconds),
+          subtitle: `HTTPS 视频直链 · ${formatDuration(
+            prepared.durationSeconds,
+          )}`,
+        };
+        setActiveSource(analysisSource);
       }
       if (runTokenRef.current !== runToken) return;
-      setStageIndex(stages.length - 2);
+      setStageIndex(3);
       setStageProgress(0.15);
       const result = await analyzeVideo(
         {
@@ -865,8 +1162,30 @@ export default function VideoWorkbench() {
       );
       if (runTokenRef.current !== runToken) return;
 
-      setStageIndex(stages.length - 1);
       setStageProgress(1);
+      if (transcriptExtractionEnabled) {
+        setStageIndex(4);
+        setStageProgress(0.1);
+        if (bilibiliAnalysisJobId) {
+          analysisTranscript = await extractBilibiliTranscript(
+            bilibiliAnalysisJobId,
+            controller.signal,
+          );
+        } else if (mediaAnalysisJobId) {
+          analysisTranscript = await extractMediaTranscript(
+            mediaAnalysisJobId,
+            controller.signal,
+          );
+        }
+        if (runTokenRef.current !== runToken) return;
+        setTranscript(analysisTranscript);
+        setStageProgress(1);
+      } else {
+        analysisTranscript = null;
+        setTranscript(null);
+      }
+      setStageIndex(stages.length - 1);
+      setStageProgress(0.2);
       setSummary(result.summary);
       setActiveModel(result.model);
       const initialMessage: ChatMessage = {
@@ -882,60 +1201,13 @@ export default function VideoWorkbench() {
           summary: result.summary,
           activeModel: result.model,
           messages: [{ role: initialMessage.role, content: initialMessage.content }],
+          ...(analysisTranscript ? { transcript: analysisTranscript } : {}),
         });
         if (runTokenRef.current !== runToken) return;
         setActiveConversationId(saved.id);
         upsertConversationItem(saved);
         setConversationListError(null);
-
-        const bilibiliVideo =
-          analysisSource.kind === "bilibili"
-            ? previewBilibiliVideo ?? analyzedBilibiliVideo
-            : null;
-        const videoFile =
-          analysisSource.kind === "upload"
-            ? selectedVideo?.file ?? null
-            : bilibiliVideo?.file ?? null;
-        if (videoFile) {
-          if (bilibiliVideo && !videoPreview) showDownloadedVideo(bilibiliVideo);
-          const persistedVideo: PersistedVideoDescriptor = {
-            filename: videoFile.name || "video.mp4",
-            mimeType: videoMimeType(videoFile),
-            sizeBytes: videoFile.size,
-            title: analysisSource.title,
-            description:
-              analysisSource.kind === "bilibili"
-                ? "该视频已随对话保存，可直接预览、下载，并可通过总结时间点跳转。"
-                : "本地原视频已随对话保存，可直接预览、下载，并可通过总结时间点跳转。",
-            durationLabel:
-              bilibiliVideo
-                ? formatDuration(bilibiliVideo.durationSeconds)
-                : selectedVideo?.duration
-                  ? formatDuration(selectedVideo.duration)
-                  : analysisSource.durationLabel,
-            qualityLabel: bilibiliVideo
-              ? bilibiliPreviewQualityLabel(bilibiliVideo)
-              : undefined,
-            sourceLabel: bilibiliVideo?.bvid ?? "本地上传",
-          };
-          try {
-            const storedSource = await storeConversationVideo(
-              saved.id,
-              videoFile,
-              persistedVideo,
-              controller.signal,
-            );
-            if (runTokenRef.current !== runToken) return;
-            setActiveSource(storedSource);
-          } catch (videoSaveError) {
-            if (runTokenRef.current !== runToken) return;
-            setConversationListError(
-              videoSaveError instanceof Error
-                ? `总结已保存，但视频持久化失败：${videoSaveError.message}`
-                : "总结已保存，但视频持久化失败。",
-            );
-          }
-        }
+        setStageProgress(1);
       } catch (saveError) {
         if (runTokenRef.current !== runToken) return;
         setConversationListError(
@@ -945,7 +1217,23 @@ export default function VideoWorkbench() {
         );
       }
       if (runTokenRef.current !== runToken) return;
+      setStageProgress(1);
       setPhase("ready");
+      if (
+        analysisSource.kind === "bilibili" &&
+        analysisSource.bvid &&
+        !(
+          videoPreview?.kind === "bilibili" &&
+          videoPreview.sourceLabel === analysisSource.bvid
+        )
+      ) {
+        void loadBilibiliConversationPreview(
+          analysisSource,
+          analysisSource.bvid,
+          runToken,
+          "first-summary",
+        );
+      }
     } catch (error) {
       if (runTokenRef.current !== runToken) return;
       if (error instanceof DOMException && error.name === "AbortError") return;
@@ -956,6 +1244,12 @@ export default function VideoWorkbench() {
           : "处理没有完成，请检查素材后重试。",
       );
     } finally {
+      if (bilibiliAnalysisJobId) {
+        void releaseBilibiliAnalysis(bilibiliAnalysisJobId);
+      }
+      if (mediaAnalysisJobId) {
+        void releaseMediaAnalysis(mediaAnalysisJobId);
+      }
       if (analyzeAbortRef.current === controller) analyzeAbortRef.current = null;
     }
   }
@@ -973,13 +1267,12 @@ export default function VideoWorkbench() {
     conversationLoadAbortRef.current = null;
     setPhase("idle");
     setSummary(null);
+    setTranscript(null);
     setActiveModel(null);
     setActiveSource(null);
     setProcessingStages([]);
     setStageIndex(-1);
     setStageProgress(0);
-    setPreprocessingResult(null);
-    setPreviewBilibiliVideo(null);
     setIsFetchingVideo(false);
     clearVideoPreview();
     setMessages([]);
@@ -995,10 +1288,22 @@ export default function VideoWorkbench() {
   }
 
   async function handleSelectConversation(id: string) {
-    if (phase === "processing" || busyConversationId || loadingConversationId === id) {
+    if (
+      phase === "processing" ||
+      busyConversationId ||
+      loadingConversationId === id
+    ) {
       return;
     }
 
+    const runToken = runTokenRef.current + 1;
+    runTokenRef.current = runToken;
+    analyzeAbortRef.current?.abort();
+    analyzeAbortRef.current = null;
+    fetchVideoAbortRef.current?.abort();
+    fetchVideoAbortRef.current = null;
+    setIsFetchingVideo(false);
+    stopReply();
     conversationLoadAbortRef.current?.abort();
     const controller = new AbortController();
     conversationLoadAbortRef.current = controller;
@@ -1007,19 +1312,16 @@ export default function VideoWorkbench() {
 
     try {
       const conversation = await getConversation(id, controller.signal);
-      if (conversationLoadAbortRef.current !== controller) return;
+      if (
+        conversationLoadAbortRef.current !== controller ||
+        runTokenRef.current !== runToken
+      ) {
+        return;
+      }
 
-      runTokenRef.current += 1;
-      analyzeAbortRef.current?.abort();
-      analyzeAbortRef.current = null;
-      fetchVideoAbortRef.current?.abort();
-      fetchVideoAbortRef.current = null;
-      askAbortRef.current?.abort();
-      askAbortRef.current = null;
-      pendingReplyRef.current = null;
-      setIsFetchingVideo(false);
       setPhase("ready");
       setSummary(conversation.summary);
+      setTranscript(conversation.transcript ?? null);
       setActiveModel(conversation.activeModel);
       setActiveSource(conversation.source);
       setActiveConversationId(conversation.id);
@@ -1033,41 +1335,42 @@ export default function VideoWorkbench() {
       setProcessingStages([]);
       setStageIndex(-1);
       setStageProgress(0);
-      setPreprocessingResult(null);
-      setPreviewBilibiliVideo(null);
       setSelectedVideo(null);
       setQuestion("");
       setIsReplying(false);
+      setIsFetchingVideo(false);
       upsertConversationItem(conversation);
 
-      if (conversation.source.persistedVideo) {
-        setMode(conversation.source.kind === "upload" ? "upload" : "bilibili");
+      if (conversation.source.kind === "bilibili") {
+        const restoredBvid =
+          conversation.source.bvid ??
+          extractBvid(conversation.source.sourceUrl ?? "");
+        setMode("bilibili");
         setBilibiliInput(
           conversation.source.bvid ?? conversation.source.sourceUrl ?? "",
         );
-        showStoredVideo(conversation.id, conversation.source.persistedVideo);
-        setNotice(null);
+        clearVideoPreview();
+        if (restoredBvid) {
+          void loadBilibiliConversationPreview(
+            conversation.source,
+            restoredBvid,
+            runToken,
+            "restore",
+          );
+        } else {
+          showNotice("已恢复总结和对话，但无法识别原视频的 BV 号。");
+        }
       } else if (conversation.source.kind === "url" && conversation.source.sourceUrl) {
         setMode("bilibili");
         setBilibiliInput(conversation.source.sourceUrl);
         showRemoteVideo(conversation.source.sourceUrl);
         setNotice(null);
-      } else if (conversation.source.kind === "bilibili") {
-        setMode("bilibili");
-        setBilibiliInput(
-          conversation.source.bvid ?? conversation.source.sourceUrl ?? "",
-        );
-        clearVideoPreview();
-        showNotice(
-          "总结和对话已恢复；这个旧对话没有保存视频，如需预览请重新获取。",
-          "success",
-        );
       } else {
         setMode("upload");
         setBilibiliInput("");
         clearVideoPreview();
         showNotice(
-          "总结和对话已恢复；这个旧对话没有保存本地原视频。",
+          "总结和对话已恢复；本地原视频不会保存，请重新选择视频后再预览或分析。",
           "success",
         );
       }
@@ -1155,11 +1458,19 @@ export default function VideoWorkbench() {
     setIsReplying(true);
 
     try {
+      const transcriptContext = transcriptForConversationContext(transcript);
       const result = await askVideo(
         {
           question: trimmed,
           source: activeSource,
           summary,
+          ...(transcriptContext
+            ? {
+                context: {
+                  transcript: transcriptContext,
+                },
+              }
+            : {}),
           history: messages.slice(-12).map(({ role, content }) => ({ role, content })),
         },
         controller.signal,
@@ -1268,15 +1579,29 @@ export default function VideoWorkbench() {
   const canFetchVideo =
     mode === "bilibili" && pendingSource !== null && pendingSource.kind !== "upload";
   const fetchVideoLabel = directVideoUrl ? "预览视频" : "获取视频";
+  const isRestoredLocalConversation =
+    phase === "ready" &&
+    Boolean(activeConversationId) &&
+    activeSource?.kind === "upload";
 
   function seekToTimeline(time: string) {
     const seconds = timestampToSeconds(time);
+    if (seconds === null || !videoPreview) return;
+    seekToSeconds(seconds);
+  }
+
+  function seekToSeconds(seconds: number) {
+    if (!videoPreview) return;
     const player = videoPlayerRef.current;
-    if (seconds === null || !player || !videoPreview) return;
+    if (!player) return;
     if (player.readyState >= HTMLMediaElement.HAVE_METADATA) {
-      player.currentTime = Math.min(seconds, Number.isFinite(player.duration)
-        ? Math.max(0, player.duration - 0.05)
-        : seconds);
+      if (
+        Number.isFinite(player.duration) &&
+        (seconds < 0 || seconds >= player.duration)
+      ) {
+        return;
+      }
+      player.currentTime = seconds;
       void player.play().catch(() => undefined);
     } else {
       pendingSeekSecondsRef.current = seconds;
@@ -1293,38 +1618,21 @@ export default function VideoWorkbench() {
     if (!videoPreview) return null;
     const details = (
       <div className="video-preview-details">
-        <span className="video-ready-label">
-          {videoPreview.kind === "stored"
-            ? "视频已随对话保存"
-            : videoPreview.kind === "downloaded"
-              ? "视频已下载并合并"
-              : videoPreview.kind === "local"
-                ? "本地视频已就绪"
-                : "HTTPS 视频直链已就绪"}
-        </span>
         <strong>{videoPreview.title ?? videoPreview.filename}</strong>
         <div className="video-preview-meta" aria-label="视频信息">
           {videoPreview.sourceLabel ? <span>{videoPreview.sourceLabel}</span> : null}
-          {videoPreview.qualityLabel ? <span>{videoPreview.qualityLabel}</span> : null}
           {videoPreview.sizeLabel ? <span>{videoPreview.sizeLabel}</span> : null}
           {videoPreview.durationLabel ? <span>{videoPreview.durationLabel}</span> : null}
+          {videoPreview.resolutionLabel ? <span>{videoPreview.resolutionLabel}</span> : null}
         </div>
-        <p>
-          {videoPreviewFailed
-            ? "浏览器无法直接预览，可以尝试打开视频源地址。"
-            : videoPreview.description}
-        </p>
-        {videoPreview.kind === "remote" ? (
-          <div className="video-preview-actions">
-            <a
-              className="video-source-action"
-              href={videoPreview.playbackUrl}
-              target="_blank"
-              rel="noreferrer"
-            >
-              打开源地址 ↗
-            </a>
-          </div>
+        {placement === "side" && videoPreview.kind === "local" ? (
+          <button
+            className="video-preview-change"
+            type="button"
+            onClick={() => fileInputRef.current?.click()}
+          >
+            更改
+          </button>
         ) : null}
       </div>
     );
@@ -1338,18 +1646,34 @@ export default function VideoWorkbench() {
           preload="metadata"
           tabIndex={-1}
           onLoadedMetadata={(event) => {
-            setVideoPreviewFailed(false);
+            const duration = event.currentTarget.duration;
+            if (
+              videoPreview.kind === "remote" &&
+              Number.isFinite(duration) &&
+              duration > 0
+            ) {
+              setVideoPreview((current) =>
+                current?.kind === "remote"
+                  ? {
+                      ...current,
+                      durationSeconds: duration,
+                      durationLabel: formatDuration(duration),
+                    }
+                  : current,
+              );
+            }
             const pendingSeconds = pendingSeekSecondsRef.current;
             if (pendingSeconds !== null) {
-              event.currentTarget.currentTime = Math.min(
-                pendingSeconds,
-                Math.max(0, event.currentTarget.duration - 0.05),
-              );
               pendingSeekSecondsRef.current = null;
-              void event.currentTarget.play().catch(() => undefined);
+              if (
+                pendingSeconds >= 0 &&
+                pendingSeconds < event.currentTarget.duration
+              ) {
+                event.currentTarget.currentTime = pendingSeconds;
+                void event.currentTarget.play().catch(() => undefined);
+              }
             }
           }}
-          onError={() => setVideoPreviewFailed(true)}
         >
           当前浏览器无法播放这个视频。
         </video>
@@ -1363,7 +1687,59 @@ export default function VideoWorkbench() {
       >
         {placement === "side" ? details : player}
         {placement === "side" ? player : details}
+        {placement === "conversation" && videoPreview.description ? (
+          <section className="video-preview-description" aria-labelledby="preview-description-title">
+            <h3 id="preview-description-title">视频简介</h3>
+            {summaryParagraphs(videoPreview.description).map((paragraph, index) => (
+              <p key={`preview-description-${index}`}>{paragraph}</p>
+            ))}
+          </section>
+        ) : null}
       </section>
+    );
+  }
+
+  function renderAnalysisSettings() {
+    return (
+      <div className="analysis-settings" ref={analysisSettingsRef}>
+        <button
+          className="analysis-settings-button"
+          type="button"
+          aria-label="视频分析设置"
+          aria-haspopup="dialog"
+          aria-expanded={isAnalysisSettingsOpen}
+          disabled={phase === "processing" || isFetchingVideo}
+          onClick={() => setIsAnalysisSettingsOpen((current) => !current)}
+        >
+          ⚙
+        </button>
+        {isAnalysisSettingsOpen ? (
+          <section
+            className="analysis-settings-popover"
+            role="dialog"
+            aria-label="视频分析设置"
+          >
+            <div>
+              <strong>视频分析设置</strong>
+              <span>只影响下一次生成的总结</span>
+            </div>
+            <label className="analysis-setting-row">
+              <span>
+                <strong>字幕提取</strong>
+                <small>FunASR Nano＋CT-Punc</small>
+              </span>
+              <input
+                type="checkbox"
+                checked={transcriptExtractionEnabled}
+                onChange={(event) =>
+                  updateTranscriptExtraction(event.target.checked)
+                }
+              />
+              <i aria-hidden="true" />
+            </label>
+          </section>
+        ) : null}
+      </div>
     );
   }
 
@@ -1400,7 +1776,7 @@ export default function VideoWorkbench() {
                 type="button"
                 role="tab"
                 aria-selected={mode === "upload"}
-                disabled={phase === "processing"}
+                disabled={phase === "processing" || isFetchingVideo}
                 onClick={() => selectMode("upload")}
               >
                 <span aria-hidden="true">↥</span>
@@ -1411,7 +1787,7 @@ export default function VideoWorkbench() {
                 type="button"
                 role="tab"
                 aria-selected={mode === "bilibili"}
-                disabled={phase === "processing"}
+                disabled={phase === "processing" || isFetchingVideo}
                 onClick={() => selectMode("bilibili")}
               >
                 <span aria-hidden="true">BV</span>
@@ -1447,9 +1823,7 @@ export default function VideoWorkbench() {
                     </span>
                     <strong>拖放视频到这里</strong>
                     <p>
-                      MP4、MOV、WebM、MKV、M4V · 浏览器本地抽取音轨与关键帧 · ≤ {Math.round(
-                        LOCAL_VIDEO_PREPROCESSING_LIMITS.maxSourceBytes / 1024 / 1024,
-                      )} MB
+                      MP4、MOV、WebM、MKV、M4V · 自动生成低分辨率分析素材 · ≤ 500 MB
                     </p>
                     <button
                       type="button"
@@ -1468,8 +1842,12 @@ export default function VideoWorkbench() {
                         muted
                         onLoadedMetadata={(event) => {
                           const duration = event.currentTarget.duration;
+                          const width = event.currentTarget.videoWidth;
+                          const height = event.currentTarget.videoHeight;
                           setSelectedVideo((current) =>
-                            current ? { ...current, duration } : current,
+                            current
+                              ? { ...current, duration, width, height }
+                              : current,
                           );
                         }}
                       />
@@ -1482,6 +1860,9 @@ export default function VideoWorkbench() {
                         {selectedVideo.duration
                           ? formatDuration(selectedVideo.duration)
                           : "正在读取时长"}
+                        {selectedVideo.width && selectedVideo.height
+                          ? ` · ${selectedVideo.width}x${selectedVideo.height}`
+                          : ""}
                       </span>
                     </div>
                     <button
@@ -1512,7 +1893,7 @@ export default function VideoWorkbench() {
                     disabled={phase === "processing" || isFetchingVideo}
                     onChange={(event) => {
                       setBilibiliInput(event.target.value);
-                      clearDownloadedBilibiliState();
+                      clearVideoPreview();
                       setNotice(null);
                     }}
                     placeholder="BV... 或 https://example.com/video.mp4"
@@ -1527,13 +1908,7 @@ export default function VideoWorkbench() {
                 </div>
                 {bilibiliInput && !bvid && !directVideoUrl ? (
                   <p className="field-error">没有识别到 BV 号或受支持的 HTTPS 视频直链。</p>
-                ) : (
-                  <p className="field-help">
-                    视频直链可直接调用 Qwen；B站仅处理你有权分析的公开 UGC，当前上限 {Math.round(
-                      MAX_BILIBILI_BROWSER_BYTES / 1024 / 1024,
-                    )} MB。
-                  </p>
-                )}
+                ) : null}
 
               </div>
             )}
@@ -1564,7 +1939,7 @@ export default function VideoWorkbench() {
                   ) : (
                     <>
                       {fetchVideoLabel}
-                      <span aria-hidden="true">↧</span>
+                      <span aria-hidden="true">▶</span>
                     </>
                   )}
                 </button>
@@ -1574,7 +1949,7 @@ export default function VideoWorkbench() {
                   disabled={!pendingSource || phase === "processing" || isFetchingVideo}
                   onClick={() => void handleAnalyze()}
                 >
-                  {phase === "processing" && !isFetchingVideo ? (
+                  {phase === "processing" ? (
                     <>
                       <span className="button-spinner" aria-hidden="true" />
                       正在理解视频
@@ -1586,27 +1961,31 @@ export default function VideoWorkbench() {
                     </>
                   )}
                 </button>
+                {renderAnalysisSettings()}
               </div>
-            ) : (
-              <button
-                className="primary-action"
-                type="button"
-                disabled={!pendingSource || phase === "processing" || isFetchingVideo}
-                onClick={() => void handleAnalyze()}
-              >
-                {phase === "processing" ? (
-                  <>
-                    <span className="button-spinner" aria-hidden="true" />
-                    正在理解视频
-                  </>
-                ) : (
-                  <>
-                    生成 AI 总结
-                    <span aria-hidden="true">→</span>
-                  </>
-                )}
-              </button>
-            )}
+            ) : !isRestoredLocalConversation ? (
+              <div className="source-action-row upload-action-row">
+                <button
+                  className="primary-action source-action-primary"
+                  type="button"
+                  disabled={!pendingSource || phase === "processing"}
+                  onClick={() => void handleAnalyze()}
+                >
+                  {phase === "processing" ? (
+                    <>
+                      <span className="button-spinner" aria-hidden="true" />
+                      正在理解视频
+                    </>
+                  ) : (
+                    <>
+                      生成 AI 总结
+                      <span aria-hidden="true">→</span>
+                    </>
+                  )}
+                </button>
+                {renderAnalysisSettings()}
+              </div>
+            ) : null}
 
             {phase === "ready" && videoPreview ? (
               <div className="side-video-context" ref={sideVideoPreviewRef}>
@@ -1749,17 +2128,21 @@ export default function VideoWorkbench() {
         <section className="conversation-panel" aria-labelledby="conversation-title">
           <div className="conversation-header">
             <div>
-              <span className="panel-kicker">视频总结对话</span>
               <h2 id="conversation-title">
                 {activeConversationTitle ?? shownSource?.title ?? "等待添加视频"}
               </h2>
-              <p>{shownSource?.subtitle ?? "总结生成后，可在这里围绕视频继续提问"}</p>
+              {shownSource?.kind !== "upload" ? (
+                <p>
+                  {shownSource?.subtitle ??
+                    "总结生成后，可在这里围绕视频继续提问"}
+                </p>
+              ) : null}
             </div>
             <span className={`phase-badge ${phase}`}>
               {phase === "processing"
-                ? "处理中"
+                  ? "处理中"
                 : phase === "ready"
-                  ? "可对话"
+                  ? "对话"
                   : phase === "error"
                     ? "需重试"
                     : "未开始"}
@@ -1842,18 +2225,6 @@ export default function VideoWorkbench() {
 
             {phase === "ready" && summary && activeSource ? (
               <div className="ready-view">
-                <div className="demo-disclaimer real-model">
-                  <span className="demo-tag">QWEN</span>
-                  <p>
-                    以下内容由真实 Qwen 视频模型生成。AI 结果可能有误，请结合原视频核对重要信息。
-                  </p>
-                  {activeSource.sourceUrl ? (
-                    <a href={activeSource.sourceUrl} target="_blank" rel="noreferrer">
-                      查看源视频 ↗
-                    </a>
-                  ) : null}
-                </div>
-
                 <article className="summary-document">
                   <div className="summary-title-row">
                     <div>
@@ -1863,21 +2234,6 @@ export default function VideoWorkbench() {
                   </div>
 
                   <div className="summary-stats">
-                    {preprocessingResult ? (
-                      <span>
-                        <strong>{preprocessingResult.frameCount}</strong> 张关键帧
-                      </span>
-                    ) : null}
-                    {preprocessingResult ? (
-                      <span>
-                        <strong>
-                          {preprocessingResult.audioBytes > 0
-                            ? formatFileSize(preprocessingResult.audioBytes)
-                            : "未提取"}
-                        </strong>{" "}
-                        音轨
-                      </span>
-                    ) : null}
                     <span>
                       <strong>{timelineItems.length}</strong> 个时间点
                     </span>
@@ -1885,6 +2241,19 @@ export default function VideoWorkbench() {
                       <strong>{activeModel ?? "Qwen"}</strong> 分析引擎
                     </span>
                   </div>
+
+                  {activeSource.description ? (
+                    <section className="summary-section video-description-section">
+                      <h4>视频简介</h4>
+                      <div className="overview-copy">
+                        {summaryParagraphs(activeSource.description).map(
+                          (paragraph) => (
+                            <p key={paragraph}>{paragraph}</p>
+                          ),
+                        )}
+                      </div>
+                    </section>
+                  ) : null}
 
                   <section className="summary-section">
                     <h4>内容概览</h4>
@@ -1919,6 +2288,45 @@ export default function VideoWorkbench() {
                       ))}
                     </div>
                   </section>
+
+                  {transcript ? (
+                    <section className="summary-section transcript-section">
+                      <div className="transcript-heading">
+                        <h4>字幕</h4>
+                        <span>FunASR</span>
+                      </div>
+                      {transcript.status === "ready" ? (
+                        transcript.cues.length > 0 ? (
+                          <div className="transcript-list">
+                            {transcript.cues.map((cue, index) => (
+                              <div
+                                className="transcript-row"
+                                key={`${cue.startSeconds}-${index}`}
+                              >
+                                <button
+                                  type="button"
+                                  disabled={!videoPreview}
+                                  onClick={() => seekToSeconds(cue.startSeconds)}
+                                  aria-label={`跳转到 ${formatPlaybackTimestamp(
+                                    cue.startSeconds,
+                                  )}`}
+                                >
+                                  {formatPlaybackTimestamp(cue.startSeconds)}
+                                </button>
+                                <p>{cue.text}</p>
+                              </div>
+                            ))}
+                          </div>
+                        ) : (
+                          <p className="transcript-copy">{transcript.text}</p>
+                        )
+                      ) : (
+                        <p className="transcript-unavailable">
+                          {transcript.error ?? "没有识别到可显示的字幕。"}
+                        </p>
+                      )}
+                    </section>
+                  ) : null}
                 </article>
 
                 <div className="chat-divider">
@@ -1994,9 +2402,7 @@ export default function VideoWorkbench() {
                 }}
                 placeholder={
                   phase === "ready"
-                    ? isReplying
-                      ? "可以继续输入；停止当前回答后即可发送"
-                      : "问问视频里的细节…"
+                    ? "问问视频里的细节…"
                     : "总结生成后即可继续提问"
                 }
                 disabled={phase !== "ready"}

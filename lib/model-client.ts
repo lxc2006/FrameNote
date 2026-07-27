@@ -4,7 +4,6 @@ import type {
   AskVideoRequest,
   AskVideoResponse,
   ModelApiErrorBody,
-  ModelStatusResponse,
 } from "./model-api";
 
 export class ModelClientError extends Error {
@@ -17,10 +16,6 @@ export class ModelClientError extends Error {
     this.code = code;
     this.retryable = retryable;
   }
-}
-
-export async function getModelStatus(signal?: AbortSignal) {
-  return requestModel<ModelStatusResponse>("/api/model/status", { signal });
 }
 
 export async function analyzeVideo(

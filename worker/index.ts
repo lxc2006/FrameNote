@@ -6,7 +6,6 @@ import { setRuntimeBindings } from "../lib/server/runtime-env";
 interface Env {
   ASSETS: Fetcher;
   DB: D1Database;
-  MEDIA: R2Bucket;
   DASHSCOPE_API_KEY?: string;
   DASHSCOPE_BASE_URL?: string;
   QWEN_VIDEO_MODEL?: string;
