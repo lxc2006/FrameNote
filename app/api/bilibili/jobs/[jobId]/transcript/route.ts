@@ -1,6 +1,7 @@
 import {
   bilibiliRouteErrorResponse,
   proxyBilibiliJson,
+  readTranscriptOptionsRequest,
   requestBilibiliService,
   validateBilibiliJobId,
 } from "@/lib/server/bilibili-route";
@@ -15,10 +16,13 @@ export async function POST(request: Request, context: RouteContext) {
   try {
     const params = await context.params;
     const jobId = validateBilibiliJobId(params.jobId);
+    const body = await readTranscriptOptionsRequest(request);
     const response = await requestBilibiliService(
       `/v1/bilibili/jobs/${jobId}/transcript`,
       {
         method: "POST",
+        headers: { "content-type": "application/json" },
+        body,
         signal: request.signal,
       },
     );

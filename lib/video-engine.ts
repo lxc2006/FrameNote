@@ -1,4 +1,5 @@
 export type SourceKind = "upload" | "bilibili" | "url";
+export type TranscriptLanguage = "zh" | "ja" | "en";
 
 export interface VideoSourceDescriptor {
   kind: SourceKind;

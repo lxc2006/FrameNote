@@ -15,6 +15,7 @@ from pathlib import Path
 from urllib.parse import urlencode
 
 from fastapi import (
+    Body,
     Depends,
     FastAPI,
     File,
@@ -43,6 +44,7 @@ from .service.models import (
     JobResponse,
     SourceResponse,
     TranscriptCueResponse,
+    TranscriptOptionsRequest,
     TranscriptResponse,
     utc_iso,
 )
@@ -590,7 +592,10 @@ async def get_job(job_id: str, request: Request, response: Response) -> JobRespo
     return job_response(request, job)
 
 
-async def _complete_deferred_transcript(job: JobRecord) -> None:
+async def _complete_deferred_transcript(
+    job: JobRecord,
+    languages: tuple[str, ...],
+) -> None:
     if not job.duration_seconds:
         raise RuntimeError("视频时长不可用。")
     job_dir = safe_job_dir(SETTINGS.state_root, job.job_id)
@@ -606,6 +611,7 @@ async def _complete_deferred_transcript(job: JobRecord) -> None:
         job.duration_seconds,
         artifact,
         ffmpeg,
+        languages,
     )
 
 
@@ -627,6 +633,7 @@ async def start_transcript(
     job_id: str,
     request: Request,
     response: Response,
+    options: TranscriptOptionsRequest | None = Body(default=None),
 ) -> JobResponse:
     if not is_valid_job_id(job_id):
         raise api_error(status.HTTP_404_NOT_FOUND, "JOB_NOT_FOUND", "任务不存在。")
@@ -664,7 +671,10 @@ async def start_transcript(
         existing = tasks.get(job_id)
         if not existing or existing.done():
             task = asyncio.create_task(
-                _complete_deferred_transcript(job),
+                _complete_deferred_transcript(
+                    job,
+                    tuple((options or TranscriptOptionsRequest()).languages),
+                ),
                 name=f"funasr-{job_id}",
             )
             tasks[job_id] = task

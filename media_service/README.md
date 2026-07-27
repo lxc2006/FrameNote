@@ -1,6 +1,6 @@
 # FrameNote 媒体服务
 
-这是 FrameNote 的独立媒体服务，统一处理本地上传、HTTPS 视频直链分析和 B 站公开 UGC。所有 `analysis` 任务都会先生成最长边不超过 854px 的 H.264/AAC 素材，再按视频时长选择“直接视频”或“最多 64 张关键帧 + 独立音轨”。Qwen 完成后，网页可以按设置异步启动 FunASR；Nano 负责识别文字与字符级时间戳，CT-Punc 重新恢复整段标点，最终只按句号、问号和感叹号合并为整句字幕。
+这是 FrameNote 的独立媒体服务，统一处理本地上传、HTTPS 视频直链分析和 B 站公开 UGC。所有 `analysis` 任务都会先生成最长边不超过 854px 的 H.264/AAC 素材，再按视频时长选择“直接视频”或“最多 64 张关键帧 + 独立音轨”。Qwen 完成后，网页可以按设置异步启动 FunASR；Nano 自动识别或按单一语言约束识别中、日、英文，CT-Punc 为中英文重新恢复整段标点，最终只按句号、问号和感叹号合并为整句字幕。
 
 B 站 `preview` 任务准备默认最高兼容画质，网页通过 HTTP Range 内联播放 URL 边播放边缓存，并可使用附件 URL 手动下载。B 站任务只接收严格的 12 位 BVID，不读取 Cookie，不登录 B 站，也不尝试访问会员、私有、付费或地区受限内容。HTTPS 直链由网页下载后作为文件上传到本服务，媒体服务本身不会对用户提供的 URL 发起请求。请只处理你拥有或已获授权使用的视频。
 
@@ -81,7 +81,6 @@ docker run --rm -p 8788:8788 `
 | `FRAMENOTE_MEDIA_CLEANUP_INTERVAL_SECONDS` | `60` | 过期目录扫描间隔 |
 | `FRAMENOTE_FUNASR_MODEL` | `FunAudioLLM/Fun-ASR-Nano-2512` | FunASR 主识别模型名称或本地模型目录 |
 | `FRAMENOTE_FUNASR_HUB` | `ms` | 模型来源；中国大陆默认使用 ModelScope，也可设为 `hf` |
-| `FRAMENOTE_FUNASR_LANGUAGE` | `中文` | Fun-ASR-Nano 的识别语言 |
 | `FRAMENOTE_FUNASR_VAD_MODEL` | `fsmn-vad` | 长音频语音活动检测模型 |
 | `FRAMENOTE_FUNASR_PUNC_MODEL` | `ct-punc` | Nano 识别完成后的独立标点恢复模型；设置为空可回退到 Nano 原生标点 |
 | `FRAMENOTE_FUNASR_DEVICE` | `cpu` | 推理设备，例如 `cpu` 或 `cuda:0` |
@@ -115,6 +114,9 @@ sourceUrl=https://example.com/video.mp4   # 仅作为 HTTPS 来源元数据
 ```http
 GET /v1/media/jobs/{jobId}
 POST /v1/media/jobs/{jobId}/transcript
+Content-Type: application/json
+
+{"languages":["zh","ja","en"]}
 DELETE /v1/media/jobs/{jobId}
 ```
 

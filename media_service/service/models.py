@@ -16,6 +16,7 @@ JobPhase = Literal[
 ]
 BilibiliDownloadVariant = Literal["preview", "analysis"]
 MediaSourceKind = Literal["upload", "bilibili", "url"]
+TranscriptLanguage = Literal["zh", "ja", "en"]
 
 
 def utc_iso(timestamp: float) -> str:
@@ -94,6 +95,22 @@ class TranscriptResponse(BaseModel):
     cues: list[TranscriptCueResponse]
     language: str | None = None
     error: str | None = None
+
+
+class TranscriptOptionsRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    languages: list[TranscriptLanguage] = Field(default_factory=list, max_length=3)
+
+    @field_validator("languages")
+    @classmethod
+    def validate_languages(
+        cls,
+        value: list[TranscriptLanguage],
+    ) -> list[TranscriptLanguage]:
+        if len(set(value)) != len(value):
+            raise ValueError("languages must not contain duplicates")
+        return value
 
 
 class AnalysisResponse(BaseModel):

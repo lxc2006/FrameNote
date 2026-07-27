@@ -1,10 +1,13 @@
 "use client";
 
 import {
+  type CSSProperties,
   type ReactNode,
   type ChangeEvent,
   type DragEvent,
   type FormEvent,
+  type KeyboardEvent as ReactKeyboardEvent,
+  type PointerEvent as ReactPointerEvent,
   useEffect,
   useMemo,
   useRef,
@@ -15,6 +18,7 @@ import {
   formatDuration,
   formatFileSize,
   type VideoTranscript,
+  type TranscriptLanguage,
   type VideoModelContext,
   type VideoSourceDescriptor,
   type VideoSummary,
@@ -58,6 +62,7 @@ import UserSettingsMenu, {
 
 type InputMode = "upload" | "bilibili";
 type Phase = "idle" | "processing" | "ready" | "error";
+type ResizeMode = "columns" | "rows" | "diagonal-source" | "diagonal-history";
 
 interface SelectedVideo {
   file: File;
@@ -88,10 +93,36 @@ interface InlineNotice {
 type ChatMessage = Pick<ConversationMessage, "id" | "role" | "content">;
 
 const acceptedExtensions = ["mp4", "mov", "webm", "mkv", "m4v"];
-const suggestions = ["这个视频的核心观点是什么？", "按时间线梳理章节", "给我三个行动建议"];
 const SUMMARY_READY_MESSAGE = "总结生成完毕，我还可以继续和你讨论相关内容 : )";
 const MAX_MEDIA_ANALYSIS_BYTES = 500 * 1024 * 1024;
 const ANALYSIS_SETTINGS_STORAGE_KEY = "framenote.analysis-settings.v1";
+const CHAT_SETTINGS_STORAGE_KEY = "framenote.chat-settings.v1";
+const TRANSCRIPT_LANGUAGE_OPTIONS: ReadonlyArray<{
+  value: TranscriptLanguage;
+  label: string;
+}> = [
+  { value: "zh", label: "中文" },
+  { value: "ja", label: "日文" },
+  { value: "en", label: "英文" },
+];
+const DEFAULT_TRANSCRIPT_LANGUAGES = TRANSCRIPT_LANGUAGE_OPTIONS.map(
+  ({ value }) => value,
+);
+const WORKSPACE_LAYOUT_STORAGE_KEY = "framenote.workspace-layout.v1";
+const MIN_SIDEBAR_WIDTH = 340;
+const MIN_CONVERSATION_WIDTH = 560;
+const MIN_SOURCE_PANE_HEIGHT = 260;
+const MIN_HISTORY_PANE_HEIGHT = 220;
+const WORKSPACE_RESIZER_SIZE = 10;
+const PANE_RESIZER_SIZE = 10;
+
+interface StoredWorkspaceLayout {
+  sidebarVisible?: boolean;
+  sourcePaneCollapsed?: boolean;
+  historyPaneCollapsed?: boolean;
+  sidebarWidth?: number | null;
+  sourcePaneHeight?: number | null;
+}
 
 function fileExtension(filename: string) {
   return filename.split(".").pop()?.toLowerCase() ?? "";
@@ -399,6 +430,11 @@ export default function VideoWorkbench() {
     useState(DEFAULT_QWEN_DIRECT_SUMMARY_MAX_SECONDS);
   const [transcriptExtractionEnabled, setTranscriptExtractionEnabled] =
     useState(true);
+  const [transcriptLanguages, setTranscriptLanguages] = useState<
+    TranscriptLanguage[]
+  >([...DEFAULT_TRANSCRIPT_LANGUAGES]);
+  const [deepThinkingEnabled, setDeepThinkingEnabled] = useState(false);
+  const [webSearchEnabled, setWebSearchEnabled] = useState(false);
   const [isAnalysisSettingsOpen, setIsAnalysisSettingsOpen] = useState(false);
   const [isFetchingVideo, setIsFetchingVideo] = useState(false);
   const [videoPreview, setVideoPreview] = useState<VideoPreview | null>(null);
@@ -410,6 +446,12 @@ export default function VideoWorkbench() {
   const [busyConversationId, setBusyConversationId] = useState<string | null>(null);
   const [renamingConversationId, setRenamingConversationId] = useState<string | null>(null);
   const [renameDraft, setRenameDraft] = useState("");
+  const [sidebarVisible, setSidebarVisible] = useState(true);
+  const [sourcePaneCollapsed, setSourcePaneCollapsed] = useState(false);
+  const [historyPaneCollapsed, setHistoryPaneCollapsed] = useState(false);
+  const [sidebarWidth, setSidebarWidth] = useState<number | null>(null);
+  const [sourcePaneHeight, setSourcePaneHeight] = useState<number | null>(null);
+  const [workspaceLayoutReady, setWorkspaceLayoutReady] = useState(false);
   const fileInputRef = useRef<HTMLInputElement>(null);
   const runTokenRef = useRef(0);
   const messageCounterRef = useRef(0);
@@ -428,6 +470,9 @@ export default function VideoWorkbench() {
   const sideVideoPreviewRef = useRef<HTMLDivElement>(null);
   const pendingSeekSecondsRef = useRef<number | null>(null);
   const analysisSettingsRef = useRef<HTMLDivElement>(null);
+  const workspaceRef = useRef<HTMLDivElement>(null);
+  const setupColumnRef = useRef<HTMLElement>(null);
+  const activeResizeCleanupRef = useRef<(() => void) | null>(null);
 
   const bvid = useMemo(() => extractBvid(bilibiliInput), [bilibiliInput]);
   const directVideoUrl = useMemo(
@@ -480,13 +525,45 @@ export default function VideoWorkbench() {
         ANALYSIS_SETTINGS_STORAGE_KEY,
       );
       if (stored) {
-        const parsed = JSON.parse(stored) as { transcriptExtraction?: unknown };
+        const parsed = JSON.parse(stored) as {
+          transcriptExtraction?: unknown;
+          transcriptLanguages?: unknown;
+        };
         if (typeof parsed.transcriptExtraction === "boolean") {
           setTranscriptExtractionEnabled(parsed.transcriptExtraction);
+        }
+        if (Array.isArray(parsed.transcriptLanguages)) {
+          const languages = parsed.transcriptLanguages.filter(
+            (value): value is TranscriptLanguage =>
+              TRANSCRIPT_LANGUAGE_OPTIONS.some(
+                (option) => option.value === value,
+              ),
+          );
+          setTranscriptLanguages([...new Set(languages)]);
         }
       }
     } catch {
       setTranscriptExtractionEnabled(true);
+    }
+  }, []);
+
+  useEffect(() => {
+    try {
+      const stored = window.localStorage.getItem(CHAT_SETTINGS_STORAGE_KEY);
+      if (!stored) return;
+      const parsed = JSON.parse(stored) as {
+        deepThinking?: unknown;
+        webSearch?: unknown;
+      };
+      if (typeof parsed.deepThinking === "boolean") {
+        setDeepThinkingEnabled(parsed.deepThinking);
+      }
+      if (typeof parsed.webSearch === "boolean") {
+        setWebSearchEnabled(parsed.webSearch);
+      }
+    } catch {
+      setDeepThinkingEnabled(false);
+      setWebSearchEnabled(false);
     }
   }, []);
 
@@ -510,6 +587,75 @@ export default function VideoWorkbench() {
       document.removeEventListener("keydown", closeOnEscape);
     };
   }, [isAnalysisSettingsOpen]);
+
+  useEffect(() => {
+    try {
+      const stored = window.localStorage.getItem(WORKSPACE_LAYOUT_STORAGE_KEY);
+      if (stored) {
+        const parsed = JSON.parse(stored) as StoredWorkspaceLayout;
+        if (typeof parsed.sidebarVisible === "boolean") {
+          setSidebarVisible(parsed.sidebarVisible);
+        }
+        const sourceCollapsed = parsed.sourcePaneCollapsed === true;
+        const historyCollapsed =
+          parsed.historyPaneCollapsed === true && !sourceCollapsed;
+        setSourcePaneCollapsed(sourceCollapsed);
+        setHistoryPaneCollapsed(historyCollapsed);
+        if (typeof parsed.sidebarWidth === "number") {
+          setSidebarWidth(clampSidebarWidth(parsed.sidebarWidth));
+        }
+        if (typeof parsed.sourcePaneHeight === "number") {
+          setSourcePaneHeight(clampSourcePaneHeight(parsed.sourcePaneHeight));
+        }
+      }
+    } catch {
+      // 损坏的本地布局设置直接回退到默认布局。
+    } finally {
+      setWorkspaceLayoutReady(true);
+    }
+  }, []);
+
+  useEffect(() => {
+    if (!workspaceLayoutReady) return;
+    const saveTimer = window.setTimeout(() => {
+      try {
+        const layout: StoredWorkspaceLayout = {
+          sidebarVisible,
+          sourcePaneCollapsed,
+          historyPaneCollapsed,
+          sidebarWidth,
+          sourcePaneHeight,
+        };
+        window.localStorage.setItem(
+          WORKSPACE_LAYOUT_STORAGE_KEY,
+          JSON.stringify(layout),
+        );
+      } catch {
+        // 无法写入时只影响下次打开页面的布局恢复。
+      }
+    }, 120);
+    return () => window.clearTimeout(saveTimer);
+  }, [
+    historyPaneCollapsed,
+    sidebarVisible,
+    sidebarWidth,
+    sourcePaneCollapsed,
+    sourcePaneHeight,
+    workspaceLayoutReady,
+  ]);
+
+  useEffect(() => {
+    const clampSavedSizes = () => {
+      setSidebarWidth((current) =>
+        current === null ? null : clampSidebarWidth(current),
+      );
+      setSourcePaneHeight((current) =>
+        current === null ? null : clampSourcePaneHeight(current),
+      );
+    };
+    window.addEventListener("resize", clampSavedSizes);
+    return () => window.removeEventListener("resize", clampSavedSizes);
+  }, []);
 
   const pendingSource = useMemo<VideoSourceDescriptor | null>(() => {
     if (mode === "upload") {
@@ -588,6 +734,7 @@ export default function VideoWorkbench() {
       askAbortRef.current?.abort();
       pendingReplyRef.current = null;
       conversationLoadAbortRef.current?.abort();
+      activeResizeCleanupRef.current?.();
     };
     globalThis.addEventListener("pagehide", cancelActiveWork);
     return () => {
@@ -605,16 +752,271 @@ export default function VideoWorkbench() {
     setNotice({ message, tone });
   }
 
-  function updateTranscriptExtraction(enabled: boolean) {
-    setTranscriptExtractionEnabled(enabled);
+  function persistAnalysisSettings(
+    transcriptExtraction: boolean,
+    languages: TranscriptLanguage[],
+  ) {
     try {
       window.localStorage.setItem(
         ANALYSIS_SETTINGS_STORAGE_KEY,
-        JSON.stringify({ transcriptExtraction: enabled }),
+        JSON.stringify({
+          transcriptExtraction,
+          transcriptLanguages: languages,
+        }),
       );
     } catch {
       // 无法写入浏览器偏好时，本次会话中的设置仍然生效。
     }
+  }
+
+  function updateTranscriptExtraction(enabled: boolean) {
+    setTranscriptExtractionEnabled(enabled);
+    persistAnalysisSettings(enabled, transcriptLanguages);
+  }
+
+  function toggleTranscriptLanguage(language: TranscriptLanguage) {
+    setTranscriptLanguages((current) => {
+      const next = current.includes(language)
+        ? current.filter((value) => value !== language)
+        : [...current, language].sort(
+            (left, right) =>
+              DEFAULT_TRANSCRIPT_LANGUAGES.indexOf(left) -
+              DEFAULT_TRANSCRIPT_LANGUAGES.indexOf(right),
+          );
+      persistAnalysisSettings(transcriptExtractionEnabled, next);
+      return next;
+    });
+  }
+
+  function updateChatSetting(
+    setting: "deepThinking" | "webSearch",
+    enabled: boolean,
+  ) {
+    const nextDeepThinking =
+      setting === "deepThinking" ? enabled : deepThinkingEnabled;
+    const nextWebSearch =
+      setting === "webSearch" ? enabled : webSearchEnabled;
+    setDeepThinkingEnabled(nextDeepThinking);
+    setWebSearchEnabled(nextWebSearch);
+    try {
+      window.localStorage.setItem(
+        CHAT_SETTINGS_STORAGE_KEY,
+        JSON.stringify({
+          deepThinking: nextDeepThinking,
+          webSearch: nextWebSearch,
+        }),
+      );
+    } catch {
+      // 无法保存时，开关在本次页面会话中仍然有效。
+    }
+  }
+
+  function sidebarWidthLimits() {
+    const workspaceWidth =
+      workspaceRef.current?.getBoundingClientRect().width ??
+      MIN_SIDEBAR_WIDTH + MIN_CONVERSATION_WIDTH + WORKSPACE_RESIZER_SIZE;
+    return {
+      min: MIN_SIDEBAR_WIDTH,
+      max: Math.max(
+        MIN_SIDEBAR_WIDTH,
+        workspaceWidth - MIN_CONVERSATION_WIDTH - WORKSPACE_RESIZER_SIZE,
+      ),
+    };
+  }
+
+  function sourcePaneHeightLimits() {
+    const columnHeight =
+      setupColumnRef.current?.getBoundingClientRect().height ??
+      MIN_SOURCE_PANE_HEIGHT + MIN_HISTORY_PANE_HEIGHT + PANE_RESIZER_SIZE;
+    return {
+      min: MIN_SOURCE_PANE_HEIGHT,
+      max: Math.max(
+        MIN_SOURCE_PANE_HEIGHT,
+        columnHeight - MIN_HISTORY_PANE_HEIGHT - PANE_RESIZER_SIZE,
+      ),
+    };
+  }
+
+  function clampTo(value: number, minimum: number, maximum: number) {
+    return Math.min(maximum, Math.max(minimum, value));
+  }
+
+  function clampSidebarWidth(value: number) {
+    const { min, max } = sidebarWidthLimits();
+    return clampTo(value, min, max);
+  }
+
+  function clampSourcePaneHeight(value: number) {
+    const { min, max } = sourcePaneHeightLimits();
+    return clampTo(value, min, max);
+  }
+
+  function beginResize(
+    mode: ResizeMode,
+    event: ReactPointerEvent<HTMLElement>,
+  ) {
+    if (event.button !== 0) return;
+    event.preventDefault();
+    activeResizeCleanupRef.current?.();
+
+    const target = event.currentTarget;
+    const pointerId = event.pointerId;
+    const resizesColumns = mode !== "rows";
+    const resizesRows = mode !== "columns";
+    const startX = event.clientX;
+    const startY = event.clientY;
+    const startSidebarWidth =
+      setupColumnRef.current?.getBoundingClientRect().width ??
+      sidebarWidth ??
+      MIN_SIDEBAR_WIDTH;
+    const startSourcePaneHeight =
+      setupColumnRef.current?.firstElementChild?.getBoundingClientRect()
+        .height ??
+      sourcePaneHeight ??
+      MIN_SOURCE_PANE_HEIGHT;
+
+    target.setPointerCapture?.(pointerId);
+    document.documentElement.dataset.resizing = mode;
+
+    const handlePointerMove = (moveEvent: PointerEvent) => {
+      moveEvent.preventDefault();
+      if (resizesColumns) {
+        setSidebarWidth(
+          clampSidebarWidth(
+            startSidebarWidth + moveEvent.clientX - startX,
+          ),
+        );
+      }
+      if (resizesRows) {
+        setSourcePaneHeight(
+          clampSourcePaneHeight(
+            startSourcePaneHeight + moveEvent.clientY - startY,
+          ),
+        );
+      }
+    };
+    const finishResize = () => {
+      window.removeEventListener("pointermove", handlePointerMove);
+      window.removeEventListener("pointerup", finishResize);
+      window.removeEventListener("pointercancel", finishResize);
+      delete document.documentElement.dataset.resizing;
+      if (target.hasPointerCapture?.(pointerId)) {
+        target.releasePointerCapture(pointerId);
+      }
+      activeResizeCleanupRef.current = null;
+    };
+
+    activeResizeCleanupRef.current = finishResize;
+    window.addEventListener("pointermove", handlePointerMove, {
+      passive: false,
+    });
+    window.addEventListener("pointerup", finishResize);
+    window.addEventListener("pointercancel", finishResize);
+  }
+
+  function handleWorkspaceResizeKeyDown(
+    event: ReactKeyboardEvent<HTMLDivElement>,
+  ) {
+    if (!["ArrowLeft", "ArrowRight", "Home", "End"].includes(event.key)) {
+      return;
+    }
+    event.preventDefault();
+    const { min, max } = sidebarWidthLimits();
+    const current =
+      setupColumnRef.current?.getBoundingClientRect().width ??
+      sidebarWidth ??
+      min;
+    const next =
+      event.key === "Home"
+        ? min
+        : event.key === "End"
+          ? max
+          : current + (event.key === "ArrowLeft" ? -24 : 24);
+    setSidebarWidth(clampTo(next, min, max));
+  }
+
+  function handlePaneResizeKeyDown(
+    event: ReactKeyboardEvent<HTMLDivElement>,
+  ) {
+    if (!["ArrowUp", "ArrowDown", "Home", "End"].includes(event.key)) {
+      return;
+    }
+    event.preventDefault();
+    const { min, max } = sourcePaneHeightLimits();
+    const current =
+      sourcePaneHeight ??
+      event.currentTarget.previousElementSibling?.getBoundingClientRect()
+        .height ??
+      min;
+    const next =
+      event.key === "Home"
+        ? min
+        : event.key === "End"
+          ? max
+          : current + (event.key === "ArrowUp" ? -24 : 24);
+    setSourcePaneHeight(clampTo(next, min, max));
+  }
+
+  function handleDiagonalResizeKeyDown(
+    event: ReactKeyboardEvent<HTMLButtonElement>,
+  ) {
+    if (
+      !["ArrowLeft", "ArrowRight", "ArrowUp", "ArrowDown"].includes(
+        event.key,
+      )
+    ) {
+      return;
+    }
+    event.preventDefault();
+
+    if (event.key === "ArrowLeft" || event.key === "ArrowRight") {
+      const { min, max } = sidebarWidthLimits();
+      const current =
+        setupColumnRef.current?.getBoundingClientRect().width ??
+        sidebarWidth ??
+        min;
+      setSidebarWidth(
+        clampTo(
+          current + (event.key === "ArrowLeft" ? -24 : 24),
+          min,
+          max,
+        ),
+      );
+      return;
+    }
+
+    const { min, max } = sourcePaneHeightLimits();
+    const current =
+      setupColumnRef.current?.firstElementChild?.getBoundingClientRect()
+        .height ??
+      sourcePaneHeight ??
+      min;
+    setSourcePaneHeight(
+      clampTo(
+        current + (event.key === "ArrowUp" ? -24 : 24),
+        min,
+        max,
+      ),
+    );
+  }
+
+  function toggleSourcePane() {
+    setSourcePaneCollapsed((current) => {
+      const next = !current;
+      if (next) {
+        setHistoryPaneCollapsed(false);
+        setIsAnalysisSettingsOpen(false);
+      }
+      return next;
+    });
+  }
+
+  function toggleHistoryPane() {
+    setHistoryPaneCollapsed((current) => {
+      const next = !current;
+      if (next) setSourcePaneCollapsed(false);
+      return next;
+    });
   }
 
   function upsertConversationItem(item: ConversationListItem) {
@@ -1169,11 +1571,13 @@ export default function VideoWorkbench() {
         if (bilibiliAnalysisJobId) {
           analysisTranscript = await extractBilibiliTranscript(
             bilibiliAnalysisJobId,
+            transcriptLanguages,
             controller.signal,
           );
         } else if (mediaAnalysisJobId) {
           analysisTranscript = await extractMediaTranscript(
             mediaAnalysisJobId,
+            transcriptLanguages,
             controller.signal,
           );
         }
@@ -1472,6 +1876,8 @@ export default function VideoWorkbench() {
               }
             : {}),
           history: messages.slice(-12).map(({ role, content }) => ({ role, content })),
+          reasoningMode: deepThinkingEnabled ? "pro" : "flash",
+          webSearchEnabled,
         },
         controller.signal,
       );
@@ -1737,11 +2143,59 @@ export default function VideoWorkbench() {
               />
               <i aria-hidden="true" />
             </label>
+            <details
+              className="transcript-language-settings"
+              aria-disabled={!transcriptExtractionEnabled}
+            >
+              <summary>
+                <span>
+                  <strong>语言选择</strong>
+                  <small>
+                    {transcriptLanguages.length === 0 ||
+                    transcriptLanguages.length ===
+                      TRANSCRIPT_LANGUAGE_OPTIONS.length
+                      ? "自动识别中、日、英"
+                      : `仅保留${TRANSCRIPT_LANGUAGE_OPTIONS.filter(
+                          ({ value }) =>
+                            transcriptLanguages.includes(value),
+                        )
+                          .map(({ label }) => label)
+                          .join("、")}`}
+                  </small>
+                </span>
+                <span aria-hidden="true">⌄</span>
+              </summary>
+              <fieldset disabled={!transcriptExtractionEnabled}>
+                <legend className="sr-only">选择字幕语言</legend>
+                {TRANSCRIPT_LANGUAGE_OPTIONS.map(({ value, label }) => (
+                  <label key={value}>
+                    <input
+                      type="checkbox"
+                      checked={transcriptLanguages.includes(value)}
+                      onChange={() => toggleTranscriptLanguage(value)}
+                    />
+                    <span>{label}</span>
+                  </label>
+                ))}
+              </fieldset>
+              <p>全选或全不选时自动识别三种语言。</p>
+            </details>
           </section>
         ) : null}
       </div>
     );
   }
+
+  const workspaceStyle = {
+    ...(sidebarWidth === null
+      ? {}
+      : { "--sidebar-width": `${sidebarWidth}px` }),
+    ...(sourcePaneHeight === null
+      ? {}
+      : { "--source-pane-height": `${sourcePaneHeight}px` }),
+  } as CSSProperties;
+  const workspaceWidthBounds = sidebarWidthLimits();
+  const paneHeightBounds = sourcePaneHeightLimits();
 
   return (
     <main className="app-shell">
@@ -1759,17 +2213,59 @@ export default function VideoWorkbench() {
         <h1 className="topbar-title">让一段视频，变成一次可继续的对话。</h1>
 
         <div className="topbar-actions">
+          <button
+            className="sidebar-visibility-button"
+            type="button"
+            aria-label={sidebarVisible ? "隐藏侧边栏" : "显示侧边栏"}
+            aria-controls="workspace-sidebar"
+            aria-expanded={sidebarVisible}
+            title={sidebarVisible ? "隐藏侧边栏" : "显示侧边栏"}
+            onClick={() => setSidebarVisible((current) => !current)}
+          >
+            <span className="sidebar-visibility-icon" aria-hidden="true">
+              <i />
+            </span>
+          </button>
           <UserSettingsMenu />
         </div>
       </header>
 
-      <div className="workspace" id="top">
-        <section className="setup-column" aria-label="添加并分析视频">
+      <div
+        className={`workspace ${sidebarVisible ? "" : "sidebar-hidden"}`}
+        id="top"
+        ref={workspaceRef}
+        style={workspaceStyle}
+      >
+        <section
+          className={`setup-column ${
+            sourcePaneCollapsed ? "source-collapsed" : ""
+          } ${historyPaneCollapsed ? "history-collapsed" : ""}`}
+          id="workspace-sidebar"
+          ref={setupColumnRef}
+          aria-label="添加视频与历史记录"
+        >
           <div
-            className={`source-card ${
-              phase === "ready" && videoPreview ? "showing-side-video" : ""
+            className={`sidebar-pane source-pane ${
+              sourcePaneCollapsed ? "collapsed" : ""
             }`}
           >
+            <button
+              className="pane-collapse-button source-collapse-button"
+              type="button"
+              aria-label={sourcePaneCollapsed ? "展开导入板块" : "隐藏导入板块"}
+              aria-expanded={!sourcePaneCollapsed}
+              onClick={toggleSourcePane}
+            >
+              <span aria-hidden="true">
+                {sourcePaneCollapsed ? "▼" : "▲"}
+              </span>
+            </button>
+            <div className="sidebar-pane-content">
+              <div
+                className={`source-card ${
+                  phase === "ready" && videoPreview ? "showing-side-video" : ""
+                }`}
+              >
             <div className="mode-tabs" role="tablist" aria-label="选择视频来源">
               <button
                 className={mode === "upload" ? "active" : ""}
@@ -1804,7 +2300,7 @@ export default function VideoWorkbench() {
                   accept="video/mp4,video/webm,video/quicktime,.mkv,.m4v"
                   disabled={phase === "processing"}
                   onChange={handleFileChange}
-                  aria-label="选择视频文件"
+                  aria-label="选择文件"
                 />
 
                 {!selectedVideo ? (
@@ -1822,15 +2318,12 @@ export default function VideoWorkbench() {
                       ↥
                     </span>
                     <strong>拖放视频到这里</strong>
-                    <p>
-                      MP4、MOV、WebM、MKV、M4V · 自动生成低分辨率分析素材 · ≤ 500 MB
-                    </p>
                     <button
                       type="button"
                       disabled={phase === "processing"}
                       onClick={() => fileInputRef.current?.click()}
                     >
-                      选择视频文件
+                      选择文件
                     </button>
                   </div>
                 ) : (
@@ -1993,8 +2486,48 @@ export default function VideoWorkbench() {
               </div>
             ) : null}
           </div>
+            </div>
+            <button
+              className="diagonal-resizer source-diagonal-resizer"
+              type="button"
+              aria-label="斜向调整导入板块大小"
+              title="斜向调整导入板块大小"
+              tabIndex={sourcePaneCollapsed || historyPaneCollapsed ? -1 : 0}
+              onPointerDown={(event) => beginResize("diagonal-source", event)}
+              onKeyDown={handleDiagonalResizeKeyDown}
+              onDoubleClick={() => {
+                setSidebarWidth(null);
+                setSourcePaneHeight(null);
+              }}
+            />
+          </div>
 
-          <aside className="conversation-library" aria-label="视频对话列表">
+          <div
+            className="pane-resizer"
+            role="separator"
+            aria-label="调整导入板块与记录板块的高度"
+            aria-orientation="horizontal"
+            aria-valuemin={paneHeightBounds.min}
+            aria-valuemax={paneHeightBounds.max}
+            aria-valuenow={
+              sourcePaneHeight ??
+              setupColumnRef.current?.firstElementChild?.getBoundingClientRect()
+                .height ??
+              paneHeightBounds.min
+            }
+            tabIndex={sourcePaneCollapsed || historyPaneCollapsed ? -1 : 0}
+            onPointerDown={(event) => beginResize("rows", event)}
+            onKeyDown={handlePaneResizeKeyDown}
+            onDoubleClick={() => setSourcePaneHeight(null)}
+          />
+
+          <div
+            className={`sidebar-pane history-pane ${
+              historyPaneCollapsed ? "collapsed" : ""
+            }`}
+          >
+            <div className="sidebar-pane-content">
+              <aside className="conversation-library" aria-label="视频对话列表">
             <div className="conversation-library-header">
               <div>
                 <span>历史记录</span>
@@ -2122,8 +2655,54 @@ export default function VideoWorkbench() {
                 ))
               )}
             </div>
-          </aside>
+              </aside>
+            </div>
+            <button
+              className="diagonal-resizer history-diagonal-resizer"
+              type="button"
+              aria-label="斜向调整记录板块大小"
+              title="斜向调整记录板块大小"
+              tabIndex={sourcePaneCollapsed || historyPaneCollapsed ? -1 : 0}
+              onPointerDown={(event) => beginResize("diagonal-history", event)}
+              onKeyDown={handleDiagonalResizeKeyDown}
+              onDoubleClick={() => {
+                setSidebarWidth(null);
+                setSourcePaneHeight(null);
+              }}
+            />
+            <button
+              className="pane-collapse-button history-collapse-button"
+              type="button"
+              aria-label={
+                historyPaneCollapsed ? "展开记录板块" : "隐藏记录板块"
+              }
+              aria-expanded={!historyPaneCollapsed}
+              onClick={toggleHistoryPane}
+            >
+              <span aria-hidden="true">
+                {historyPaneCollapsed ? "▲" : "▼"}
+              </span>
+            </button>
+          </div>
         </section>
+
+        <div
+          className="workspace-resizer"
+          role="separator"
+          aria-label="调整侧边栏与对话板块的宽度"
+          aria-orientation="vertical"
+          aria-valuemin={workspaceWidthBounds.min}
+          aria-valuemax={workspaceWidthBounds.max}
+          aria-valuenow={
+            sidebarWidth ??
+            setupColumnRef.current?.getBoundingClientRect().width ??
+            workspaceWidthBounds.min
+          }
+          tabIndex={sidebarVisible ? 0 : -1}
+          onPointerDown={(event) => beginResize("columns", event)}
+          onKeyDown={handleWorkspaceResizeKeyDown}
+          onDoubleClick={() => setSidebarWidth(null)}
+        />
 
         <section className="conversation-panel" aria-labelledby="conversation-title">
           <div className="conversation-header">
@@ -2367,17 +2946,30 @@ export default function VideoWorkbench() {
 
           <div className={`composer-area ${phase === "ready" ? "enabled" : ""}`}>
             {phase === "ready" ? (
-              <div className="suggestion-row" aria-label="推荐问题">
-                {suggestions.map((suggestion) => (
-                  <button
-                    key={suggestion}
-                    type="button"
-                    disabled={isReplying}
-                    onClick={() => void askQuestion(suggestion)}
-                  >
-                    {suggestion}
-                  </button>
-                ))}
+              <div className="conversation-tool-row" aria-label="对话工具">
+                <button
+                  type="button"
+                  aria-pressed={deepThinkingEnabled}
+                  onClick={() =>
+                    updateChatSetting(
+                      "deepThinking",
+                      !deepThinkingEnabled,
+                    )
+                  }
+                >
+                  <span aria-hidden="true">✦</span>
+                  深度思考
+                </button>
+                <button
+                  type="button"
+                  aria-pressed={webSearchEnabled}
+                  onClick={() =>
+                    updateChatSetting("webSearch", !webSearchEnabled)
+                  }
+                >
+                  <span aria-hidden="true">◎</span>
+                  联网搜索
+                </button>
               </div>
             ) : null}
 

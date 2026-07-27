@@ -7,7 +7,11 @@ import {
   BILIBILI_ANALYSIS_DOWNLOAD_VARIANT,
   DEFAULT_BILIBILI_DOWNLOAD_VARIANT,
 } from "../bilibili-api";
-import type { VideoModelContext, VideoTranscript } from "../video-engine";
+import type {
+  TranscriptLanguage,
+  VideoModelContext,
+  VideoTranscript,
+} from "../video-engine";
 
 const POLL_INTERVAL_MS = 1_000;
 // 服务端下载超时为 20 分钟；额外两分钟留给排队、轮询和媒体传输。
@@ -240,6 +244,7 @@ export function releaseBilibiliAnalysis(jobId: string) {
 
 export async function extractBilibiliTranscript(
   jobId: string,
+  languages: TranscriptLanguage[],
   signal?: AbortSignal,
 ): Promise<VideoTranscript> {
   throwIfAborted(signal);
@@ -248,6 +253,8 @@ export async function extractBilibiliTranscript(
     `/api/bilibili/jobs/${jobId}/transcript`,
     {
       method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ languages }),
       signal,
     },
   );

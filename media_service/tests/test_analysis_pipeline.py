@@ -6,6 +6,7 @@ from pathlib import Path
 from unittest.mock import Mock, patch
 
 from media_service.analysis_pipeline import (
+    _filter_transcript_languages,
     _normalize_funasr_result,
     _prefer_cached_modelscope_model,
     _read_frame,
@@ -17,6 +18,71 @@ from media_service.analysis_pipeline import (
 
 
 class AnalysisPipelineTests(unittest.TestCase):
+    def test_transcript_language_filter_keeps_only_selected_language_cues(
+        self,
+    ) -> None:
+        transcript = {
+            "status": "ready",
+            "language": "auto",
+            "text": "中文内容。日本語です。English text.",
+            "cues": [
+                {"startSeconds": 0, "endSeconds": 1, "text": "中文内容。"},
+                {"startSeconds": 1, "endSeconds": 2, "text": "日本語です。"},
+                {"startSeconds": 2, "endSeconds": 3, "text": "English text."},
+            ],
+        }
+
+        filtered = _filter_transcript_languages(
+            transcript,
+            ("zh", "en"),
+        )
+
+        self.assertEqual(filtered["language"], "zh,en")
+        self.assertEqual(
+            [cue["text"] for cue in filtered["cues"]],
+            ["中文内容。", "English text."],
+        )
+        self.assertNotIn("日本語", filtered["text"])
+
+    def test_all_or_no_transcript_languages_use_automatic_detection(self) -> None:
+        for languages in ((), ("zh", "ja", "en")):
+            transcript = {
+                "status": "ready",
+                "language": "zh",
+                "text": "中文とEnglish。",
+                "cues": [
+                    {
+                        "startSeconds": 0,
+                        "endSeconds": 1,
+                        "text": "中文とEnglish。",
+                    }
+                ],
+            }
+
+            filtered = _filter_transcript_languages(transcript, languages)
+
+            self.assertEqual(filtered["language"], "auto")
+            self.assertEqual(len(filtered["cues"]), 1)
+
+    def test_single_japanese_selection_does_not_drop_kanji_only_cues(self) -> None:
+        transcript = {
+            "status": "ready",
+            "language": "auto",
+            "text": "東京大学。",
+            "cues": [
+                {
+                    "startSeconds": 0,
+                    "endSeconds": 1,
+                    "text": "東京大学。",
+                }
+            ],
+        }
+
+        filtered = _filter_transcript_languages(transcript, ("ja",))
+
+        self.assertEqual(filtered["language"], "ja")
+        self.assertEqual(filtered["text"], "東京大学。")
+
     def test_ct_punc_receives_unpunctuated_text(self) -> None:
         punctuation_model = Mock()
         punctuation_model.generate.return_value = [

@@ -4,6 +4,7 @@ import type {
   BilibiliJobSnapshot,
   CreateBilibiliJobRequest,
 } from "../bilibili-api";
+import type { TranscriptLanguage } from "../video-engine";
 import { DEFAULT_BILIBILI_DOWNLOAD_VARIANT } from "../bilibili-api";
 import {
   BilibiliConfigurationError,
@@ -32,6 +33,11 @@ const JOB_PHASES = new Set([
 const SUPPORTED_DOWNLOAD_VARIANTS = new Set<BilibiliDownloadVariant>([
   "preview",
   "analysis",
+]);
+const SUPPORTED_TRANSCRIPT_LANGUAGES = new Set<TranscriptLanguage>([
+  "zh",
+  "ja",
+  "en",
 ]);
 
 export class BilibiliInputError extends Error {
@@ -122,6 +128,51 @@ export function validateBilibiliJobId(value: string) {
     throw new BilibiliInputError("B站下载任务 ID 无效。");
   }
   return value.toLowerCase();
+}
+
+export async function readTranscriptOptionsRequest(request: Request) {
+  const contentType = request.headers.get("content-type") ?? "";
+  if (!contentType.toLowerCase().startsWith("application/json")) {
+    throw new BilibiliInputError("字幕设置请求必须使用 application/json。");
+  }
+  const contentLength = Number(request.headers.get("content-length"));
+  if (
+    Number.isFinite(contentLength) &&
+    contentLength > MAX_CONTROL_BODY_BYTES
+  ) {
+    throw new BilibiliInputError("字幕设置请求体过大。");
+  }
+  const raw = await request.text();
+  if (new TextEncoder().encode(raw).byteLength > MAX_CONTROL_BODY_BYTES) {
+    throw new BilibiliInputError("字幕设置请求体过大。");
+  }
+  let value: unknown;
+  try {
+    value = JSON.parse(raw);
+  } catch {
+    throw new BilibiliInputError("字幕设置请求体不是有效 JSON。");
+  }
+  if (!value || typeof value !== "object" || Array.isArray(value)) {
+    throw new BilibiliInputError("字幕设置请求体必须是对象。");
+  }
+  const languages = (value as Record<string, unknown>).languages;
+  if (
+    !Array.isArray(languages) ||
+    languages.length > SUPPORTED_TRANSCRIPT_LANGUAGES.size ||
+    languages.some(
+      (language) =>
+        typeof language !== "string" ||
+        !SUPPORTED_TRANSCRIPT_LANGUAGES.has(
+          language as TranscriptLanguage,
+        ),
+    ) ||
+    new Set(languages).size !== languages.length
+  ) {
+    throw new BilibiliInputError(
+      "languages 只能包含不重复的 zh、ja、en。",
+    );
+  }
+  return JSON.stringify({ languages });
 }
 
 export async function requestBilibiliService(

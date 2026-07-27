@@ -342,6 +342,9 @@ test("server-renders the FrameNote video workspace", async () => {
   assert.match(html, /设置/);
   assert.match(html, /视频对话/);
   assert.match(html, /新建/);
+  assert.match(html, /aria-label="隐藏侧边栏"/);
+  assert.match(html, /aria-label="隐藏导入板块"/);
+  assert.match(html, /aria-label="隐藏记录板块"/);
   assert.doesNotMatch(html, /视频总结对话/);
   assert.doesNotMatch(html, /architecture-note/);
   assert.doesNotMatch(html, /Qwen 视频理解 \+ DeepSeek V4 Pro 对话/);
@@ -782,7 +785,7 @@ test("validates and proxies Bilibili download jobs without exposing the service 
   ));
 });
 
-test("uses Qwen for analysis and DeepSeek V4 Pro for follow-up answers", async (t) => {
+test("uses Qwen for analysis and selects the requested DeepSeek follow-up model", async (t) => {
   const providerRequests = [];
   const summary = {
     title: "测试视频",
@@ -831,13 +834,16 @@ test("uses Qwen for analysis and DeepSeek V4 Pro for follow-up answers", async (
       body: JSON.parse(body),
     };
     providerRequests.push(providerRequest);
-    if (providerRequest.body.model === "deepseek-v4-pro") {
+    if (
+      providerRequest.body.model === "deepseek-v4-pro" ||
+      providerRequest.body.model === "deepseek-v4-flash"
+    ) {
       res.writeHead(200, { "content-type": "application/json" });
       res.end(JSON.stringify({
         id: "chatcmpl-deepseek-test",
         object: "chat.completion",
         created: 0,
-        model: "deepseek-v4-pro",
+        model: providerRequest.body.model,
         choices: [{
           index: 0,
           message: {
@@ -1075,6 +1081,8 @@ test("uses Qwen for analysis and DeepSeek V4 Pro for follow-up answers", async (
             "[00:00] 视频介绍模型接口。\n[00:08] 随后完成调用验证。",
         },
         history: [{ role: "user", content: "它讲了什么？" }],
+        reasoningMode: "pro",
+        webSearchEnabled: false,
       }),
     },
     {
@@ -1118,6 +1126,7 @@ test("uses Qwen for analysis and DeepSeek V4 Pro for follow-up answers", async (
           subtitle: "legacy.mp4",
         },
         summary: summaryWithoutAudioAnalysis,
+        reasoningMode: "pro",
       }),
     },
     {
@@ -1127,6 +1136,33 @@ test("uses Qwen for analysis and DeepSeek V4 Pro for follow-up answers", async (
     },
   );
   assert.equal(legacyAskResponse.status, 200);
+
+  const flashAskResponse = await request(
+    "/api/model/ask",
+    {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        question: "快速回答。",
+        source: {
+          kind: "upload",
+          title: "快速模型测试",
+          subtitle: "flash.mp4",
+        },
+        summary,
+        reasoningMode: "flash",
+        webSearchEnabled: false,
+      }),
+    },
+    {
+      DEEPSEEK_API_KEY: "deepseek-test-key",
+      DEEPSEEK_BASE_URL: `http://127.0.0.1:${address.port}/deepseek`,
+      DEEPSEEK_FLASH_MODEL: "deepseek-v4-flash",
+      DEEPSEEK_PRO_MODEL: "deepseek-v4-pro",
+    },
+  );
+  assert.equal(flashAskResponse.status, 200);
+  assert.equal((await flashAskResponse.json()).model, "deepseek-v4-flash");
 });
 
 test("removes disposable starter assets and keeps model choice decoupled", async () => {
@@ -1245,7 +1281,10 @@ test("removes disposable starter assets and keeps model choice decoupled", async
   assert.doesNotMatch(workbench, /可以继续输入；停止当前回答后即可发送/);
   assert.match(workbench, /480p 等价分析素材/);
   assert.doesNotMatch(workbench, /不设网页文件大小上限/);
-  assert.match(workbench, /自动生成低分辨率分析素材/);
+  assert.doesNotMatch(workbench, /自动生成低分辨率分析素材/);
+  assert.doesNotMatch(workbench, /MP4、MOV、WebM、MKV、M4V ·/);
+  assert.match(workbench, /aria-label="选择文件"/);
+  assert.match(workbench, />\s*选择文件\s*<\/button>/);
   assert.doesNotMatch(workbench, /浏览器处理上限/);
   assert.doesNotMatch(workbench, /BILIBILI_VIDEO_QUALITIES|最高 \{height\}p/);
   assert.doesNotMatch(workbench, /download=\{videoPreview\.filename\}/);
@@ -1258,6 +1297,30 @@ test("removes disposable starter assets and keeps model choice decoupled", async
   assert.match(workbench, /字幕提取/);
   assert.match(workbench, /FunASR Nano＋CT-Punc/);
   assert.match(workbench, /transcriptExtractionEnabled/);
+  assert.match(workbench, /语言选择/);
+  assert.match(workbench, /自动识别中、日、英/);
+  assert.match(workbench, /深度思考/);
+  assert.match(workbench, /联网搜索/);
+  assert.match(workbench, /reasoningMode:\s*deepThinkingEnabled \? "pro" : "flash"/);
+  assert.doesNotMatch(workbench, /这个视频的核心观点是什么/);
+  assert.doesNotMatch(workbench, /按时间线梳理章节/);
+  assert.doesNotMatch(workbench, /给我三个行动建议/);
+  assert.match(workbench, /framenote\.workspace-layout\.v1/);
+  assert.match(workbench, /beginResize\("columns", event\)/);
+  assert.match(workbench, /beginResize\("rows", event\)/);
+  assert.match(workbench, /beginResize\("diagonal-source", event\)/);
+  assert.match(workbench, /beginResize\("diagonal-history", event\)/);
+  assert.match(workbench, /斜向调整导入板块大小/);
+  assert.match(workbench, /斜向调整记录板块大小/);
+  assert.match(workbench, /role="separator"/);
+  assert.match(workbench, /aria-orientation="vertical"/);
+  assert.match(workbench, /aria-orientation="horizontal"/);
+  assert.match(workbench, /function toggleSourcePane\(\)/);
+  assert.match(workbench, /function toggleHistoryPane\(\)/);
+  assert.match(workbench, /MIN_SIDEBAR_WIDTH\s*=\s*340/);
+  assert.match(workbench, /MIN_CONVERSATION_WIDTH\s*=\s*560/);
+  assert.match(workbench, /MIN_SOURCE_PANE_HEIGHT\s*=\s*260/);
+  assert.match(workbench, /MIN_HISTORY_PANE_HEIGHT\s*=\s*220/);
   const restoreStart = workbench.indexOf(
     "async function loadBilibiliConversationPreview",
   );
@@ -1324,6 +1387,22 @@ test("removes disposable starter assets and keeps model choice decoupled", async
   );
   assert.match(
     styles,
+    /html\[data-theme="dark"\]\s*\{[^}]*--switch-active:\s*#6cc1fb;/s,
+  );
+  assert.match(
+    styles,
+    /\.analysis-setting-row input:checked \+ i\s*\{[^}]*background:\s*var\(--switch-active\);/s,
+  );
+  assert.match(
+    styles,
+    /\.transcript-language-settings fieldset label:active span\s*\{[^}]*transform:\s*scale\(0\.96\);/s,
+  );
+  assert.match(
+    styles,
+    /\.conversation-tool-row button:active\s*\{[^}]*transform:\s*scale\(0\.96\);/s,
+  );
+  assert.match(
+    styles,
     /\.video-preview-details > strong\s*\{[^}]*var\(--ui-font-size\)/s,
   );
   assert.match(
@@ -1335,6 +1414,37 @@ test("removes disposable starter assets and keeps model choice decoupled", async
   assert.doesNotMatch(workbench, /download-option|switch-wrap|下载公开视频，再进行总结/);
   assert.match(styles, /\.conversation-library\s*\{[^}]*display:\s*flex/s);
   assert.match(styles, /\.conversation-list\s*\{[^}]*flex:\s*1/s);
+  assert.match(
+    styles,
+    /\.workspace\s*\{[^}]*width:\s*min\(1880px,[^}]*grid-template-columns:/s,
+  );
+  assert.match(styles, /\.workspace-resizer\s*\{[^}]*cursor:\s*col-resize;/s);
+  assert.match(styles, /\.pane-resizer\s*\{[^}]*cursor:\s*row-resize;/s);
+  assert.match(
+    styles,
+    /\.source-diagonal-resizer\s*\{[^}]*cursor:\s*nwse-resize;/s,
+  );
+  assert.match(
+    styles,
+    /\.history-diagonal-resizer\s*\{[^}]*cursor:\s*nesw-resize;/s,
+  );
+  assert.match(
+    styles,
+    /\.video-preview-card\.side \.video-preview-player video\s*\{[^}]*width:\s*100%;[^}]*height:\s*auto;[^}]*max-height:\s*none;[^}]*aspect-ratio:\s*auto;/s,
+  );
+  assert.doesNotMatch(
+    styles,
+    /\.workspace-resizer::before|\.pane-resizer::before|\.diagonal-resizer::before/,
+  );
+  assert.match(styles, /transition:\s*grid-template-columns 240ms/);
+  assert.match(styles, /grid-template-rows 240ms/);
+  assert.match(
+    styles,
+    /\.source-card\s*\{[^}]*scrollbar-color:\s*var\(--line-strong\) transparent;/s,
+  );
+  assert.match(styles, /\.source-card::-webkit-scrollbar,/);
+  assert.match(styles, /\.setup-column\.source-collapsed/);
+  assert.match(styles, /\.setup-column\.history-collapsed/);
   const parsedHostingConfig = JSON.parse(hostingJson);
   assert.equal(parsedHostingConfig.d1, "DB");
   assert.equal(typeof parsedHostingConfig.project_id, "string");

@@ -7,6 +7,7 @@ import type {
 } from "../bilibili-api";
 import type {
   SourceKind,
+  TranscriptLanguage,
   VideoModelContext,
   VideoTranscript,
 } from "../video-engine";
@@ -170,13 +171,19 @@ export async function prepareMediaAnalysis(
 
 export async function extractMediaTranscript(
   jobId: string,
+  languages: TranscriptLanguage[],
   signal?: AbortSignal,
 ): Promise<VideoTranscript> {
   throwIfAborted(signal);
   const deadline = Date.now() + MAX_JOB_WAIT_MS;
   let snapshot = await requestJob(
     `/api/media/jobs/${jobId}/transcript`,
-    { method: "POST", signal },
+    {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ languages }),
+      signal,
+    },
   );
   while (snapshot.analysis?.transcript.status === "pending") {
     if (Date.now() >= deadline) {

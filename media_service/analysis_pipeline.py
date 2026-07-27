@@ -677,6 +677,7 @@ def _normalize_funasr_result(
     result: Any,
     duration_seconds: float,
     repunctuated_text: str | None = None,
+    language: str = "auto",
 ) -> dict[str, Any]:
     item = result[0] if isinstance(result, list) and result else result
     if not isinstance(item, dict):
@@ -713,11 +714,64 @@ def _normalize_funasr_result(
         )
     return {
         "status": "ready" if text else "unavailable",
-        "language": "zh",
+        "language": language,
         "text": text,
         "cues": cues,
         **({} if text else {"error": "没有识别到可辨语音。"}),
     }
+
+
+def _dominant_transcript_language(text: str) -> str | None:
+    hiragana_or_katakana = sum(
+        1
+        for character in text
+        if "\u3040" <= character <= "\u30ff"
+        or "\u31f0" <= character <= "\u31ff"
+    )
+    han = sum(1 for character in text if "\u3400" <= character <= "\u9fff")
+    latin = sum(
+        1
+        for character in text
+        if ("a" <= character.lower() <= "z")
+    )
+    if hiragana_or_katakana:
+        return "ja"
+    if han:
+        return "zh"
+    if latin:
+        return "en"
+    return None
+
+
+def _filter_transcript_languages(
+    transcript: dict[str, Any],
+    languages: tuple[str, ...],
+) -> dict[str, Any]:
+    selected = tuple(dict.fromkeys(languages))
+    if not selected or len(selected) == 3:
+        transcript["language"] = "auto"
+        return transcript
+    transcript["language"] = ",".join(selected)
+    # A single selected language is already supplied to Nano as a decoding
+    # constraint. Filtering it again would incorrectly discard Japanese
+    # sentences made only from Kanji.
+    if len(selected) == 1:
+        return transcript
+
+    cues = [
+        cue
+        for cue in transcript.get("cues", [])
+        if _dominant_transcript_language(str(cue.get("text") or ""))
+        in selected
+    ]
+    transcript["cues"] = cues
+    transcript["text"] = "".join(
+        str(cue.get("text") or "").strip() for cue in cues
+    ).strip()
+    if not transcript["text"]:
+        transcript["status"] = "unavailable"
+        transcript["error"] = "没有识别到所选语言的字幕。"
+    return transcript
 
 
 def _is_nano_model(model_name: str) -> bool:
@@ -808,13 +862,33 @@ def _repunctuate_with_ct_punc(
     )
 
 
-def transcribe_with_funasr(wav_path: Path, duration_seconds: float) -> dict[str, Any]:
+def transcribe_with_funasr(
+    wav_path: Path,
+    duration_seconds: float,
+    languages: tuple[str, ...] = (),
+) -> dict[str, Any]:
+    selected_languages = tuple(
+        language
+        for language in dict.fromkeys(languages)
+        if language in {"zh", "ja", "en"}
+    )
+    language_names = {"zh": "中文", "ja": "日文", "en": "英文"}
+    forced_language = (
+        language_names[selected_languages[0]]
+        if len(selected_languages) == 1
+        else None
+    )
+    output_language = (
+        selected_languages[0]
+        if len(selected_languages) == 1
+        else "auto"
+    )
     try:
         import funasr  # noqa: F401
     except ImportError:
         return {
             "status": "unavailable",
-            "language": "zh",
+            "language": output_language,
             "text": "",
             "cues": [],
             "error": "FunASR 未安装。",
@@ -834,24 +908,30 @@ def transcribe_with_funasr(wav_path: Path, duration_seconds: float) -> dict[str,
         repunctuated_text = None
         with _FUNASR_INFERENCE_LOCK:
             if _is_nano_model(model_name):
+                generation_options: dict[str, Any] = {
+                    "input": str(wav_path),
+                    "cache": {},
+                    "batch_size": 1,
+                    "use_itn": True,
+                }
+                if forced_language:
+                    generation_options["language"] = forced_language
                 result = model.generate(
-                    input=str(wav_path),
-                    cache={},
-                    batch_size=1,
-                    language=os.getenv("FRAMENOTE_FUNASR_LANGUAGE", "中文"),
-                    use_itn=True,
+                    **generation_options,
                 )
-                try:
-                    repunctuated_text = _repunctuate_with_ct_punc(
-                        _funasr_result_text(result),
-                        punc_model,
-                        device,
-                        hub,
-                    )
-                except Exception:
-                    # Keep the usable Nano transcript if punctuation recovery
-                    # is temporarily unavailable or returns incompatible text.
-                    repunctuated_text = None
+                raw_text = _funasr_result_text(result)
+                if _dominant_transcript_language(raw_text) != "ja":
+                    try:
+                        repunctuated_text = _repunctuate_with_ct_punc(
+                            raw_text,
+                            punc_model,
+                            device,
+                            hub,
+                        )
+                    except Exception:
+                        # Keep the usable Nano transcript if punctuation
+                        # recovery is unavailable or incompatible.
+                        repunctuated_text = None
             else:
                 result = model.generate(
                     input=str(wav_path),
@@ -859,15 +939,19 @@ def transcribe_with_funasr(wav_path: Path, duration_seconds: float) -> dict[str,
                     batch_size_threshold_s=60,
                     sentence_timestamp=True,
                 )
-        return _normalize_funasr_result(
-            result,
-            duration_seconds,
-            repunctuated_text,
+        return _filter_transcript_languages(
+            _normalize_funasr_result(
+                result,
+                duration_seconds,
+                repunctuated_text,
+                output_language,
+            ),
+            selected_languages,
         )
     except Exception as exc:
         return {
             "status": "unavailable",
-            "language": "zh",
+            "language": output_language,
             "text": "",
             "cues": [],
             "error": f"FunASR 提取失败：{str(exc)[:240]}",
@@ -933,6 +1017,7 @@ def complete_analysis_transcript(
     duration_seconds: float,
     video_path: Path | None = None,
     ffmpeg: str | None = None,
+    languages: tuple[str, ...] = (),
 ) -> dict[str, Any]:
     """Complete the deferred FunASR step and atomically update its manifest."""
     manifest_path = output_dir / "analysis-manifest.json"
@@ -958,11 +1043,15 @@ def complete_analysis_transcript(
             wav_path = extract_funasr_audio(ffmpeg, video_path, output_dir)
         if not wav_path.is_file() or wav_path.is_symlink():
             raise RuntimeError("FunASR 音轨不存在。")
-        transcript = transcribe_with_funasr(wav_path, duration_seconds)
+        transcript = transcribe_with_funasr(
+            wav_path,
+            duration_seconds,
+            languages,
+        )
     except Exception as exc:
         transcript = {
             "status": "unavailable",
-            "language": "zh",
+            "language": ",".join(languages) if languages else "auto",
             "text": "",
             "cues": [],
             "error": f"FunASR 提取失败：{str(exc)[:240]}",

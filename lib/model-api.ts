@@ -16,6 +16,8 @@ export interface AskVideoRequest {
   summary: VideoSummary;
   context?: VideoModelContext;
   history?: VideoConversationMessage[];
+  reasoningMode?: "flash" | "pro";
+  webSearchEnabled?: boolean;
 }
 
 export interface AnalyzeVideoResponse {
@@ -28,6 +30,7 @@ export interface AskVideoResponse {
   provider: "deepseek";
   model: string;
   answer: string;
+  webSearchUsed?: boolean;
 }
 
 export interface ModelApiErrorBody {

@@ -82,11 +82,25 @@ export function parseAskVideoRequest(value: unknown): AskVideoRequest {
     question,
     source,
     summary,
+    reasoningMode: parseReasoningMode(object.reasoningMode),
+    webSearchEnabled: booleanValue(
+      object.webSearchEnabled,
+      "webSearchEnabled",
+      false,
+    ),
     ...(object.context === undefined
       ? {}
       : { context: parseContext(object.context, true) }),
     ...(history ? { history } : {}),
   };
+}
+
+function parseReasoningMode(value: unknown): "flash" | "pro" {
+  if (value === undefined) return "flash";
+  if (value !== "flash" && value !== "pro") {
+    throw new QwenInputError("reasoningMode 只支持 flash 或 pro。");
+  }
+  return value;
 }
 
 export function modelErrorResponse(
@@ -372,6 +386,18 @@ function optionalString(value: unknown, field: string, maxLength: number) {
 function numberValue(value: unknown, field: string) {
   if (typeof value !== "number" || !Number.isFinite(value)) {
     throw new QwenInputError(`${field} 必须是有限数字。`);
+  }
+  return value;
+}
+
+function booleanValue(
+  value: unknown,
+  field: string,
+  fallback: boolean,
+) {
+  if (value === undefined) return fallback;
+  if (typeof value !== "boolean") {
+    throw new QwenInputError(`${field} 必须是布尔值。`);
   }
   return value;
 }
