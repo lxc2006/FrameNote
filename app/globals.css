@@ -2404,6 +2404,18 @@ html[data-resizing] .sidebar-pane-content {
   font-weight: 800;
 }
 
+.message-markdown a {
+  color: var(--accent-deep);
+  font-weight: 760;
+  text-decoration: underline;
+  text-decoration-color: color-mix(in srgb, currentColor 42%, transparent);
+  text-underline-offset: 0.18em;
+}
+
+.message-markdown a:hover {
+  text-decoration-color: currentColor;
+}
+
 .message.user .message-markdown {
   border-color: #cce6f8;
   border-radius: 13px 4px 13px 13px;

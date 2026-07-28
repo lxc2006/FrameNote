@@ -8,8 +8,11 @@ import type { TranscriptLanguage } from "../video-engine";
 import { DEFAULT_BILIBILI_DOWNLOAD_VARIANT } from "../bilibili-api";
 import {
   BilibiliConfigurationError,
-  getBilibiliServiceConfig,
 } from "./bilibili-config";
+import {
+  MediaServiceUnavailableError,
+  requestMediaService,
+} from "./media-service-client";
 
 const MAX_CONTROL_BODY_BYTES = 8 * 1024;
 const BVID_PATTERN = /^BV[0-9A-Za-z]{10}$/;
@@ -180,41 +183,7 @@ export async function requestBilibiliService(
   init: RequestInit,
   timeoutOverrideMs?: number,
 ): Promise<Response> {
-  const config = getBilibiliServiceConfig();
-  if (!config.baseURL) {
-    throw new BilibiliConfigurationError(
-      "B站媒体服务尚未配置。请先启动 media_service/app.py，并填写 BILIBILI_MEDIA_SERVICE_URL。",
-    );
-  }
-
-  const headers = new Headers(init.headers);
-  headers.set("accept", "application/json");
-  if (config.token) headers.set("authorization", `Bearer ${config.token}`);
-
-  const timeoutSignal = AbortSignal.timeout(timeoutOverrideMs ?? config.timeoutMs);
-  const signals = init.signal ? [init.signal, timeoutSignal] : [timeoutSignal];
-  const requestInit = {
-    ...init,
-    headers,
-    signal: signals.length === 1 ? signals[0] : AbortSignal.any(signals),
-    ...(init.body instanceof ReadableStream ? { duplex: "half" as const } : {}),
-  };
-
-  try {
-    return await fetch(`${config.baseURL}${path}`, {
-      ...requestInit,
-    });
-  } catch (error) {
-    if (init.signal?.aborted) throw error;
-    if (timeoutSignal.aborted) {
-      throw new BilibiliServiceUnavailableError(
-        "B站媒体服务响应超时，请稍后重试。",
-      );
-    }
-    throw new BilibiliServiceUnavailableError(
-      "无法连接 B站媒体服务，请确认 Python 服务已经启动。",
-    );
-  }
+  return requestMediaService(path, init, timeoutOverrideMs);
 }
 
 export async function proxyMediaJson(response: Response) {
@@ -282,7 +251,7 @@ export function bilibiliRouteErrorResponse(error: unknown) {
   if (error instanceof BilibiliInputError) {
     return bilibiliErrorResponse(400, "INVALID_BILIBILI_INPUT", error.message, false);
   }
-  if (error instanceof BilibiliServiceUnavailableError) {
+  if (error instanceof MediaServiceUnavailableError) {
     return bilibiliErrorResponse(503, "MEDIA_SERVICE_UNAVAILABLE", error.message, true);
   }
   if (error instanceof DOMException && error.name === "AbortError") {
@@ -296,13 +265,6 @@ export function bilibiliRouteErrorResponse(error: unknown) {
     "B站下载服务发生内部错误。",
     true,
   );
-}
-
-class BilibiliServiceUnavailableError extends Error {
-  constructor(message: string) {
-    super(message);
-    this.name = "BilibiliServiceUnavailableError";
-  }
 }
 
 function parseUpstreamError(value: unknown) {

@@ -40,7 +40,16 @@ declare module "cloudflare:workers" {
     DEEPSEEK_API_KEY?: string;
     DEEPSEEK_BASE_URL?: string;
     DEEPSEEK_CHAT_MODEL?: string;
+    DEEPSEEK_FLASH_MODEL?: string;
+    DEEPSEEK_PRO_MODEL?: string;
     DEEPSEEK_REQUEST_TIMEOUT_MS?: string;
+    SERPAPI_API_KEY?: string;
+    SERPAPI_ENDPOINT?: string;
+    SERPAPI_REQUEST_TIMEOUT_MS?: string;
+    WEB_CONTENT_EXTRACT_TIMEOUT_MS?: string;
+    CLOUDFLARE_ACCOUNT_ID?: string;
+    CLOUDFLARE_BROWSER_RUN_API_TOKEN?: string;
+    CLOUDFLARE_BROWSER_RUN_TIMEOUT_MS?: string;
     BILIBILI_MEDIA_SERVICE_URL?: string;
     BILIBILI_MEDIA_SERVICE_TOKEN?: string;
     BILIBILI_MEDIA_REQUEST_TIMEOUT_MS?: string;

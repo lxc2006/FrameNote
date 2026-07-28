@@ -910,8 +910,8 @@ test("uses Qwen for analysis and selects the requested DeepSeek follow-up model"
     },
   );
 
-  assert.equal(response.status, 200);
   const payload = await response.json();
+  assert.equal(response.status, 200, JSON.stringify(payload));
   assert.deepEqual(payload.summary, summary);
   const providerRequest = providerRequests[0];
   assert.equal(providerRequest.authorization, "Bearer local-test-key");
@@ -1165,6 +1165,159 @@ test("uses Qwen for analysis and selects the requested DeepSeek follow-up model"
   assert.equal((await flashAskResponse.json()).model, "deepseek-v4-flash");
 });
 
+test("plans a search, reads four pages and returns persistent citations", async (t) => {
+  const modelRequests = [];
+  const extractedUrls = [];
+  const upstream = createServer(async (req, res) => {
+    let rawBody = "";
+    for await (const chunk of req) rawBody += chunk;
+
+    if (req.url?.startsWith("/search.json")) {
+      const requestUrl = new URL(req.url, "http://127.0.0.1");
+      assert.equal(requestUrl.searchParams.get("q"), "测试作品 官方资料 最新版本");
+      res.writeHead(200, { "content-type": "application/json" });
+      res.end(JSON.stringify({
+        organic_results: [1, 2, 3, 4].map((index) => ({
+          title: `可信来源 ${index}`,
+          link: `https://source${index}.example/article`,
+          snippet: `第 ${index} 个搜索摘要`,
+        })),
+      }));
+      return;
+    }
+
+    if (req.url === "/v1/web/extract") {
+      assert.equal(req.headers.authorization, "Bearer media-search-token");
+      const body = JSON.parse(rawBody);
+      extractedUrls.push(body.url);
+      const index = Number(body.url.match(/source(\d+)/)?.[1] ?? 0);
+      res.writeHead(200, { "content-type": "application/json" });
+      res.end(JSON.stringify({
+        status: "ok",
+        url: body.url,
+        finalUrl: body.url,
+        title: `正文来源 ${index}`,
+        contentType: "text/html",
+        method: "trafilatura",
+        text: [
+          `测试作品的官方资料显示，第 ${index} 个来源记录了当前版本以及发布日期。这一段包含用于验证搜索正文的有效信息，也明确列出了版本标识、适用地区、更新时间和发布主体。`,
+          `该来源还解释了测试作品的版本变化，并提供可以和其他独立网页交叉核验的事实内容。为了让相关段落选择器能够稳定工作，这里继续补充来源背景与核验范围。`,
+        ].join("\n\n"),
+      }));
+      return;
+    }
+
+    if (req.url === "/deepseek/chat/completions") {
+      const body = JSON.parse(rawBody);
+      modelRequests.push(body);
+      const isPlanner = body.messages[0]?.content?.includes("联网检索规划器");
+      const content = isPlanner
+        ? JSON.stringify({
+            decision: "search",
+            query: "测试作品 官方资料 最新版本",
+            reason: "用户要求核实当前资料。",
+            searchLanguage: "zh-CN",
+            countryCode: "CN",
+          })
+        : "官方资料显示当前版本已经更新。[1] 第二个独立来源给出了相同结论。[2]";
+      res.writeHead(200, { "content-type": "application/json" });
+      res.end(JSON.stringify({
+        id: "chatcmpl-web-search-test",
+        object: "chat.completion",
+        created: 0,
+        model: body.model,
+        choices: [{
+          index: 0,
+          message: { role: "assistant", content },
+          finish_reason: "stop",
+        }],
+      }));
+      return;
+    }
+
+    res.writeHead(404).end();
+  });
+  upstream.listen(0, "127.0.0.1");
+  await once(upstream, "listening");
+  t.after(() => upstream.close());
+  const address = upstream.address();
+  assert.ok(address && typeof address === "object");
+  const origin = `http://127.0.0.1:${address.port}`;
+
+  const response = await request(
+    "/api/model/ask",
+    {
+      method: "POST",
+      headers: {
+        "content-type": "application/json",
+        "accept-language": "zh-CN",
+      },
+      body: JSON.stringify({
+        question: "请联网核实这个作品的最新版本。",
+        source: {
+          kind: "bilibili",
+          title: "测试作品",
+          subtitle: "BV1nx411u79K",
+          bvid: "BV1nx411u79K",
+          description: "作者发布的测试作品。",
+        },
+        summary: {
+          title: "测试作品总结",
+          overview: "视频讨论了一个作品版本。",
+          keyPoints: [{
+            time: "00:10",
+            title: "作品版本",
+            detail: "作者提到作品可能已经更新。",
+          }],
+          chapters: [{
+            time: "00:10",
+            title: "版本讨论",
+            description: "视频讨论了作品版本变化。",
+          }],
+        },
+        context: {
+          transcript: "[00:10] 作者提到作品最近可能更新。",
+        },
+        history: [{ role: "user", content: "刚才说的是哪个作品？" }],
+        webSearchEnabled: true,
+        reasoningMode: "flash",
+        searchContext: {
+          locale: "zh-CN",
+          timeZone: "Asia/Shanghai",
+          transcriptLanguage: "zh",
+        },
+      }),
+    },
+    {
+      DEEPSEEK_API_KEY: "deepseek-test-key",
+      DEEPSEEK_BASE_URL: `${origin}/deepseek`,
+      DEEPSEEK_FLASH_MODEL: "deepseek-v4-flash",
+      SERPAPI_API_KEY: "serp-test-key",
+      SERPAPI_ENDPOINT: `${origin}/search.json`,
+      BILIBILI_MEDIA_SERVICE_URL: origin,
+      BILIBILI_MEDIA_SERVICE_TOKEN: "media-search-token",
+    },
+  );
+
+  const payload = await response.json();
+  assert.equal(response.status, 200, JSON.stringify(payload));
+  assert.equal(payload.webSearchUsed, true);
+  assert.equal(payload.visitedPageCount, 4);
+  assert.match(payload.answer, /\[1\]\(https:\/\/source1\.example\/article\)/);
+  assert.match(payload.answer, /参考来源/);
+  assert.match(payload.answer, /访问了 4 个网页/);
+  assert.equal(extractedUrls.length, 4);
+  assert.equal(modelRequests.length, 2);
+  assert.match(modelRequests[0].messages[1].content, /测试作品/);
+  assert.match(modelRequests[0].messages[1].content, /作者提到作品最近可能更新/);
+  assert.match(
+    modelRequests[1].messages.find((message) =>
+      message.content?.includes?.("联网搜索资料"),
+    ).content,
+    /passages/,
+  );
+});
+
 test("removes disposable starter assets and keeps model choice decoupled", async () => {
   const [
     page,
@@ -1335,6 +1488,7 @@ test("removes disposable starter assets and keeps model choice decoupled", async
     /setSummary\(null\)|setMessages\(\[\]\)|setActiveConversationId\(null\)|setPhase\("error"\)/,
   );
   assert.match(workbench, /MarkdownMessage/);
+  assert.match(workbench, /\? `\[\$\{link\[1\]\}\]` : link\[1\]/);
   assert.match(workbench, /timeline-seek/);
   assert.match(workbench, /seekToTimeline/);
   assert.doesNotMatch(workbench, /summary-mode|>结构化</);

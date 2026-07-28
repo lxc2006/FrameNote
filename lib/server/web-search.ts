@@ -1,43 +1,36 @@
-import type { VideoSourceDescriptor } from "../video-engine";
+import { extractWebDocument } from "./web-content";
 import { positiveInteger, runtimeValue } from "./runtime-env";
+import { planWebSearch } from "./web-search-planner";
+import type {
+  WebSearchEvidence,
+  WebSearchPlanningContext,
+  WebSearchSource,
+} from "./web-search-types";
 
-const SERPAPI_ENDPOINT = "https://serpapi.com/search.json";
-const MAX_SEARCH_RESULTS = 8;
-const MAX_QUERY_CHARACTERS = 240;
+export type {
+  WebSearchEvidence,
+  WebSearchPlan,
+  WebSearchPlanningContext,
+  WebSearchSource,
+} from "./web-search-types";
+
+const DEFAULT_SERPAPI_ENDPOINT = "https://serpapi.com/search.json";
+const TARGET_READABLE_PAGES = 4;
+const MAX_SEARCH_CANDIDATES = 12;
 const DEFAULT_TIMEOUT_MS = 15_000;
+const MAX_PASSAGES_PER_SOURCE = 4;
+const MAX_PASSAGE_CHARACTERS = 1_600;
 
-const SEARCH_INTENT_PATTERN =
-  /(?:联网|上网|搜索|搜一下|查一下|查证|核实|事实核查|来源|出处|是真的吗|是否属实|对不对|可靠吗|可信(?:吗|么)?|准确吗|有没有依据|最新|最近|今日|今天|刚刚|目前|现在|实时|新闻|价格|多少钱|汇率|天气|比分|赛程|政策|法规|版本|更新|发布|附近|周边|当地|本地|营业时间|地址|电话|官网|现任|(?:总统|总理|主席|首相|CEO|负责人|冠军|排名|票房|市值|股价).{0,12}(?:是谁|多少|排名|情况)|current|latest|today|news|search|verify|fact[\s-]?check|near me)/i;
-
-const UNSAFE_SEARCH_PATTERNS = [
-  /(?:自制|制作|组装|合成).{0,10}(?:炸弹|爆炸物|枪支|枪械|毒气|剧毒物)/i,
-  /(?:购买|交易|出售).{0,8}(?:毒品|枪支|枪械|爆炸物|儿童色情)/i,
-  /(?:入侵|攻击|盗取|破解).{0,10}(?:账号|密码|服务器|网站|摄像头|银行卡)/i,
-  /(?:人肉|开盒|跟踪|定位).{0,10}(?:个人|住址|手机号|身份证|实时位置)/i,
-  /(?:自杀|轻生).{0,8}(?:方法|教程|成功率|最有效)/i,
-  /(?:儿童|未成年).{0,8}(?:色情|裸照|性交易)/i,
-];
-
-export interface WebSearchSource {
+interface SearchCandidate {
   title: string;
   url: string;
   snippet: string;
   publishedAt?: string;
-  reliability: "high" | "medium" | "unverified";
-  sourceType: "organic" | "news" | "local" | "answer";
-}
-
-export interface WebSearchEvidence {
-  status: "searched" | "blocked" | "unavailable";
-  query?: string;
-  sources: WebSearchSource[];
-  note?: string;
+  sourceType: WebSearchSource["sourceType"];
 }
 
 interface SerpApiResult {
   error?: unknown;
-  answer_box?: Record<string, unknown>;
-  knowledge_graph?: Record<string, unknown>;
   organic_results?: Array<Record<string, unknown>>;
   news_results?: Array<Record<string, unknown>>;
   local_results?: {
@@ -45,25 +38,38 @@ interface SerpApiResult {
   };
 }
 
-export function shouldUseWebSearch(question: string) {
-  return SEARCH_INTENT_PATTERN.test(question.trim());
-}
-
-export function isUnsafeWebSearch(question: string) {
-  return UNSAFE_SEARCH_PATTERNS.some((pattern) => pattern.test(question));
-}
-
 export async function prepareWebSearch(
-  question: string,
-  source: VideoSourceDescriptor,
+  context: WebSearchPlanningContext,
   signal?: AbortSignal,
-): Promise<WebSearchEvidence | undefined> {
-  if (!shouldUseWebSearch(question)) return undefined;
-  if (isUnsafeWebSearch(question)) {
+): Promise<WebSearchEvidence> {
+  let plan;
+  try {
+    plan = await planWebSearch(context, signal);
+  } catch (error) {
+    if (signal?.aborted) throw error;
     return {
-      status: "blocked",
+      status: "unavailable",
+      plan: {
+        decision: "skip",
+        reason: "搜索规划模型暂时不可用。",
+      },
       sources: [],
-      note: "该请求可能涉及危险操作、违法获取或严重隐私侵害，已跳过联网检索。",
+      visitedPageCount: 0,
+      note: "未能完成联网意图判断与关键词提取，本轮没有执行搜索。",
+    };
+  }
+
+  if (plan.decision !== "search" || !plan.query) {
+    const status = plan.decision === "forbidden" ? "forbidden" : "skipped";
+    return {
+      status,
+      plan,
+      sources: [],
+      visitedPageCount: 0,
+      note:
+        status === "forbidden"
+          ? "搜索规划判断本轮不应访问公开网页。"
+          : "当前问题不需要联网检索。",
     };
   }
 
@@ -71,21 +77,93 @@ export async function prepareWebSearch(
   if (!apiKey) {
     return {
       status: "unavailable",
+      plan,
+      query: plan.query,
       sources: [],
+      visitedPageCount: 0,
       note: "尚未配置 SERPAPI_API_KEY，无法执行联网检索。",
     };
   }
 
-  const query = buildSearchQuery(question, source);
-  const endpoint = new URL(SERPAPI_ENDPOINT);
+  const candidates = await searchSerpApi(
+    plan.query,
+    plan.searchLanguage ?? context.locale,
+    plan.countryCode ?? countryCodeFromRegion(context.region),
+    apiKey,
+    signal,
+  );
+  if (!candidates.length) {
+    return {
+      status: "unavailable",
+      plan,
+      query: plan.query,
+      sources: [],
+      visitedPageCount: 0,
+      note: "SerpAPI 没有返回可读取的网页结果。",
+    };
+  }
+
+  const sources: WebSearchSource[] = [];
+  for (const candidate of candidates) {
+    if (sources.length >= TARGET_READABLE_PAGES) break;
+    const document = await extractWebDocument(candidate.url, signal);
+    if (!document) continue;
+    const passages = selectRelevantPassages(
+      document.text,
+      `${plan.query} ${context.question}`,
+    );
+    if (!passages.length) continue;
+    const finalUrl = document.finalUrl;
+    sources.push({
+      index: sources.length + 1,
+      title: (document.title || candidate.title).slice(0, 240),
+      url: finalUrl,
+      snippet: candidate.snippet.slice(0, 800),
+      passages,
+      ...(document.publishedAt || candidate.publishedAt
+        ? {
+            publishedAt: (
+              document.publishedAt || candidate.publishedAt
+            )?.slice(0, 80),
+          }
+        : {}),
+      reliability: sourceReliability(finalUrl),
+      sourceType: candidate.sourceType,
+      extractionMethod: document.method,
+    });
+  }
+
+  return {
+    status: sources.length > 0 ? "searched" : "unavailable",
+    plan,
+    query: plan.query,
+    sources,
+    visitedPageCount: sources.length,
+    ...(sources.length
+      ? {}
+      : {
+          note:
+            "搜索结果均无法读取：可能需要登录、触发了反爬验证，或没有可提取正文。",
+        }),
+  };
+}
+
+async function searchSerpApi(
+  query: string,
+  locale: string,
+  countryCode: string | undefined,
+  apiKey: string,
+  signal?: AbortSignal,
+) {
+  const endpoint = serpApiEndpoint();
   endpoint.searchParams.set("engine", "google");
   endpoint.searchParams.set("q", query);
   endpoint.searchParams.set("api_key", apiKey);
   endpoint.searchParams.set("output", "json");
   endpoint.searchParams.set("safe", "active");
-  endpoint.searchParams.set("hl", "zh-cn");
-  endpoint.searchParams.set("gl", "cn");
-  endpoint.searchParams.set("num", String(MAX_SEARCH_RESULTS));
+  endpoint.searchParams.set("hl", normalizeGoogleLanguage(locale));
+  if (countryCode) endpoint.searchParams.set("gl", countryCode);
+  endpoint.searchParams.set("num", String(MAX_SEARCH_CANDIDATES));
 
   const timeoutSignal = AbortSignal.timeout(
     positiveInteger(
@@ -96,7 +174,6 @@ export async function prepareWebSearch(
   const requestSignal = signal
     ? AbortSignal.any([signal, timeoutSignal])
     : timeoutSignal;
-
   try {
     const response = await fetch(endpoint, {
       headers: { accept: "application/json" },
@@ -105,110 +182,185 @@ export async function prepareWebSearch(
     const body = (await response.json().catch(() => null)) as
       | SerpApiResult
       | null;
-    if (!response.ok || !body || typeof body !== "object") {
-      return {
-        status: "unavailable",
-        query,
-        sources: [],
-        note: `SerpAPI 检索失败（HTTP ${response.status}）。`,
-      };
-    }
-    if (typeof body.error === "string" && body.error.trim()) {
-      return {
-        status: "unavailable",
-        query,
-        sources: [],
-        note: `SerpAPI 检索失败：${body.error.trim().slice(0, 180)}`,
-      };
-    }
-    const sources = collectSources(body).slice(0, MAX_SEARCH_RESULTS);
-    return {
-      status: sources.length > 0 ? "searched" : "unavailable",
-      query,
-      sources,
-      ...(sources.length > 0
-        ? {}
-        : { note: "SerpAPI 没有返回可用于回答的搜索结果。" }),
-    };
+    if (!response.ok || !body || typeof body !== "object") return [];
+    if (typeof body.error === "string" && body.error.trim()) return [];
+    return collectCandidates(body).slice(0, MAX_SEARCH_CANDIDATES);
   } catch (error) {
     if (signal?.aborted) throw error;
-    return {
-      status: "unavailable",
-      query,
-      sources: [],
-      note: timeoutSignal.aborted
-        ? "SerpAPI 检索超时。"
-        : "暂时无法连接 SerpAPI。",
-    };
+    return [];
   }
 }
 
-function buildSearchQuery(question: string, source: VideoSourceDescriptor) {
-  const normalized = question
-    .replace(
-      /(?:请|麻烦)?(?:帮我)?(?:联网|上网)?(?:搜索|搜一下|查一下|查证|核实)(?:一下)?/gi,
-      " ",
-    )
-    .replace(/\s+/g, " ")
-    .trim();
-  const needsVideoContext =
-    /(?:这个|该|视频中|作者|里面|上述|它)/.test(normalized);
-  const query = needsVideoContext
-    ? `${source.title} ${normalized}`
-    : normalized;
-  return query.slice(0, MAX_QUERY_CHARACTERS);
+function serpApiEndpoint() {
+  const configured = runtimeValue("SERPAPI_ENDPOINT");
+  if (!configured) return new URL(DEFAULT_SERPAPI_ENDPOINT);
+  try {
+    const url = new URL(configured);
+    const localHttp =
+      url.protocol === "http:" &&
+      (url.hostname === "127.0.0.1" || url.hostname === "localhost");
+    if (url.protocol !== "https:" && !localHttp) {
+      return new URL(DEFAULT_SERPAPI_ENDPOINT);
+    }
+    return url;
+  } catch {
+    return new URL(DEFAULT_SERPAPI_ENDPOINT);
+  }
 }
 
-function collectSources(body: SerpApiResult) {
-  const sources: WebSearchSource[] = [];
+function collectCandidates(body: SerpApiResult) {
+  const candidates: SearchCandidate[] = [];
   const seen = new Set<string>();
   const add = (
     item: Record<string, unknown>,
-    sourceType: WebSearchSource["sourceType"],
+    sourceType: SearchCandidate["sourceType"],
   ) => {
-    const url = stringField(item.link) || stringField(item.website);
+    const url = publicHttpUrl(stringField(item.link) || stringField(item.website));
     const title =
       stringField(item.title) ||
       stringField(item.name) ||
       stringField(item.source);
+    if (!url || !title || seen.has(url)) return;
+    seen.add(url);
     const snippet =
       stringField(item.snippet) ||
       stringField(item.description) ||
-      stringField(item.answer) ||
-      stringField(item.address);
-    if (!url || !title || seen.has(url) || !isPublicHttpUrl(url)) return;
-    seen.add(url);
-    sources.push({
+      stringField(item.address) ||
+      "搜索结果没有提供摘要。";
+    candidates.push({
       title: title.slice(0, 240),
       url,
-      snippet: (snippet || "搜索结果未提供摘要。").slice(0, 800),
+      snippet: snippet.slice(0, 800),
       ...(stringField(item.date)
         ? { publishedAt: stringField(item.date)?.slice(0, 80) }
         : {}),
-      reliability: sourceReliability(url),
       sourceType,
     });
   };
 
-  if (body.answer_box) add(body.answer_box, "answer");
-  if (body.knowledge_graph) add(body.knowledge_graph, "answer");
-  for (const result of body.news_results ?? []) add(result, "news");
   for (const result of body.organic_results ?? []) add(result, "organic");
+  for (const result of body.news_results ?? []) add(result, "news");
   for (const result of body.local_results?.places ?? []) add(result, "local");
-  return sources;
+  return candidates;
+}
+
+export function selectRelevantPassages(text: string, query: string) {
+  const paragraphs = text
+    .replace(/\r/g, "")
+    .split(/\n{2,}|\n(?=(?:[-*•]|\d+[.)、])\s+)/)
+    .map((paragraph) => paragraph.replace(/\s+/g, " ").trim())
+    .filter((paragraph) => paragraph.length >= 60)
+    .slice(0, 500);
+  if (!paragraphs.length) return [];
+
+  const terms = searchTerms(query);
+  const ranked = paragraphs
+    .map((paragraph, order) => {
+      const normalized = paragraph.toLocaleLowerCase();
+      const overlap = terms.reduce(
+        (score, term) => score + (normalized.includes(term) ? 1 : 0),
+        0,
+      );
+      const lengthScore = Math.min(paragraph.length, 800) / 800;
+      const earlyScore = 1 / (order + 4);
+      return {
+        paragraph,
+        order,
+        score: overlap * 3 + lengthScore + earlyScore,
+      };
+    })
+    .sort((left, right) => right.score - left.score || left.order - right.order);
+
+  const selected: string[] = [];
+  for (const item of ranked) {
+    if (
+      selected.some(
+        (existing) =>
+          existing.includes(item.paragraph.slice(0, 80)) ||
+          item.paragraph.includes(existing.slice(0, 80)),
+      )
+    ) {
+      continue;
+    }
+    selected.push(item.paragraph.slice(0, MAX_PASSAGE_CHARACTERS));
+    if (selected.length >= MAX_PASSAGES_PER_SOURCE) break;
+  }
+  return selected;
+}
+
+function searchTerms(value: string) {
+  const normalized = value.toLocaleLowerCase();
+  const terms = new Set(
+    normalized
+      .match(/[a-z0-9][a-z0-9._-]{1,}|[\p{Script=Han}]{2,}/gu)
+      ?.map((term) => term.trim())
+      .filter(Boolean) ?? [],
+  );
+  for (const run of normalized.match(/[\p{Script=Han}]{3,}/gu) ?? []) {
+    for (let index = 0; index < run.length - 1 && terms.size < 80; index += 1) {
+      terms.add(run.slice(index, index + 2));
+    }
+  }
+  return [...terms].slice(0, 80);
+}
+
+function normalizeGoogleLanguage(value: string) {
+  const normalized = value.toLowerCase();
+  if (normalized.startsWith("zh")) return "zh-cn";
+  if (normalized.startsWith("ja")) return "ja";
+  if (normalized.startsWith("en")) return "en";
+  return normalized.match(/^[a-z]{2,3}/)?.[0] ?? "zh-cn";
+}
+
+function countryCodeFromRegion(value: string) {
+  const normalized = value.trim().toLowerCase();
+  if (/^[a-z]{2}$/.test(normalized)) return normalized;
+  if (/china|中国|beijing|shanghai|chongqing|guangdong/.test(normalized)) {
+    return "cn";
+  }
+  return undefined;
 }
 
 function stringField(value: unknown) {
   return typeof value === "string" && value.trim() ? value.trim() : undefined;
 }
 
-function isPublicHttpUrl(value: string) {
+function publicHttpUrl(value: string | undefined) {
+  if (!value) return null;
   try {
     const url = new URL(value);
-    return url.protocol === "https:" || url.protocol === "http:";
+    if (
+      !["https:", "http:"].includes(url.protocol) ||
+      url.username ||
+      url.password ||
+      isPrivateHostname(url.hostname)
+    ) {
+      return null;
+    }
+    return url.href;
   } catch {
-    return false;
+    return null;
   }
+}
+
+function isPrivateHostname(hostname: string) {
+  const normalized = hostname.toLowerCase().replace(/\.$/, "");
+  if (
+    normalized === "localhost" ||
+    normalized.endsWith(".local") ||
+    normalized === "::1"
+  ) {
+    return true;
+  }
+  if (/^(?:127|10)\./.test(normalized) || /^192\.168\./.test(normalized)) {
+    return true;
+  }
+  const private172 = normalized.match(/^172\.(\d{1,3})\./);
+  if (private172) {
+    const second = Number(private172[1]);
+    if (second >= 16 && second <= 31) return true;
+  }
+  return normalized === "0.0.0.0";
 }
 
 function sourceReliability(urlValue: string): WebSearchSource["reliability"] {

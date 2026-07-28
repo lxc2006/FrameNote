@@ -18,6 +18,11 @@ export interface AskVideoRequest {
   history?: VideoConversationMessage[];
   reasoningMode?: "flash" | "pro";
   webSearchEnabled?: boolean;
+  searchContext?: {
+    locale?: string;
+    timeZone?: string;
+    transcriptLanguage?: string;
+  };
 }
 
 export interface AnalyzeVideoResponse {
@@ -31,6 +36,7 @@ export interface AskVideoResponse {
   model: string;
   answer: string;
   webSearchUsed?: boolean;
+  visitedPageCount?: number;
 }
 
 export interface ModelApiErrorBody {

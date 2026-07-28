@@ -246,13 +246,32 @@ function transcriptForConversationContext(transcript: VideoTranscript | null) {
 }
 
 function renderInlineMarkdown(value: string, keyPrefix: string): ReactNode[] {
-  return value.split(/(\*\*[^*\n]+\*\*)/g).filter(Boolean).map((part, index) =>
-    part.startsWith("**") && part.endsWith("**") ? (
-      <strong key={`${keyPrefix}-strong-${index}`}>{part.slice(2, -2)}</strong>
-    ) : (
-      <span key={`${keyPrefix}-text-${index}`}>{part}</span>
-    ),
-  );
+  return value
+    .split(/(\*\*[^*\n]+\*\*|\[[^\]\n]+\]\(https?:\/\/[^)\s]+\))/g)
+    .filter(Boolean)
+    .map((part, index) => {
+      if (part.startsWith("**") && part.endsWith("**")) {
+        return (
+          <strong key={`${keyPrefix}-strong-${index}`}>
+            {part.slice(2, -2)}
+          </strong>
+        );
+      }
+      const link = part.match(/^\[([^\]\n]+)\]\((https?:\/\/[^)\s]+)\)$/);
+      if (link) {
+        return (
+          <a
+            key={`${keyPrefix}-link-${index}`}
+            href={link[2]}
+            target="_blank"
+            rel="noopener noreferrer"
+          >
+            {/^\d{1,2}$/.test(link[1]) ? `[${link[1]}]` : link[1]}
+          </a>
+        );
+      }
+      return <span key={`${keyPrefix}-text-${index}`}>{part}</span>;
+    });
 }
 
 function MarkdownMessage({ content }: { content: string }) {
@@ -1878,6 +1897,18 @@ export default function VideoWorkbench() {
           history: messages.slice(-12).map(({ role, content }) => ({ role, content })),
           reasoningMode: deepThinkingEnabled ? "pro" : "flash",
           webSearchEnabled,
+          ...(webSearchEnabled
+            ? {
+                searchContext: {
+                  locale: navigator.language,
+                  timeZone:
+                    Intl.DateTimeFormat().resolvedOptions().timeZone,
+                  ...(transcript?.language
+                    ? { transcriptLanguage: transcript.language }
+                    : {}),
+                },
+              }
+            : {}),
         },
         controller.signal,
       );

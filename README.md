@@ -27,8 +27,9 @@
 ## 对话设置
 
 - **深度思考**：关闭时使用 `DEEPSEEK_FLASH_MODEL`，开启时使用 `DEEPSEEK_PRO_MODEL`。
-- **联网搜索**：开启后仍不会每次都搜索；只有主动搜索、最新/实时信息、事实核查、本地信息等问题才调用 SerpAPI。搜索结果会作为不可信外部资料交给模型，回答需要优先使用一手来源、核对时效并附链接。
-- 涉及危险操作、违法获取、严重隐私侵害等请求会跳过联网检索。
+- **联网搜索**：开启后先调用一次 Flash 模型，结合视频标题、简介、总结、相关字幕、近期对话、语言、地区和日期判断是否需要搜索，并把含糊代词补全为可用关键词。
+- SerpAPI 返回候选网址后，系统会顺序补足最多 4 个可读来源：普通网页由 Trafilatura 提取正文，PDF 由 pypdf 解析；必须运行 JavaScript 的页面可选用 Cloudflare Browser Rendering。登录页、反爬验证页和不可访问页面会被跳过。
+- 回答中的搜索事实使用可点击编号引用，末尾列出来源并显示本轮实际访问的网页数量。
 
 ## 本地运行
 
@@ -76,6 +77,15 @@ BILIBILI_MEDIA_SERVICE_TOKEN=
 ```
 
 本机回环开发可以暂时不设置媒体服务 Token。公开部署时，网站和媒体服务必须配置相同的高强度 Token，并让媒体服务使用 HTTPS。
+
+如需为必须执行 JavaScript 的网页启用浏览器渲染回退，再填写：
+
+```dotenv
+CLOUDFLARE_ACCOUNT_ID=
+CLOUDFLARE_BROWSER_RUN_API_TOKEN=
+```
+
+该 Token 只需要 Cloudflare Browser Rendering 的调用权限。未配置时不影响普通 HTML 和 PDF 正文提取，只会跳过必须运行 JavaScript 的页面。
 
 ### 4. 启动两个服务
 
@@ -161,6 +171,9 @@ pnpm lint
 - `media_service/analysis_pipeline.py`：场景检测、关键帧评分去重、音轨和 FunASR 字幕。
 - `lib/server/qwen-video-engine.ts`：Qwen 视频总结。
 - `lib/server/deepseek-conversation-engine.ts`：带固定视频上下文的后续对话。
-- `lib/server/web-search.ts`：联网意图判断、危险查询拦截、SerpAPI 检索与来源分级。
+- `lib/server/web-search-planner.ts`：Flash 联网意图判断与上下文关键词提取。
+- `lib/server/web-search.ts`：SerpAPI 候选检索、正文相关段落选择与来源分级。
+- `lib/server/web-content.ts`：Python 正文提取与 Cloudflare Browser Rendering 回退。
+- `media_service/web_extract.py`：Trafilatura HTML 正文提取、pypdf PDF 解析和抓取安全边界。
 
 更完整的接口与部署约束见 [架构文档](docs/architecture.md)。

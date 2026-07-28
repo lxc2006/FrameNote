@@ -2,7 +2,7 @@
 
 这是 FrameNote 的独立媒体服务，统一处理本地上传、HTTPS 视频直链分析和 B 站公开 UGC。所有 `analysis` 任务都会先生成最长边不超过 854px 的 H.264/AAC 素材，再按视频时长选择“直接视频”或“最多 64 张关键帧 + 独立音轨”。Qwen 完成后，网页可以按设置异步启动 FunASR；Nano 自动识别或按单一语言约束识别中、日、英文，CT-Punc 为中英文重新恢复整段标点，最终只按句号、问号和感叹号合并为整句字幕。
 
-B 站 `preview` 任务准备默认最高兼容画质，网页通过 HTTP Range 内联播放 URL 边播放边缓存，并可使用附件 URL 手动下载。B 站任务只接收严格的 12 位 BVID，不读取 Cookie，不登录 B 站，也不尝试访问会员、私有、付费或地区受限内容。HTTPS 直链由网页下载后作为文件上传到本服务，媒体服务本身不会对用户提供的 URL 发起请求。请只处理你拥有或已获授权使用的视频。
+B 站 `preview` 任务准备默认最高兼容画质，网页通过 HTTP Range 内联播放 URL 边播放边缓存，并可使用附件 URL 手动下载。B 站任务只接收严格的 12 位 BVID，不读取 Cookie，不登录 B 站，也不尝试访问会员、私有、付费或地区受限内容。HTTPS 视频直链仍由网页下载后作为文件上传，本服务不会为视频分析直接抓取该地址。联网搜索另有一个仅供网站服务端调用、需要同一 Token 的正文提取接口。
 
 ## 固定限制
 
@@ -17,6 +17,7 @@ B 站 `preview` 任务准备默认最高兼容画质，网页通过 HTTP Range �
 - 下载文件默认保留 1 小时；
 - `preview` 播放/下载 URL 默认随文件保留 1 小时，`analysis` 签名 URL 默认有效 10 分钟。
 - 关键帧固定锚点间隔为 `max(1 秒, 视频时长 / 50)`；每个锚点及 AdaptiveDetector 场景点前后取 5 个候选，按清晰度、曝光、对比度、信息熵与独特性评分，并用 pHash 去重。
+- 网页正文抓取只允许公开 HTTP(S) 地址和 80/443 端口，逐次校验重定向与 DNS 结果；HTML 最大 5 MB，PDF 最大 20 MB。
 
 这些安全上限固定在服务端，不能由请求覆盖。
 
@@ -84,6 +85,7 @@ docker run --rm -p 8788:8788 `
 | `FRAMENOTE_FUNASR_VAD_MODEL` | `fsmn-vad` | 长音频语音活动检测模型 |
 | `FRAMENOTE_FUNASR_PUNC_MODEL` | `ct-punc` | Nano 识别完成后的独立标点恢复模型；设置为空可回退到 Nano 原生标点 |
 | `FRAMENOTE_FUNASR_DEVICE` | `cpu` | 推理设备，例如 `cpu` 或 `cuda:0` |
+| `FRAMENOTE_WEB_FETCH_TIMEOUT_SECONDS` | `12` | 单个搜索结果正文的连接与读取超时，范围会限制在 3–30 秒 |
 
 `playbackUrl` 与 `downloadUrl` 由浏览器直接访问，因此 `FRAMENOTE_MEDIA_PUBLIC_BASE_URL` 必须是浏览器能够访问的 HTTPS Origin；`127.0.0.1` 只适合本机联调。
 
@@ -119,6 +121,18 @@ Content-Type: application/json
 {"languages":["zh","ja","en"]}
 DELETE /v1/media/jobs/{jobId}
 ```
+
+### 提取搜索结果正文
+
+```http
+POST /v1/web/extract
+Content-Type: application/json
+Authorization: Bearer <FRAMENOTE_MEDIA_API_TOKEN>
+
+{"url":"https://example.com/article"}
+```
+
+普通 HTML 使用 Trafilatura，PDF 使用 pypdf。成功时返回 `status: "ok"` 和正文；静态响应没有正文时返回 `status: "requires_browser"`，由网站服务端决定是否调用 Cloudflare Browser Rendering；登录、反爬验证、超时和不公开地址返回 `status: "skipped"`。
 
 ### 创建 B 站任务
 
