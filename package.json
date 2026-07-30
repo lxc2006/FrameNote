@@ -10,7 +10,7 @@
     "dev": "vinext dev",
     "build": "vinext build",
     "start": "vinext start",
-    "test": "vinext build && node --test tests/rendered-html.test.mjs tests/bilibili-client.test.mjs tests/media-analysis-client.test.mjs tests/dashscope-video-upload.test.mjs tests/qwen-video-parser.test.mjs",
+    "test": "vinext build && node --test tests/rendered-html.test.mjs tests/bilibili-client.test.mjs tests/media-analysis-client.test.mjs tests/dashscope-video-upload.test.mjs tests/qwen-video-parser.test.mjs tests/analysis-progress.test.mjs tests/markdown-content.test.mjs tests/model-usage.test.mjs tests/video-recall.test.mjs",
     "lint": "eslint . --ignore-pattern dist --ignore-pattern .next",
     "db:generate": "drizzle-kit generate"
   },
@@ -19,7 +19,9 @@
     "next": "16.2.6",
     "openai": "^6.47.0",
     "react": "19.2.6",
-    "react-dom": "19.2.6"
+    "react-dom": "19.2.6",
+    "react-markdown": "^10.1.0",
+    "remark-gfm": "^4.0.1"
   },
   "devDependencies": {
     "@cloudflare/vite-plugin": "1.37.1",

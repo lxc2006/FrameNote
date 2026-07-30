@@ -2,8 +2,10 @@ import type {
   ConversationDetail,
   ConversationListItem,
   ConversationMessage,
+  ConversationMessageInput,
   CreateConversationInput,
 } from "@/lib/conversation";
+import type { VideoTranscript } from "@/lib/video-engine";
 
 interface ConversationErrorPayload {
   error?: {
@@ -75,6 +77,20 @@ export async function renameConversation(id: string, title: string) {
   return payload.conversation;
 }
 
+export async function updateConversationTranscript(
+  id: string,
+  transcript: VideoTranscript,
+) {
+  const payload = await conversationRequest<{ transcript: VideoTranscript }>(
+    `/api/conversations/${encodeURIComponent(id)}/transcript`,
+    {
+      method: "PUT",
+      body: JSON.stringify({ transcript }),
+    },
+  );
+  return payload.transcript;
+}
+
 export async function deleteConversation(id: string) {
   await conversationRequest<void>(`/api/conversations/${encodeURIComponent(id)}`, {
     method: "DELETE",
@@ -83,7 +99,7 @@ export async function deleteConversation(id: string) {
 
 export async function appendConversationMessages(
   id: string,
-  messages: Array<Pick<ConversationMessage, "role" | "content">>,
+  messages: ConversationMessageInput[],
 ) {
   const payload = await conversationRequest<{ messages: ConversationMessage[] }>(
     `/api/conversations/${encodeURIComponent(id)}/messages`,
@@ -93,4 +109,17 @@ export async function appendConversationMessages(
     },
   );
   return payload.messages;
+}
+
+export async function truncateConversationMessages(
+  id: string,
+  fromMessageId: string,
+) {
+  await conversationRequest<void>(
+    `/api/conversations/${encodeURIComponent(id)}/messages`,
+    {
+      method: "DELETE",
+      body: JSON.stringify({ fromMessageId }),
+    },
+  );
 }

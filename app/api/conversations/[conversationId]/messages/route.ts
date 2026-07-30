@@ -5,7 +5,9 @@ import {
   ownerIdFromRequest,
   parseAppendMessagesInput,
   parseConversationId,
+  parseTruncateMessagesInput,
   readConversationJson,
+  truncateConversationMessages,
 } from "@/lib/server/conversation-store";
 
 export const dynamic = "force-dynamic";
@@ -30,6 +32,20 @@ export async function POST(request: Request, context: RouteContext) {
       input,
     );
     return conversationJson({ messages }, { status: 201 });
+  } catch (error) {
+    return conversationErrorResponse(error);
+  }
+}
+
+export async function DELETE(request: Request, context: RouteContext) {
+  try {
+    const ownerId = ownerIdFromRequest(request);
+    const conversationId = await conversationIdFrom(context);
+    const input = parseTruncateMessagesInput(
+      await readConversationJson(request),
+    );
+    await truncateConversationMessages(ownerId, conversationId, input);
+    return new Response(null, { status: 204 });
   } catch (error) {
     return conversationErrorResponse(error);
   }

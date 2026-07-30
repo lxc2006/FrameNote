@@ -6,6 +6,7 @@ import type {
   WebSearchPlanningContext,
   WebSearchSource,
 } from "./web-search-types";
+import type { ModelUsageSink } from "../model-usage";
 
 export type {
   WebSearchEvidence,
@@ -38,13 +39,24 @@ interface SerpApiResult {
   };
 }
 
+interface WebSearchUsageHooks {
+  onModelUsage?: ModelUsageSink;
+  onSearchRequest?: () => void;
+}
+
 export async function prepareWebSearch(
   context: WebSearchPlanningContext,
   signal?: AbortSignal,
+  usageHooks: WebSearchUsageHooks = {},
 ): Promise<WebSearchEvidence> {
   let plan;
   try {
-    plan = await planWebSearch(context, signal);
+    plan = await planWebSearch(
+      context,
+      signal,
+      undefined,
+      usageHooks.onModelUsage,
+    );
   } catch (error) {
     if (signal?.aborted) throw error;
     return {
@@ -85,6 +97,7 @@ export async function prepareWebSearch(
     };
   }
 
+  usageHooks.onSearchRequest?.();
   const candidates = await searchSerpApi(
     plan.query,
     plan.searchLanguage ?? context.locale,

@@ -2,6 +2,8 @@ import type {
   ConversationDetail,
   ConversationListItem,
   ConversationMessage,
+  ConversationMessageInput,
+  ConversationWebSource,
   CreateConversationInput,
 } from "../conversation";
 import type {
@@ -15,13 +17,20 @@ import {
   parseVideoSummary,
 } from "./qwen-video-engine";
 import { runtimeBinding } from "./runtime-env";
+import {
+  parseConversationUsageRecord,
+  type ConversationUsageRecord,
+} from "../model-usage";
 
 const USER_EMAIL_HEADER = "oai-authenticated-user-email";
 const LOCAL_OWNER_ID = "local-development-user";
 const MAX_REQUEST_BYTES = 2 * 1024 * 1024;
 const MAX_MESSAGES_PER_WRITE = 20;
 const MAX_MESSAGE_CHARACTERS = 12_000;
+const MAX_REASONING_CHARACTERS = 80_000;
+const MAX_MESSAGE_WEB_SOURCES = 12;
 const MAX_SUMMARY_BYTES = 512 * 1024;
+// 读取层保留旧记录兼容余量；新生成的总结已在 Qwen 解析器中限制为 24 个。
 const MAX_KEY_POINTS = 32;
 const MAX_CHAPTERS = 256;
 const MAX_EVIDENCE = 24;
@@ -53,6 +62,17 @@ const CONVERSATION_SCHEMA_STATEMENTS = [
    )`,
   `CREATE UNIQUE INDEX IF NOT EXISTS conversation_messages_sequence_idx
    ON conversation_messages (conversation_id, sequence)`,
+  `CREATE TABLE IF NOT EXISTS conversation_message_details (
+     message_id TEXT PRIMARY KEY NOT NULL,
+     conversation_id TEXT NOT NULL,
+     reasoning_content TEXT,
+     reasoning_duration_seconds INTEGER,
+     web_sources_json TEXT,
+     usage_json TEXT,
+     stopped INTEGER NOT NULL DEFAULT 0,
+     FOREIGN KEY (message_id) REFERENCES conversation_messages(id) ON DELETE CASCADE,
+     FOREIGN KEY (conversation_id) REFERENCES conversations(id) ON DELETE CASCADE
+   )`,
   `CREATE TABLE IF NOT EXISTS conversation_transcripts (
      conversation_id TEXT PRIMARY KEY NOT NULL,
      transcript_json TEXT NOT NULL,
@@ -104,8 +124,21 @@ interface MessageRow {
   created_at: number;
 }
 
+interface MessageDetailRow {
+  message_id: string;
+  reasoning_content: string | null;
+  reasoning_duration_seconds: number | null;
+  web_sources_json: string | null;
+  usage_json: string | null;
+  stopped: number;
+}
+
 interface AppendMessagesInput {
-  messages: Array<Pick<ConversationMessage, "role" | "content">>;
+  messages: ConversationMessageInput[];
+}
+
+interface TruncateMessagesInput {
+  fromMessageId: string;
 }
 
 export class ConversationRouteError extends Error {
@@ -214,11 +247,31 @@ export function parseRenameConversationInput(value: unknown): { title: string } 
   return { title: stringValue(object.title, "title", 300) };
 }
 
+export function parseUpdateTranscriptInput(value: unknown): {
+  transcript: VideoTranscript;
+} {
+  const object = recordValue(value, "请求体");
+  assertOnlyKeys(object, ["transcript"], "请求体");
+  return { transcript: parseTranscript(object.transcript) };
+}
+
 export function parseAppendMessagesInput(value: unknown): AppendMessagesInput {
   const object = recordValue(value, "请求体");
   assertOnlyKeys(object, ["messages"], "请求体");
   return {
     messages: parseMessageInputs(object.messages, "messages", false),
+  };
+}
+
+export function parseTruncateMessagesInput(
+  value: unknown,
+): TruncateMessagesInput {
+  const object = recordValue(value, "请求体");
+  assertOnlyKeys(object, ["fromMessageId"], "请求体");
+  return {
+    fromMessageId: parseConversationId(
+      stringValue(object.fromMessageId, "fromMessageId", 36),
+    ),
   };
 }
 
@@ -265,6 +318,7 @@ export async function createConversation(
     role: message.role,
     content: message.content,
     createdAt: now + index,
+    ...messageMetadata(message),
   }));
 
   const statements: D1PreparedStatement[] = [
@@ -302,6 +356,14 @@ export async function createConversation(
           message.createdAt,
         ),
     ),
+    ...messageRecords.flatMap((message) => {
+      const statement = messageDetailsStatement(
+        databaseBinding,
+        conversationId,
+        message,
+      );
+      return statement ? [statement] : [];
+    }),
     ...(input.transcript
       ? [
           databaseBinding
@@ -356,6 +418,14 @@ export async function getConversation(
   )
     .bind(conversationId)
     .all<MessageRow>();
+  const messageDetailResult = await databaseBinding.prepare(
+    `SELECT message_id, reasoning_content, reasoning_duration_seconds,
+            web_sources_json, usage_json, stopped
+     FROM conversation_message_details
+     WHERE conversation_id = ?`,
+  )
+    .bind(conversationId)
+    .all<MessageDetailRow>();
   const transcriptRow = await databaseBinding.prepare(
     `SELECT transcript_json
      FROM conversation_transcripts
@@ -367,11 +437,16 @@ export async function getConversation(
   try {
     const source = parseSource(JSON.parse(row.source_json));
     const summary = parseSummary(JSON.parse(row.summary_json), source.title);
+    const detailsByMessageId = new Map(
+      messageDetailResult.results.map((detail) => [detail.message_id, detail]),
+    );
     return {
       ...listItemFromRow(row),
       source,
       summary,
-      messages: messageResult.results.map(messageFromRow),
+      messages: messageResult.results.map((message) =>
+        messageFromRow(message, detailsByMessageId.get(message.id)),
+      ),
       activeModel: row.active_model,
       ...(transcriptRow
         ? { transcript: parseTranscript(JSON.parse(transcriptRow.transcript_json)) }
@@ -414,6 +489,36 @@ export async function renameConversation(
   return listItemFromRow(row);
 }
 
+export async function updateConversationTranscript(
+  ownerId: string,
+  conversationId: string,
+  transcript: VideoTranscript,
+): Promise<VideoTranscript> {
+  await requireOwnedConversation(ownerId, conversationId);
+  const databaseBinding = await database();
+  const updatedAt = Date.now();
+  const results = await databaseBinding.batch([
+    databaseBinding
+      .prepare(
+        `INSERT INTO conversation_transcripts (
+           conversation_id, transcript_json
+         ) VALUES (?, ?)
+         ON CONFLICT(conversation_id)
+         DO UPDATE SET transcript_json = excluded.transcript_json`,
+      )
+      .bind(conversationId, JSON.stringify(transcript)),
+    databaseBinding
+      .prepare(
+        `UPDATE conversations
+         SET updated_at = ?
+         WHERE id = ? AND owner_id = ?`,
+      )
+      .bind(updatedAt, conversationId, ownerId),
+  ]);
+  assertBatchSucceeded(results);
+  return transcript;
+}
+
 export async function deleteConversation(
   ownerId: string,
   conversationId: string,
@@ -424,6 +529,14 @@ export async function deleteConversation(
     databaseBinding
       .prepare(
         `DELETE FROM conversation_transcripts
+         WHERE conversation_id IN (
+           SELECT id FROM conversations WHERE id = ? AND owner_id = ?
+         )`,
+      )
+      .bind(conversationId, ownerId),
+    databaseBinding
+      .prepare(
+        `DELETE FROM conversation_message_details
          WHERE conversation_id IN (
            SELECT id FROM conversations WHERE id = ? AND owner_id = ?
          )`,
@@ -457,6 +570,7 @@ export async function appendConversationMessages(
     role: message.role,
     content: message.content,
     createdAt: now + index,
+    ...messageMetadata(message),
   }));
   const updatedAt = createdMessages.at(-1)?.createdAt ?? now;
   const statements: D1PreparedStatement[] = [
@@ -479,6 +593,14 @@ export async function appendConversationMessages(
           conversationId,
         ),
     ),
+    ...createdMessages.flatMap((message) => {
+      const statement = messageDetailsStatement(
+        databaseBinding,
+        conversationId,
+        message,
+      );
+      return statement ? [statement] : [];
+    }),
     databaseBinding
       .prepare(
         `UPDATE conversations
@@ -490,6 +612,59 @@ export async function appendConversationMessages(
   const results = await databaseBinding.batch(statements);
   assertBatchSucceeded(results);
   return createdMessages;
+}
+
+export async function truncateConversationMessages(
+  ownerId: string,
+  conversationId: string,
+  input: TruncateMessagesInput,
+): Promise<void> {
+  await requireOwnedConversation(ownerId, conversationId);
+  const databaseBinding = await database();
+  const anchor = await databaseBinding
+    .prepare(
+      `SELECT sequence
+       FROM conversation_messages
+       WHERE id = ? AND conversation_id = ?`,
+    )
+    .bind(input.fromMessageId, conversationId)
+    .first<{ sequence: number }>();
+  if (!anchor) {
+    throw new ConversationRouteError(
+      404,
+      "MESSAGE_NOT_FOUND",
+      "要重新发送的消息已不存在，请刷新对话后重试。",
+    );
+  }
+
+  const updatedAt = Date.now();
+  const results = await databaseBinding.batch([
+    databaseBinding
+      .prepare(
+        `DELETE FROM conversation_message_details
+         WHERE conversation_id = ?
+           AND message_id IN (
+             SELECT id
+             FROM conversation_messages
+             WHERE conversation_id = ? AND sequence >= ?
+           )`,
+      )
+      .bind(conversationId, conversationId, anchor.sequence),
+    databaseBinding
+      .prepare(
+        `DELETE FROM conversation_messages
+         WHERE conversation_id = ? AND sequence >= ?`,
+      )
+      .bind(conversationId, anchor.sequence),
+    databaseBinding
+      .prepare(
+        `UPDATE conversations
+         SET updated_at = ?
+         WHERE id = ? AND owner_id = ?`,
+      )
+      .bind(updatedAt, conversationId, ownerId),
+  ]);
+  assertBatchSucceeded(results);
 }
 
 export function conversationErrorResponse(error: unknown): Response {
@@ -542,14 +717,29 @@ async function database(): Promise<D1Database> {
 
   let initialization = initializedConversationDatabases.get(binding);
   if (!initialization) {
-    initialization = binding
-      .batch(
+    initialization = (async () => {
+      const results = await binding.batch(
         CONVERSATION_SCHEMA_STATEMENTS.map((statement) =>
           binding.prepare(statement),
         ),
-      )
-      .then(assertBatchSucceeded)
-      .catch((error: unknown) => {
+      );
+      assertBatchSucceeded(results);
+      try {
+        const columns = await binding
+          .prepare("PRAGMA table_info(conversation_message_details)")
+          .all<{ name: string }>();
+        if (!columns.results.some((column) => column.name === "usage_json")) {
+          await binding
+            .prepare(
+              "ALTER TABLE conversation_message_details ADD COLUMN usage_json TEXT",
+            )
+            .run();
+        }
+      } catch {
+        // Some test adapters do not implement PRAGMA. Real D1/SQLite instances do;
+        // deployed databases also receive the checked-in migration.
+      }
+    })().catch((error: unknown) => {
         initializedConversationDatabases.delete(binding);
         throw error;
       });
@@ -676,6 +866,24 @@ function stableHttpsUrl(value: string, field: string): URL {
   }
   url.hash = "";
   return url;
+}
+
+function stableWebReferenceUrl(value: string, field: string): string {
+  let url: URL;
+  try {
+    url = new URL(value);
+  } catch {
+    throw invalidInput(`${field} 不是有效 URL。`);
+  }
+  if (
+    (url.protocol !== "https:" && url.protocol !== "http:") ||
+    url.username ||
+    url.password
+  ) {
+    throw invalidInput(`${field} 必须是没有内嵌凭据的 HTTP(S) 地址。`);
+  }
+  url.hash = "";
+  return url.href;
 }
 
 function parseSummary(value: unknown, fallbackTitle: string): VideoSummary {
@@ -867,7 +1075,7 @@ function parseMessageInputs(
   value: unknown,
   field: string,
   allowEmpty: boolean,
-): Array<Pick<ConversationMessage, "role" | "content">> {
+): ConversationMessageInput[] {
   if (
     !Array.isArray(value) ||
     (!allowEmpty && value.length === 0) ||
@@ -878,17 +1086,104 @@ function parseMessageInputs(
     );
   }
   return value.map((item, index) => {
-    const message = recordValue(item, `${field}[${index}]`);
-    assertOnlyKeys(message, ["role", "content"], `${field}[${index}]`);
+    const itemField = `${field}[${index}]`;
+    const message = recordValue(item, itemField);
+    assertOnlyKeys(
+      message,
+      [
+        "role",
+        "content",
+        "reasoningContent",
+        "reasoningDurationSeconds",
+        "webSources",
+        "stopped",
+        "usage",
+      ],
+      itemField,
+    );
     if (message.role !== "assistant" && message.role !== "user") {
-      throw invalidInput(`${field}[${index}].role 格式无效。`);
+      throw invalidInput(`${itemField}.role 格式无效。`);
+    }
+    const reasoningContent = optionalString(
+      message.reasoningContent,
+      `${itemField}.reasoningContent`,
+      MAX_REASONING_CHARACTERS,
+    );
+    let reasoningDurationSeconds: number | undefined;
+    if (message.reasoningDurationSeconds !== undefined) {
+      const duration = finiteNumber(
+        message.reasoningDurationSeconds,
+        `${itemField}.reasoningDurationSeconds`,
+      );
+      if (!Number.isSafeInteger(duration) || duration < 0 || duration > 3_600) {
+        throw invalidInput(
+          `${itemField}.reasoningDurationSeconds 必须是 0 到 3600 的整数。`,
+        );
+      }
+      reasoningDurationSeconds = duration;
+    }
+    const webSources =
+      message.webSources === undefined
+        ? undefined
+        : parseMessageWebSources(message.webSources, `${itemField}.webSources`);
+    if (message.stopped !== undefined && typeof message.stopped !== "boolean") {
+      throw invalidInput(`${itemField}.stopped 必须是布尔值。`);
+    }
+    const usage =
+      message.usage === undefined
+        ? undefined
+        : parseConversationUsageRecord(message.usage);
+    if (message.usage !== undefined && !usage) {
+      throw invalidInput(`${itemField}.usage 格式无效。`);
     }
     return {
       role: message.role,
       content: stringValue(
         message.content,
-        `${field}[${index}].content`,
+        `${itemField}.content`,
         MAX_MESSAGE_CHARACTERS,
+      ),
+      ...(reasoningContent ? { reasoningContent } : {}),
+      ...(reasoningDurationSeconds !== undefined
+        ? { reasoningDurationSeconds }
+        : {}),
+      ...(webSources?.length ? { webSources } : {}),
+      ...(message.stopped === true ? { stopped: true } : {}),
+      ...(usage ? { usage } : {}),
+    };
+  });
+}
+
+function parseMessageWebSources(
+  value: unknown,
+  field: string,
+): ConversationWebSource[] {
+  if (!Array.isArray(value) || value.length > MAX_MESSAGE_WEB_SOURCES) {
+    throw invalidInput(
+      `${field} 必须包含 0 到 ${MAX_MESSAGE_WEB_SOURCES} 个来源。`,
+    );
+  }
+  const usedIndices = new Set<number>();
+  return value.map((entry, index) => {
+    const itemField = `${field}[${index}]`;
+    const item = recordValue(entry, itemField);
+    assertOnlyKeys(item, ["index", "title", "url"], itemField);
+    const sourceIndex = finiteNumber(item.index, `${itemField}.index`);
+    if (
+      !Number.isSafeInteger(sourceIndex) ||
+      sourceIndex < 1 ||
+      sourceIndex > 99 ||
+      usedIndices.has(sourceIndex)
+    ) {
+      throw invalidInput(`${itemField}.index 格式无效或重复。`);
+    }
+    usedIndices.add(sourceIndex);
+    return {
+      index: sourceIndex,
+      title: stringValue(item.title, `${itemField}.title`, 500),
+      url: stableWebReferenceUrl(
+        stringValue(item.url, `${itemField}.url`, 2_048),
+        `${itemField}.url`,
       ),
     };
   });
@@ -925,16 +1220,146 @@ function listItemFromRow(
   };
 }
 
-function messageFromRow(row: MessageRow): ConversationMessage {
+function messageFromRow(
+  row: MessageRow,
+  detail?: MessageDetailRow,
+): ConversationMessage {
   if (row.role !== "assistant" && row.role !== "user") {
     throw new Error("D1 中的消息角色无效。");
+  }
+  const reasoningContent = detail
+    ? optionalString(
+        detail.reasoning_content,
+        "conversation_message_details.reasoning_content",
+        MAX_REASONING_CHARACTERS,
+      )
+    : undefined;
+  const reasoningDurationSeconds =
+    detail?.reasoning_duration_seconds === null ||
+    detail?.reasoning_duration_seconds === undefined
+      ? undefined
+      : integerValue(
+          detail.reasoning_duration_seconds,
+          "conversation_message_details.reasoning_duration_seconds",
+        );
+  const webSources =
+    detail?.web_sources_json
+      ? parseMessageWebSources(
+          JSON.parse(detail.web_sources_json),
+          "conversation_message_details.web_sources_json",
+        )
+      : undefined;
+  const usage = detail?.usage_json
+    ? parsePersistedUsage(detail.usage_json)
+    : undefined;
+  const legacySearchMetadata = extractLegacySearchMetadata(row.content);
+  const resolvedWebSources = webSources?.length
+    ? webSources
+    : legacySearchMetadata.webSources;
+  if (detail && detail.stopped !== 0 && detail.stopped !== 1) {
+    throw new Error("D1 中的 stopped 字段无效。");
   }
   return {
     id: row.id,
     role: row.role,
-    content: row.content,
+    content: legacySearchMetadata.content,
     createdAt: integerValue(row.created_at, "created_at"),
+    ...(reasoningContent ? { reasoningContent } : {}),
+    ...(reasoningDurationSeconds !== undefined
+      ? { reasoningDurationSeconds }
+      : {}),
+    ...(resolvedWebSources?.length ? { webSources: resolvedWebSources } : {}),
+    ...(detail?.stopped === 1 ? { stopped: true } : {}),
+    ...(usage ? { usage } : {}),
   };
+}
+
+function extractLegacySearchMetadata(content: string): {
+  content: string;
+  webSources?: ConversationWebSource[];
+} {
+  const marker = "\n\n参考来源：\n";
+  const markerIndex = content.lastIndexOf(marker);
+  if (markerIndex < 0) return { content };
+  const suffix = content.slice(markerIndex + marker.length);
+  const visited = suffix.match(/\n\n访问了\s+\d+\s+个网页\s*$/);
+  if (!visited || visited.index === undefined) return { content };
+  const sourceBlock = suffix.slice(0, visited.index);
+  const webSources: ConversationWebSource[] = [];
+  for (const match of sourceBlock.matchAll(
+    /^-\s+\[(\d{1,2})\s*·\s*([^\]\r\n]+)\]\((https?:\/\/[^)\s]+)\)\s*$/gm,
+  )) {
+    const index = Number(match[1]);
+    if (
+      !Number.isSafeInteger(index) ||
+      webSources.some((source) => source.index === index)
+    ) {
+      continue;
+    }
+    webSources.push({
+      index,
+      title: match[2].trim(),
+      url: match[3],
+    });
+  }
+  return webSources.length
+    ? {
+        content: content.slice(0, markerIndex).trim(),
+        webSources,
+      }
+    : { content };
+}
+
+function messageMetadata(message: ConversationMessageInput) {
+  return {
+    ...(message.reasoningContent
+      ? { reasoningContent: message.reasoningContent }
+      : {}),
+    ...(message.reasoningDurationSeconds !== undefined
+      ? { reasoningDurationSeconds: message.reasoningDurationSeconds }
+      : {}),
+    ...(message.webSources?.length ? { webSources: message.webSources } : {}),
+    ...(message.stopped ? { stopped: true } : {}),
+    ...(message.usage ? { usage: message.usage } : {}),
+  };
+}
+
+function messageDetailsStatement(
+  databaseBinding: D1Database,
+  conversationId: string,
+  message: ConversationMessageInput & { id: string },
+) {
+  const hasDetails =
+    Boolean(message.reasoningContent) ||
+    message.reasoningDurationSeconds !== undefined ||
+    Boolean(message.webSources?.length) ||
+    Boolean(message.stopped) ||
+    Boolean(message.usage);
+  if (!hasDetails) return null;
+  return databaseBinding
+    .prepare(
+      `INSERT INTO conversation_message_details (
+         message_id, conversation_id, reasoning_content,
+         reasoning_duration_seconds, web_sources_json, usage_json, stopped
+       ) VALUES (?, ?, ?, ?, ?, ?, ?)`,
+    )
+    .bind(
+      message.id,
+      conversationId,
+      message.reasoningContent ?? null,
+      message.reasoningDurationSeconds ?? null,
+      message.webSources?.length ? JSON.stringify(message.webSources) : null,
+      message.usage ? JSON.stringify(message.usage) : null,
+      message.stopped ? 1 : 0,
+    );
+}
+
+function parsePersistedUsage(value: string): ConversationUsageRecord {
+  const usage = parseConversationUsageRecord(JSON.parse(value));
+  if (!usage) {
+    throw new Error("D1 中的消息 usage_json 格式无效。");
+  }
+  return usage;
 }
 
 function sourceKindValue(value: string): SourceKind {

@@ -111,9 +111,17 @@ class JobRecordTests(unittest.TestCase):
                 upload_command[upload_command.index("--input-file") + 1],
                 "source-media",
             )
-            environment = manager._worker_environment()
+            with patch.dict(
+                "os.environ",
+                {"FRAMENOTE_MEDIA_PROXY": "http://127.0.0.1:7890"},
+            ):
+                environment = manager._worker_environment()
             self.assertEqual(environment["PYTHONIOENCODING"], "utf-8")
             self.assertEqual(environment["PYTHONUTF8"], "1")
+            self.assertEqual(
+                environment["FRAMENOTE_MEDIA_PROXY"],
+                "http://127.0.0.1:7890",
+            )
 
             completed = subprocess.run(
                 [

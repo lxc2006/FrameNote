@@ -917,6 +917,7 @@ class JobManager:
             "FRAMENOTE_FUNASR_VAD_MODEL",
             "FRAMENOTE_FUNASR_PUNC_MODEL",
             "FRAMENOTE_FUNASR_DEVICE",
+            "FRAMENOTE_MEDIA_PROXY",
         }
         environment = {
             key: value for key, value in os.environ.items() if key.upper() in allowed

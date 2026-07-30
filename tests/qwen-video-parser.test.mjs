@@ -47,3 +47,73 @@ test("normalizes common Qwen audio field variants through one parser", async (t)
   );
   assert.equal(parsed.audioAnalysis.soundscape, "轻微的环境声。");
 });
+
+test("ignores malformed optional evidence without rejecting a valid summary", async (t) => {
+  const vite = await createViteServer({
+    appType: "custom",
+    configFile: false,
+    logLevel: "silent",
+    server: { middlewareMode: true },
+  });
+  t.after(() => vite.close());
+
+  const { parseVideoSummary } = await vite.ssrLoadModule(
+    `/lib/server/qwen-video-engine.ts?optional-evidence=${Date.now()}`,
+  );
+  const parsed = parseVideoSummary(
+    JSON.stringify({
+      title: "测试总结",
+      overview: "视频包含完整且可用的概览。",
+      keyPoints: [
+        { time: "00:01", title: "开始", detail: "视频内容开始。" },
+      ],
+      chapters: [
+        { time: "00:01", title: "开场", description: "视频进入开场部分。" },
+      ],
+      evidence: [
+        { time: "00:01", fact: "" },
+        { time: "", fact: "缺少时间。" },
+        null,
+        { time: "00:02", fact: "这是一条有效证据。" },
+      ],
+    }),
+    "回退标题",
+  );
+
+  assert.deepEqual(parsed.evidence, [
+    { time: "00:02", fact: "这是一条有效证据。" },
+  ]);
+});
+
+test("keeps at most 24 summary time points", async (t) => {
+  const vite = await createViteServer({
+    appType: "custom",
+    configFile: false,
+    logLevel: "silent",
+    server: { middlewareMode: true },
+  });
+  t.after(() => vite.close());
+
+  const { parseVideoSummary } = await vite.ssrLoadModule(
+    `/lib/server/qwen-video-engine.ts?time-points=${Date.now()}`,
+  );
+  const parsed = parseVideoSummary(
+    JSON.stringify({
+      title: "长视频",
+      overview: "包含许多时间点。",
+      keyPoints: Array.from({ length: 30 }, (_, index) => ({
+        time: `00:${String(index).padStart(2, "0")}`,
+        title: `时间点 ${index + 1}`,
+        detail: `第 ${index + 1} 个片段。`,
+      })),
+      chapters: [
+        { time: "00:00", title: "开始", description: "视频开始。" },
+      ],
+    }),
+    "回退标题",
+  );
+
+  assert.equal(parsed.keyPoints.length, 24);
+  assert.equal(parsed.keyPoints[0].title, "时间点 1");
+  assert.equal(parsed.keyPoints.at(-1).title, "时间点 30");
+});

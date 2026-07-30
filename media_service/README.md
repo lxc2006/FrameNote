@@ -80,6 +80,7 @@ docker run --rm -p 8788:8788 `
 | `FRAMENOTE_MEDIA_SIGNED_URL_TTL_SECONDS` | `600` | AI 分析签名 URL 有效期，范围 30–3600 秒；预览 URL 跟随成品保留期 |
 | `FRAMENOTE_MEDIA_TERMINAL_RETENTION_SECONDS` | `3600` | 失败、取消及过期记录的保留时间 |
 | `FRAMENOTE_MEDIA_CLEANUP_INTERVAL_SECONDS` | `60` | 过期目录扫描间隔 |
+| `FRAMENOTE_MEDIA_PROXY` | 空 | 可选的 yt-dlp HTTP/HTTPS/SOCKS 代理，例如 `http://127.0.0.1:7890`；不自动继承系统代理 |
 | `FRAMENOTE_FUNASR_MODEL` | `FunAudioLLM/Fun-ASR-Nano-2512` | FunASR 主识别模型名称或本地模型目录 |
 | `FRAMENOTE_FUNASR_HUB` | `ms` | 模型来源；中国大陆默认使用 ModelScope，也可设为 `hf` |
 | `FRAMENOTE_FUNASR_VAD_MODEL` | `fsmn-vad` | 长音频语音活动检测模型 |

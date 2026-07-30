@@ -14,6 +14,10 @@ import type {
   VideoSourceDescriptor,
   VideoSummary,
 } from "../video-engine";
+import {
+  normalizeModelCallUsage,
+  type ModelCallUsage,
+} from "../model-usage";
 import { getQwenConfig, type QwenConfig } from "./qwen-config";
 
 const SUMMARY_SYSTEM_PROMPT = `你是“帧记”的视频分析引擎。请只依据用户提供的视频、画面、音频和转写文本总结，不得用常识补写素材中没有出现的事实。
@@ -21,8 +25,8 @@ const SUMMARY_SYSTEM_PROMPT = `你是“帧记”的视频分析引擎。请只�
 必须分别检查视觉与声音，不能只描述画面。只要提供了独立音轨或含内嵌音轨的视频，就必须实际听取并分析可辨的讲话、字幕、音乐和环境声。声音信息应融入内容概览和时间线：讲话/字幕用于还原观点和事实，音乐/环境声只在影响理解、节奏、段落变化或用户判断时提及。不要单独写“营造氛围、表达情绪、增强叙事性”这类空泛审美分析；纯音乐/氛围音乐只记录可听见的节奏、速度、音色、乐器特征、是否有人声以及可靠的时间变化。流派或乐器不确定时使用“具有……特征”等保守表述，不得猜测具体曲名、艺人或来源。不得依据标题、画面或场景臆测声音。
 用简体中文输出一个 JSON 对象，不要输出 Markdown 代码块或 JSON 之外的文字。JSON 必须包含：
 - title: 简洁标题
-- overview: 2 至 5 段内容概览，面向用户解释“这个视频讲了什么/发生了什么/值得注意什么”。如果视频包含多个观点、步骤、事件或转折，必须在概览中有条理地覆盖，不要只写一个笼统主题。
-- keyPoints: 4 至 12 个按时间排序的 {time, title, detail}。这是主要时间线，time 使用 HH:MM:SS 或 MM:SS；detail 要把该时间段的画面、讲话/字幕、音乐或环境声中真正影响理解的信息合并说明。
+- overview: 较为详细的内容概览，面向用户解释“这个视频讲了什么/发生了什么/值得注意什么”。如果视频包含多个观点、步骤、事件或转折，必须在概览中有条理地覆盖，不要只写一个笼统主题。
+- keyPoints: 最多 24 个按时间排序的 {time, title, detail}。这是主要时间线，数量必须根据视频时长和真实内容变化自适应，24 只是硬上限而不是目标；不得为了凑数量，每个时间点details需要有内容，有意义。只有主题、事件、观点、步骤、场景或声音出现有意义变化时才新增时间点，相邻且内容相近的片段必须合并。时间线必须从开头的重要内容覆盖到结尾的最后一个重要内容，不能只密集描述前半段。time 使用 HH:MM:SS 或 MM:SS；detail 要把该时间段的画面、讲话/字幕、音乐或环境声中真正影响理解的信息合并说明。
 - chapters: 2 至 8 个按时间排序的粗章节 {time, title, description}，用于兼容旧结构；description 可以比 keyPoints 更概括。
 - audioAnalysis: {status, summary, music, soundscape, temporalChanges, uncertainty?}
   - status 只能是 analyzed、silent 或 unavailable：analyzed 表示已听取到可辨声音，silent 表示已检查音轨但没有可辨声音，unavailable 表示没有可靠音频证据或无法读取
@@ -30,7 +34,7 @@ const SUMMARY_SYSTEM_PROMPT = `你是“帧记”的视频分析引擎。请只�
   - music、soundscape 的 JSON 类型只能是非空字符串或 null：有内容用字符串，没有对应声音用 null，绝不能使用空字符串、数组或对象
   - temporalChanges 是按时间排序的 {time, description} 数组，只记录可靠且有助于理解内容的声音变化；没有明显变化时返回 [] 并在 summary 中说明整体稳定
   - silent 或 unavailable 时 music、soundscape 必须为 null，temporalChanges 必须为 []；uncertainty 只用于说明真实的不确定性
-- evidence: 最多 24 条可供追问核验的 {time, fact}
+- evidence: 最多 24 条可供追问核验的 {time, fact}；time 和 fact 都必须是非空字符串，没有可靠证据时返回 []
 当 status=analyzed 时，overview 和 keyPoints 必须综合画面和声音，而不是把声音信息只放在 audioAnalysis 中。
 所有 time 都必须表示原视频从 00:00 开始的真实播放时间，绝不能使用关键帧编号、图片序号或列表序号代替时间。唯一例外是：当用户消息给出了 KF_### 关键帧标识映射时，凡依据画面定位的 time 必须原样填写对应的 KF_###，由服务端换算为原视频时间；不要使用模型内部看到的稀疏图片序列时间。时间无法确认时应明确标注“时间未知”，不要伪造时间戳。不要输出大段逐字稿。`;
 
@@ -101,6 +105,13 @@ export class QwenVideoEngine implements VideoEngine {
     source: VideoSourceDescriptor,
     context?: VideoModelContext,
   ): Promise<VideoSummary> {
+    return (await this.analyzeWithUsage(source, context)).summary;
+  }
+
+  async analyzeWithUsage(
+    source: VideoSourceDescriptor,
+    context?: VideoModelContext,
+  ): Promise<{ summary: VideoSummary; usage: ModelCallUsage | null }> {
     const safeContext = requireModelContext(context);
     const audioEvidence = audioEvidenceMode(safeContext);
     const parts = modelContextParts(safeContext);
@@ -111,7 +122,7 @@ export class QwenVideoEngine implements VideoEngine {
       )}`,
     });
 
-    const raw = await this.complete(
+    const completion = await this.complete(
       [
         { role: "system", content: SUMMARY_SYSTEM_PROMPT },
         {
@@ -122,11 +133,18 @@ export class QwenVideoEngine implements VideoEngine {
       true,
     );
 
-    const summary = parseVideoSummary(raw, source.title, {
+    const summary = parseVideoSummary(completion.output, source.title, {
       requireAudioAnalysis: true,
       audioEvidence,
     });
-    return normalizeSummaryTimestamps(summary, safeContext);
+    return {
+      summary: normalizeSummaryTimestamps(summary, safeContext),
+      usage: normalizeModelCallUsage(completion.usage, {
+        provider: "qwen",
+        model: this.config.model,
+        operation: "video_summary",
+      }),
+    };
   }
 
   private async complete(
@@ -145,17 +163,19 @@ export class QwenVideoEngine implements VideoEngine {
 
     const stream = await this.client.chat.completions.create(request);
     let output = "";
+    let usage: unknown;
 
     for await (const chunk of stream) {
       const content = chunk.choices[0]?.delta?.content;
       if (typeof content === "string") output += content;
+      if (chunk.usage) usage = chunk.usage;
     }
 
     const normalized = output.trim();
     if (!normalized) {
       throw new QwenResponseError("Qwen 返回了空内容。");
     }
-    return normalized;
+    return { output: normalized, usage };
   }
 }
 
@@ -430,12 +450,18 @@ export function parseVideoSummary(
   }
 
   const object = recordValue(value, "总结");
-  const keyPoints = arrayValue(object.keyPoints, "keyPoints").map(parsePoint);
+  const keyPoints = limitTimelinePoints(
+    arrayValue(object.keyPoints, "keyPoints").map(parsePoint),
+    24,
+  );
   const chapters = arrayValue(object.chapters, "chapters").map(parseChapter);
   const evidence =
     object.evidence === undefined
       ? []
-      : arrayValue(object.evidence, "evidence").map(parseEvidence).slice(0, 24);
+      : arrayValue(object.evidence, "evidence")
+          .map(parseEvidence)
+          .filter((item): item is SummaryEvidence => item !== null)
+          .slice(0, 24);
   const audioAnalysis =
     object.audioAnalysis === undefined
       ? undefined
@@ -468,6 +494,16 @@ export function parseVideoSummary(
     ...(audioAnalysis ? { audioAnalysis } : {}),
     evidence,
   };
+}
+
+function limitTimelinePoints<T>(items: T[], maximum: number) {
+  if (items.length <= maximum) return items;
+  return Array.from({ length: maximum }, (_, index) => {
+    const position = Math.round(
+      (index * (items.length - 1)) / (maximum - 1),
+    );
+    return items[position];
+  });
 }
 
 function parseAudioAnalysis(value: unknown): SummaryAudioAnalysis {
@@ -551,12 +587,12 @@ function parseChapter(value: unknown): SummaryChapter {
   };
 }
 
-function parseEvidence(value: unknown): SummaryEvidence {
-  const object = recordValue(value, "evidence 项");
-  return {
-    time: requiredString(object.time, "evidence.time"),
-    fact: requiredString(object.fact, "evidence.fact"),
-  };
+function parseEvidence(value: unknown): SummaryEvidence | null {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return null;
+  const object = value as Record<string, unknown>;
+  const time = optionalString(object.time);
+  const fact = optionalString(object.fact);
+  return time && fact ? { time, fact } : null;
 }
 
 function recordValue(value: unknown, field: string): Record<string, unknown> {

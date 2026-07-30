@@ -71,21 +71,49 @@ export function parseAnalyzeVideoRequest(value: unknown): AnalyzeVideoRequest {
 
 export function parseAskVideoRequest(value: unknown): AskVideoRequest {
   const object = recordValue(value, "请求体");
-  const source = parseSource(object.source);
   const question = stringValue(object.question, "question", 4_000);
-  const summary = parseSummaryInput(object.summary, source.title);
+  const conversationId = optionalString(
+    object.conversationId,
+    "conversationId",
+    36,
+  );
+  if (
+    conversationId &&
+    !JOB_ID_PATTERN.test(conversationId)
+  ) {
+    throw new QwenInputError("conversationId 格式无效。");
+  }
+  const source =
+    object.source === undefined ? undefined : parseSource(object.source);
+  const summary =
+    object.summary === undefined
+      ? undefined
+      : parseSummaryInput(object.summary, source?.title ?? "视频总结");
+  if (!conversationId && (!source || !summary)) {
+    throw new QwenInputError(
+      "请求必须提供 conversationId，或同时提供 source 与 summary。",
+    );
+  }
   const history = object.history === undefined
     ? undefined
     : parseHistory(object.history);
 
   return {
     question,
-    source,
-    summary,
+    ...(conversationId
+      ? { conversationId: conversationId.toLowerCase() }
+      : {}),
+    ...(source ? { source } : {}),
+    ...(summary ? { summary } : {}),
     reasoningMode: parseReasoningMode(object.reasoningMode),
     webSearchEnabled: booleanValue(
       object.webSearchEnabled,
       "webSearchEnabled",
+      false,
+    ),
+    fullRecallEnabled: booleanValue(
+      object.fullRecallEnabled,
+      "fullRecallEnabled",
       false,
     ),
     ...(object.searchContext === undefined

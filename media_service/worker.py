@@ -27,6 +27,7 @@ ANALYSIS_MAX_EDGE = 854
 ANALYSIS_MAX_BYTES = 500 * 1024 * 1024
 PREVIEW_MAX_BYTES = 2 * 1024 * 1024 * 1024
 DOWNLOAD_FRAGMENT_CONCURRENCY = 4
+DOWNLOAD_RETRIES = 10
 BROWSER_VIDEO_CODECS = frozenset({"h264"})
 BROWSER_AUDIO_CODECS = frozenset({"aac"})
 
@@ -226,6 +227,30 @@ class QuietLogger:
 
     def error(self, message: str) -> None:
         sys.stderr.write(f"yt-dlp error: {message[:1000]}\n")
+
+
+def download_retry_delay(attempt: int) -> float:
+    """Back off transient CDN failures without exceeding the job timeout."""
+    return min(10.0, 2.0 ** max(0, attempt - 1))
+
+
+def download_network_options() -> dict[str, Any]:
+    options: dict[str, Any] = {
+        "socket_timeout": 30,
+        "retries": DOWNLOAD_RETRIES,
+        "fragment_retries": DOWNLOAD_RETRIES,
+        "file_access_retries": 3,
+        "extractor_retries": 5,
+        "retry_sleep_functions": {
+            "http": download_retry_delay,
+            "fragment": download_retry_delay,
+            "extractor": download_retry_delay,
+        },
+    }
+    proxy = (os.getenv("FRAMENOTE_MEDIA_PROXY") or "").strip()
+    if proxy:
+        options["proxy"] = proxy
+    return options
 
 
 def locate_ffmpeg() -> tuple[str, str]:
@@ -707,11 +732,10 @@ def run(args: argparse.Namespace) -> None:
         ],
         "merge_output_format": "mp4",
         "outtmpl": output_template,
-        "paths": {"home": str(job_dir), "temp": str(job_dir)},
         "ffmpeg_location": ffmpeg_location,
         "max_filesize": args.max_bytes,
         "overwrites": False,
-        "continuedl": False,
+        "continuedl": True,
         "quiet": True,
         "no_warnings": True,
         "noprogress": True,
@@ -721,11 +745,6 @@ def run(args: argparse.Namespace) -> None:
         "postprocessors": [
             {"key": "FFmpegVideoRemuxer", "preferedformat": "mp4"}
         ],
-        "socket_timeout": 20,
-        "retries": 3,
-        "fragment_retries": 3,
-        "file_access_retries": 3,
-        "extractor_retries": 3,
         "concurrent_fragment_downloads": DOWNLOAD_FRAGMENT_CONCURRENCY,
         "cachedir": False,
         "usenetrc": False,
@@ -735,6 +754,7 @@ def run(args: argparse.Namespace) -> None:
         "writesubtitles": False,
         "writeautomaticsub": False,
         "writeinfojson": False,
+        **download_network_options(),
     }
 
     emit("progress", phase="resolving", progress=0.02)

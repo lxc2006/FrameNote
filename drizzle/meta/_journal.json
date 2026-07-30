@@ -15,6 +15,20 @@
       "when": 1785083889941,
       "tag": "0001_peaceful_agent_brand",
       "breakpoints": true
+    },
+    {
+      "idx": 2,
+      "version": "6",
+      "when": 1785324761965,
+      "tag": "0002_fine_hobgoblin",
+      "breakpoints": true
+    },
+    {
+      "idx": 3,
+      "version": "6",
+      "when": 1785343042076,
+      "tag": "0003_ordinary_chimera",
+      "breakpoints": true
     }
   ]
 }

@@ -2,7 +2,6 @@
 
 import {
   type CSSProperties,
-  type ReactNode,
   type ChangeEvent,
   type DragEvent,
   type FormEvent,
@@ -13,6 +12,11 @@ import {
   useRef,
   useState,
 } from "react";
+import ReactMarkdown, {
+  defaultUrlTransform,
+  type Components as MarkdownComponents,
+} from "react-markdown";
+import remarkGfm from "remark-gfm";
 import {
   extractBvid,
   formatDuration,
@@ -42,17 +46,30 @@ import {
   releaseMediaAnalysis,
 } from "@/lib/client/media-analysis-client";
 import {
+  advanceDisplayedProgress,
+  estimatedStageProgress,
+  type EstimatedAnalysisStage,
+} from "@/lib/client/analysis-progress";
+import {
+  parseVideoTimeHref,
+  prepareMarkdownContent,
+} from "@/lib/client/markdown-content";
+import {
   appendConversationMessages,
   createConversation,
   deleteConversation,
   getConversation,
   listConversations,
   renameConversation,
+  truncateConversationMessages,
+  updateConversationTranscript as saveConversationTranscript,
 } from "@/lib/client/conversation-client";
 import type {
   ConversationListItem,
   ConversationMessage,
+  ConversationMessageInput,
 } from "@/lib/conversation";
+import type { ConversationUsageRecord } from "@/lib/model-usage";
 import UserSettingsMenu, {
   DEFAULT_QWEN_DIRECT_SUMMARY_MAX_SECONDS,
   parseUserPreferences,
@@ -90,9 +107,63 @@ interface InlineNotice {
   tone: "error" | "success";
 }
 
-type ChatMessage = Pick<ConversationMessage, "id" | "role" | "content">;
+type ChatMessage = Pick<
+  ConversationMessage,
+  | "id"
+  | "role"
+  | "content"
+  | "reasoningContent"
+  | "reasoningDurationSeconds"
+  | "webSources"
+  | "stopped"
+  | "createdAt"
+  | "usage"
+> & {
+  isStreaming?: boolean;
+  streamLabel?: string;
+};
+
+function conversationMessageForStorage(
+  message: ChatMessage,
+): ConversationMessageInput {
+  return {
+    role: message.role,
+    content: message.content,
+    ...(message.reasoningContent
+      ? { reasoningContent: message.reasoningContent }
+      : {}),
+    ...(message.reasoningDurationSeconds !== undefined
+      ? { reasoningDurationSeconds: message.reasoningDurationSeconds }
+      : {}),
+    ...(message.webSources?.length ? { webSources: message.webSources } : {}),
+    ...(message.stopped ? { stopped: true } : {}),
+    ...(message.usage ? { usage: message.usage } : {}),
+  };
+}
 
 const acceptedExtensions = ["mp4", "mov", "webm", "mkv", "m4v"];
+const TRANSCRIPT_TIMEOUT_MESSAGE =
+  "字幕提取超过 22 分钟，暂不可用。可在视频预览中点击“提取字幕”重试。";
+
+function isTranscriptTimeout(error: unknown) {
+  return (
+    error instanceof Error &&
+    "code" in error &&
+    (error as Error & { code?: unknown }).code === "TRANSCRIPT_TIMEOUT"
+  );
+}
+
+function unavailableTimedOutTranscript(
+  languages: TranscriptLanguage[],
+): VideoTranscript {
+  return {
+    status: "unavailable",
+    text: "",
+    cues: [],
+    language: languages.length > 0 ? languages.join(",") : "auto",
+    error: TRANSCRIPT_TIMEOUT_MESSAGE,
+  };
+}
 const SUMMARY_READY_MESSAGE = "总结生成完毕，我还可以继续和你讨论相关内容 : )";
 const MAX_MEDIA_ANALYSIS_BYTES = 500 * 1024 * 1024;
 const ANALYSIS_SETTINGS_STORAGE_KEY = "framenote.analysis-settings.v1";
@@ -110,7 +181,7 @@ const DEFAULT_TRANSCRIPT_LANGUAGES = TRANSCRIPT_LANGUAGE_OPTIONS.map(
 );
 const WORKSPACE_LAYOUT_STORAGE_KEY = "framenote.workspace-layout.v1";
 const MIN_SIDEBAR_WIDTH = 340;
-const MIN_CONVERSATION_WIDTH = 560;
+const MIN_CONVERSATION_WIDTH = 600;
 const MIN_SOURCE_PANE_HEIGHT = 260;
 const MIN_HISTORY_PANE_HEIGHT = 220;
 const WORKSPACE_RESIZER_SIZE = 10;
@@ -122,6 +193,46 @@ interface StoredWorkspaceLayout {
   historyPaneCollapsed?: boolean;
   sidebarWidth?: number | null;
   sourcePaneHeight?: number | null;
+}
+
+interface WorkspaceMeasurements {
+  workspaceWidth: number;
+  columnHeight: number;
+  sidebarWidth: number;
+  sourcePaneHeight: number;
+}
+
+const DEFAULT_WORKSPACE_MEASUREMENTS: WorkspaceMeasurements = {
+  workspaceWidth:
+    MIN_SIDEBAR_WIDTH + MIN_CONVERSATION_WIDTH + WORKSPACE_RESIZER_SIZE,
+  columnHeight:
+    MIN_SOURCE_PANE_HEIGHT + MIN_HISTORY_PANE_HEIGHT + PANE_RESIZER_SIZE,
+  sidebarWidth: MIN_SIDEBAR_WIDTH,
+  sourcePaneHeight: MIN_SOURCE_PANE_HEIGHT,
+};
+
+function sidebarWidthLimitsFor(workspaceWidth: number) {
+  return {
+    min: MIN_SIDEBAR_WIDTH,
+    max: Math.max(
+      MIN_SIDEBAR_WIDTH,
+      workspaceWidth - MIN_CONVERSATION_WIDTH - WORKSPACE_RESIZER_SIZE,
+    ),
+  };
+}
+
+function sourcePaneHeightLimitsFor(columnHeight: number) {
+  return {
+    min: MIN_SOURCE_PANE_HEIGHT,
+    max: Math.max(
+      MIN_SOURCE_PANE_HEIGHT,
+      columnHeight - MIN_HISTORY_PANE_HEIGHT - PANE_RESIZER_SIZE,
+    ),
+  };
+}
+
+function clampTo(value: number, minimum: number, maximum: number) {
+  return Math.min(maximum, Math.max(minimum, value));
 }
 
 function fileExtension(filename: string) {
@@ -168,6 +279,76 @@ function formatConversationDate(timestamp: number) {
     hour: "2-digit",
     minute: "2-digit",
   }).format(date);
+}
+
+function formatUsageTokens(tokens: number) {
+  return new Intl.NumberFormat("zh-CN").format(tokens);
+}
+
+function formatCompactUsageTokens(tokens: number) {
+  return new Intl.NumberFormat("zh-CN", {
+    notation: tokens >= 10_000 ? "compact" : "standard",
+    maximumFractionDigits: 1,
+  }).format(tokens);
+}
+
+function formatEstimatedCost(costCnyMicros: number) {
+  const cost = costCnyMicros / 1_000_000;
+  return `¥${cost === 0 || cost < 0.01 ? cost.toFixed(4) : cost.toFixed(2)}`;
+}
+
+function formatUsageTime(timestamp: number) {
+  const date = new Date(timestamp);
+  if (Number.isNaN(date.getTime())) return "--:--";
+  return new Intl.DateTimeFormat("zh-CN", {
+    month: "2-digit",
+    day: "2-digit",
+    hour: "2-digit",
+    minute: "2-digit",
+    hour12: false,
+  }).format(date);
+}
+
+function formatAnswerTime(timestamp: number) {
+  const date = new Date(timestamp);
+  if (Number.isNaN(date.getTime())) return "";
+  const month = [
+    "Jan",
+    "Feb",
+    "Mar",
+    "Apr",
+    "May",
+    "Jun",
+    "Jul",
+    "Aug",
+    "Sep",
+    "Oct",
+    "Nov",
+    "Dec",
+  ][date.getMonth()];
+  const year =
+    date.getFullYear() === new Date().getFullYear()
+      ? ""
+      : `${date.getFullYear()} `;
+  return `${year}${month} ${date.getDate()}, ${date.getHours()}:${String(
+    date.getMinutes(),
+  ).padStart(2, "0")}`;
+}
+
+function currentTimestamp() {
+  return Date.now();
+}
+
+function usageTotals(records: ConversationUsageRecord[]) {
+  return records.reduce(
+    (total, record) => ({
+      totalTokens: total.totalTokens + record.totalTokens,
+      estimatedCostCnyMicros:
+        total.estimatedCostCnyMicros + record.estimatedCostCnyMicros,
+      searchCount: total.searchCount + record.searchCount,
+    }),
+    { totalTokens: 0, estimatedCostCnyMicros: 0, searchCount: 0 },
+  );
 }
 
 function summaryParagraphs(value: string) {
@@ -233,101 +414,150 @@ function formatPlaybackTimestamp(totalSeconds: number) {
         .join(":");
 }
 
-function transcriptForConversationContext(transcript: VideoTranscript | null) {
-  if (!transcript || transcript.status !== "ready") return undefined;
-  const timedTranscript = transcript.cues
-    .map(
-      (cue) =>
-        `[${formatPlaybackTimestamp(cue.startSeconds)}] ${cue.text.trim()}`,
-    )
-    .filter((line) => line.trim())
-    .join("\n");
-  return timedTranscript || transcript.text.trim() || undefined;
+function formatTimelineTimestamp(value: string) {
+  const seconds = timestampToSeconds(value);
+
+  return seconds === null
+    ? value
+    : formatPlaybackTimestamp(seconds);
 }
 
-function renderInlineMarkdown(value: string, keyPrefix: string): ReactNode[] {
-  return value
-    .split(/(\*\*[^*\n]+\*\*|\[[^\]\n]+\]\(https?:\/\/[^)\s]+\))/g)
-    .filter(Boolean)
-    .map((part, index) => {
-      if (part.startsWith("**") && part.endsWith("**")) {
+function VideoTimeButton({
+  seconds,
+  label,
+  onVideoTimeClick,
+}: {
+  seconds: number;
+  label: string;
+  onVideoTimeClick?: (seconds: number) => void;
+}) {
+  return (
+    <button
+      className="message-video-time"
+      type="button"
+      disabled={!onVideoTimeClick}
+      onClick={() => onVideoTimeClick?.(seconds)}
+      aria-label={`跳转到视频 ${label}`}
+      title={onVideoTimeClick ? `跳转到视频 ${label}` : "视频预览尚未恢复"}
+    >
+      {label}
+    </button>
+  );
+}
+
+function safeMarkdownUrl(url: string) {
+  if (parseVideoTimeHref(url) !== null) return url;
+  const transformed = defaultUrlTransform(url);
+  return /^https?:\/\//i.test(transformed) ? transformed : "";
+}
+
+function MarkdownMessage({
+  content,
+  onVideoTimeClick,
+}: {
+  content: string;
+  onVideoTimeClick?: (seconds: number) => void;
+}) {
+  const markdown = useMemo(() => prepareMarkdownContent(content), [content]);
+  const components = useMemo<MarkdownComponents>(
+    () => ({
+      a({ href, children }) {
+        const seconds = parseVideoTimeHref(href);
+        if (seconds !== null) {
+          return (
+            <VideoTimeButton
+              seconds={seconds}
+              label={String(children)}
+              onVideoTimeClick={onVideoTimeClick}
+            />
+          );
+        }
+        if (!href || !/^https?:\/\//i.test(href)) {
+          return <span>{children}</span>;
+        }
+        const label = String(children);
         return (
-          <strong key={`${keyPrefix}-strong-${index}`}>
-            {part.slice(2, -2)}
-          </strong>
-        );
-      }
-      const link = part.match(/^\[([^\]\n]+)\]\((https?:\/\/[^)\s]+)\)$/);
-      if (link) {
-        return (
-          <a
-            key={`${keyPrefix}-link-${index}`}
-            href={link[2]}
-            target="_blank"
-            rel="noopener noreferrer"
-          >
-            {/^\d{1,2}$/.test(link[1]) ? `[${link[1]}]` : link[1]}
+          <a href={href} target="_blank" rel="noopener noreferrer">
+            {/^\d{1,2}$/.test(label) ? `[${label}]` : children}
           </a>
         );
-      }
-      return <span key={`${keyPrefix}-text-${index}`}>{part}</span>;
-    });
-}
-
-function MarkdownMessage({ content }: { content: string }) {
-  const normalized = content
-    .trim()
-    .replace(/\s+(?=\*\*(?:\d+[.、]|[^*\n]{1,18}[：:])\*\*)/g, "\n\n");
-  const blocks = normalized.split(/\n{2,}/).map((block) => block.trim()).filter(Boolean);
+      },
+      img({ alt }) {
+        return <span>{alt ?? ""}</span>;
+      },
+    }),
+    [onVideoTimeClick],
+  );
 
   return (
     <div className="message-markdown">
-      {blocks.map((block, blockIndex) => {
-        const lines = block.split(/\n/).map((line) => line.trim()).filter(Boolean);
-        const unordered = lines.every((line) => /^[-*]\s+/.test(line));
-        const ordered = lines.every((line) => /^\d+[.、]\s*/.test(line));
-        if (unordered || ordered) {
-          const List = ordered ? "ol" : "ul";
-          return (
-            <List key={`list-${blockIndex}`}>
-              {lines.map((line, lineIndex) => (
-                <li key={`item-${blockIndex}-${lineIndex}`}>
-                  {renderInlineMarkdown(
-                    line.replace(unordered ? /^[-*]\s+/ : /^\d+[.、]\s*/, ""),
-                    `item-${blockIndex}-${lineIndex}`,
-                  )}
-                </li>
-              ))}
-            </List>
-          );
-        }
-        const heading = block.match(/^#{1,6}\s+([\s\S]+)$/);
-        if (heading) {
-          return (
-            <h5 key={`heading-${blockIndex}`}>
-              {renderInlineMarkdown(heading[1], `heading-${blockIndex}`)}
-            </h5>
-          );
-        }
-        return (
-          <p key={`paragraph-${blockIndex}`}>
-            {lines.map((line, lineIndex) => (
-              <span key={`line-${blockIndex}-${lineIndex}`}>
-                {lineIndex > 0 ? <br /> : null}
-                {renderInlineMarkdown(line, `line-${blockIndex}-${lineIndex}`)}
-              </span>
-            ))}
-          </p>
-        );
-      })}
+      <ReactMarkdown
+        remarkPlugins={[remarkGfm]}
+        components={components}
+        skipHtml
+        urlTransform={safeMarkdownUrl}
+      >
+        {markdown}
+      </ReactMarkdown>
     </div>
   );
 }
 
-function bilibiliAnalysisLabel(result: BilibiliDownloadResult) {
-  return result.width && result.height
-    ? `分析素材 ${result.width}×${result.height}`
-    : "480p 等价分析素材";
+function ReasoningPanel({
+  content,
+  durationSeconds,
+  isStreaming,
+  hasAnswer,
+}: {
+  content: string;
+  durationSeconds?: number;
+  isStreaming?: boolean;
+  hasAnswer: boolean;
+}) {
+  return (
+    <details
+      key={`${isStreaming ? "streaming" : "complete"}-${hasAnswer ? "answer" : "thought"}`}
+      className="message-reasoning"
+      open={isStreaming && !hasAnswer ? true : undefined}
+    >
+      <summary>
+        <span aria-hidden="true">✦</span>
+        {isStreaming && !hasAnswer
+          ? "正在深度思考…"
+          : `已深度思考 ${durationSeconds ?? 1} 秒`}
+        <span className="message-disclosure" aria-hidden="true">⌄</span>
+      </summary>
+      <div>{content}</div>
+    </details>
+  );
+}
+
+function WebSourcesPanel({
+  sources,
+}: {
+  sources: NonNullable<ChatMessage["webSources"]>;
+}) {
+  return (
+    <details className="message-web-sources">
+      <summary>
+        访问了 {sources.length} 个网页
+        <span className="message-disclosure" aria-hidden="true">⌄</span>
+      </summary>
+      <div className="message-web-source-list">
+        {sources.map((source) => (
+          <a
+            key={`${source.index}-${source.url}`}
+            href={source.url}
+            target="_blank"
+            rel="noopener noreferrer"
+          >
+            <span>[{source.index}]</span>
+            {source.title}
+          </a>
+        ))}
+      </div>
+    </details>
+  );
 }
 
 function bilibiliPreviewResolutionLabel(
@@ -438,6 +668,9 @@ export default function VideoWorkbench() {
   const [processingStages, setProcessingStages] = useState<string[]>([]);
   const [stageIndex, setStageIndex] = useState(-1);
   const [stageProgress, setStageProgress] = useState(0);
+  const [displayedProgress, setDisplayedProgress] = useState(0);
+  const [processingDurationSeconds, setProcessingDurationSeconds] =
+    useState<number | null>(null);
   const [notice, setNotice] = useState<InlineNotice | null>(null);
   const [isDragging, setIsDragging] = useState(false);
   const [messages, setMessages] = useState<ChatMessage[]>([]);
@@ -454,8 +687,18 @@ export default function VideoWorkbench() {
   >([...DEFAULT_TRANSCRIPT_LANGUAGES]);
   const [deepThinkingEnabled, setDeepThinkingEnabled] = useState(false);
   const [webSearchEnabled, setWebSearchEnabled] = useState(false);
+  const [fullRecallEnabled, setFullRecallEnabled] = useState(false);
+  const [isUsageMenuOpen, setIsUsageMenuOpen] = useState(false);
+  const [copiedMessageId, setCopiedMessageId] = useState<string | null>(null);
+  const [hoveredMessageId, setHoveredMessageId] = useState<string | null>(null);
+  const [resendingMessageId, setResendingMessageId] = useState<string | null>(
+    null,
+  );
   const [isAnalysisSettingsOpen, setIsAnalysisSettingsOpen] = useState(false);
   const [isFetchingVideo, setIsFetchingVideo] = useState(false);
+  const [isExtractingTranscript, setIsExtractingTranscript] = useState(false);
+  const [transcriptExtractionProgress, setTranscriptExtractionProgress] =
+    useState<number | null>(null);
   const [videoPreview, setVideoPreview] = useState<VideoPreview | null>(null);
   const [conversationItems, setConversationItems] = useState<ConversationListItem[]>([]);
   const [activeConversationId, setActiveConversationId] = useState<string | null>(null);
@@ -471,26 +714,36 @@ export default function VideoWorkbench() {
   const [sidebarWidth, setSidebarWidth] = useState<number | null>(null);
   const [sourcePaneHeight, setSourcePaneHeight] = useState<number | null>(null);
   const [workspaceLayoutReady, setWorkspaceLayoutReady] = useState(false);
+  const [workspaceMeasurements, setWorkspaceMeasurements] =
+    useState<WorkspaceMeasurements>(DEFAULT_WORKSPACE_MEASUREMENTS);
   const fileInputRef = useRef<HTMLInputElement>(null);
   const runTokenRef = useRef(0);
   const messageCounterRef = useRef(0);
   const analyzeAbortRef = useRef<AbortController | null>(null);
   const fetchVideoAbortRef = useRef<AbortController | null>(null);
+  const transcriptAbortRef = useRef<AbortController | null>(null);
+  const transcriptProgressStartedAtRef = useRef(0);
   const askAbortRef = useRef<AbortController | null>(null);
   const pendingReplyRef = useRef<{
     controller: AbortController;
     userMessage: ChatMessage;
+    assistantMessage: ChatMessage;
     conversationId: string | null;
+    reasoningStartedAt?: number;
+    reasoningLastAt?: number;
   } | null>(null);
   const conversationLoadAbortRef = useRef<AbortController | null>(null);
   const restoreConversationRef = useRef<(id: string) => void>(() => undefined);
+  const targetProgressRef = useRef(0);
   const hasRestoredConversationRef = useRef(false);
   const videoPlayerRef = useRef<HTMLVideoElement>(null);
   const sideVideoPreviewRef = useRef<HTMLDivElement>(null);
   const pendingSeekSecondsRef = useRef<number | null>(null);
   const analysisSettingsRef = useRef<HTMLDivElement>(null);
+  const usageMenuRef = useRef<HTMLDivElement>(null);
   const workspaceRef = useRef<HTMLDivElement>(null);
   const setupColumnRef = useRef<HTMLElement>(null);
+  const sourcePaneRef = useRef<HTMLDivElement>(null);
   const activeResizeCleanupRef = useRef<(() => void) | null>(null);
 
   const bvid = useMemo(() => extractBvid(bilibiliInput), [bilibiliInput]);
@@ -506,6 +759,60 @@ export default function VideoWorkbench() {
     () => (summary ? summaryTimeline(summary) : []),
     [summary],
   );
+  const usageRecords = useMemo(
+    () =>
+      messages.flatMap((message) =>
+        message.role === "assistant" && message.usage
+          ? [{ messageId: message.id, usage: message.usage }]
+          : [],
+      ),
+    [messages],
+  );
+  const conversationUsageTotals = useMemo(
+    () => usageTotals(usageRecords.map(({ usage }) => usage)),
+    [usageRecords],
+  );
+  const lastAssistantMessageId = useMemo(
+    () =>
+      messages.findLast((message) => message.role === "assistant")?.id ?? null,
+    [messages],
+  );
+
+  useEffect(() => {
+    if (!isUsageMenuOpen) return;
+    const closeOnOutsidePointer = (event: PointerEvent) => {
+      if (
+        event.target instanceof Node &&
+        !usageMenuRef.current?.contains(event.target)
+      ) {
+        setIsUsageMenuOpen(false);
+      }
+    };
+    window.addEventListener("pointerdown", closeOnOutsidePointer);
+    return () => window.removeEventListener("pointerdown", closeOnOutsidePointer);
+  }, [isUsageMenuOpen]);
+
+  useEffect(() => {
+    if (!isExtractingTranscript) return;
+    const durationSeconds =
+      videoPreview?.durationSeconds ?? processingDurationSeconds;
+    const timer = window.setInterval(() => {
+      const estimate = estimatedStageProgress(
+        "transcript",
+        performance.now() - transcriptProgressStartedAtRef.current,
+        durationSeconds,
+        0.04,
+      );
+      setTranscriptExtractionProgress((current) =>
+        Math.max(current ?? 0, estimate),
+      );
+    }, 400);
+    return () => window.clearInterval(timer);
+  }, [
+    isExtractingTranscript,
+    processingDurationSeconds,
+    videoPreview?.durationSeconds,
+  ]);
 
   useEffect(() => {
     const readSetting = () => {
@@ -539,51 +846,62 @@ export default function VideoWorkbench() {
   }, []);
 
   useEffect(() => {
-    try {
-      const stored = window.localStorage.getItem(
-        ANALYSIS_SETTINGS_STORAGE_KEY,
-      );
-      if (stored) {
-        const parsed = JSON.parse(stored) as {
-          transcriptExtraction?: unknown;
-          transcriptLanguages?: unknown;
-        };
-        if (typeof parsed.transcriptExtraction === "boolean") {
-          setTranscriptExtractionEnabled(parsed.transcriptExtraction);
+    const frame = window.requestAnimationFrame(() => {
+      try {
+        const stored = window.localStorage.getItem(
+          ANALYSIS_SETTINGS_STORAGE_KEY,
+        );
+        if (stored) {
+          const parsed = JSON.parse(stored) as {
+            transcriptExtraction?: unknown;
+            transcriptLanguages?: unknown;
+          };
+          if (typeof parsed.transcriptExtraction === "boolean") {
+            setTranscriptExtractionEnabled(parsed.transcriptExtraction);
+          }
+          if (Array.isArray(parsed.transcriptLanguages)) {
+            const languages = parsed.transcriptLanguages.filter(
+              (value): value is TranscriptLanguage =>
+                TRANSCRIPT_LANGUAGE_OPTIONS.some(
+                  (option) => option.value === value,
+                ),
+            );
+            setTranscriptLanguages([...new Set(languages)]);
+          }
         }
-        if (Array.isArray(parsed.transcriptLanguages)) {
-          const languages = parsed.transcriptLanguages.filter(
-            (value): value is TranscriptLanguage =>
-              TRANSCRIPT_LANGUAGE_OPTIONS.some(
-                (option) => option.value === value,
-              ),
-          );
-          setTranscriptLanguages([...new Set(languages)]);
-        }
+      } catch {
+        setTranscriptExtractionEnabled(true);
       }
-    } catch {
-      setTranscriptExtractionEnabled(true);
-    }
+    });
+    return () => window.cancelAnimationFrame(frame);
   }, []);
 
   useEffect(() => {
-    try {
-      const stored = window.localStorage.getItem(CHAT_SETTINGS_STORAGE_KEY);
-      if (!stored) return;
-      const parsed = JSON.parse(stored) as {
-        deepThinking?: unknown;
-        webSearch?: unknown;
-      };
-      if (typeof parsed.deepThinking === "boolean") {
-        setDeepThinkingEnabled(parsed.deepThinking);
+    const frame = window.requestAnimationFrame(() => {
+      try {
+        const stored = window.localStorage.getItem(CHAT_SETTINGS_STORAGE_KEY);
+        if (!stored) return;
+        const parsed = JSON.parse(stored) as {
+          deepThinking?: unknown;
+          webSearch?: unknown;
+          fullRecall?: unknown;
+        };
+        if (typeof parsed.deepThinking === "boolean") {
+          setDeepThinkingEnabled(parsed.deepThinking);
+        }
+        if (typeof parsed.webSearch === "boolean") {
+          setWebSearchEnabled(parsed.webSearch);
+        }
+        if (typeof parsed.fullRecall === "boolean") {
+          setFullRecallEnabled(parsed.fullRecall);
+        }
+      } catch {
+        setDeepThinkingEnabled(false);
+        setWebSearchEnabled(false);
+        setFullRecallEnabled(false);
       }
-      if (typeof parsed.webSearch === "boolean") {
-        setWebSearchEnabled(parsed.webSearch);
-      }
-    } catch {
-      setDeepThinkingEnabled(false);
-      setWebSearchEnabled(false);
-    }
+    });
+    return () => window.cancelAnimationFrame(frame);
   }, []);
 
   useEffect(() => {
@@ -608,30 +926,41 @@ export default function VideoWorkbench() {
   }, [isAnalysisSettingsOpen]);
 
   useEffect(() => {
-    try {
-      const stored = window.localStorage.getItem(WORKSPACE_LAYOUT_STORAGE_KEY);
-      if (stored) {
-        const parsed = JSON.parse(stored) as StoredWorkspaceLayout;
-        if (typeof parsed.sidebarVisible === "boolean") {
-          setSidebarVisible(parsed.sidebarVisible);
+    const frame = window.requestAnimationFrame(() => {
+      try {
+        const stored = window.localStorage.getItem(WORKSPACE_LAYOUT_STORAGE_KEY);
+        if (stored) {
+          const parsed = JSON.parse(stored) as StoredWorkspaceLayout;
+          if (typeof parsed.sidebarVisible === "boolean") {
+            setSidebarVisible(parsed.sidebarVisible);
+          }
+          const sourceCollapsed = parsed.sourcePaneCollapsed === true;
+          const historyCollapsed =
+            parsed.historyPaneCollapsed === true && !sourceCollapsed;
+          setSourcePaneCollapsed(sourceCollapsed);
+          setHistoryPaneCollapsed(historyCollapsed);
+          if (typeof parsed.sidebarWidth === "number") {
+            const workspaceWidth =
+              workspaceRef.current?.getBoundingClientRect().width ??
+              DEFAULT_WORKSPACE_MEASUREMENTS.workspaceWidth;
+            const { min, max } = sidebarWidthLimitsFor(workspaceWidth);
+            setSidebarWidth(clampTo(parsed.sidebarWidth, min, max));
+          }
+          if (typeof parsed.sourcePaneHeight === "number") {
+            const columnHeight =
+              setupColumnRef.current?.getBoundingClientRect().height ??
+              DEFAULT_WORKSPACE_MEASUREMENTS.columnHeight;
+            const { min, max } = sourcePaneHeightLimitsFor(columnHeight);
+            setSourcePaneHeight(clampTo(parsed.sourcePaneHeight, min, max));
+          }
         }
-        const sourceCollapsed = parsed.sourcePaneCollapsed === true;
-        const historyCollapsed =
-          parsed.historyPaneCollapsed === true && !sourceCollapsed;
-        setSourcePaneCollapsed(sourceCollapsed);
-        setHistoryPaneCollapsed(historyCollapsed);
-        if (typeof parsed.sidebarWidth === "number") {
-          setSidebarWidth(clampSidebarWidth(parsed.sidebarWidth));
-        }
-        if (typeof parsed.sourcePaneHeight === "number") {
-          setSourcePaneHeight(clampSourcePaneHeight(parsed.sourcePaneHeight));
-        }
+      } catch {
+        // 损坏的本地布局设置直接回退到默认布局。
+      } finally {
+        setWorkspaceLayoutReady(true);
       }
-    } catch {
-      // 损坏的本地布局设置直接回退到默认布局。
-    } finally {
-      setWorkspaceLayoutReady(true);
-    }
+    });
+    return () => window.cancelAnimationFrame(frame);
   }, []);
 
   useEffect(() => {
@@ -664,16 +993,68 @@ export default function VideoWorkbench() {
   ]);
 
   useEffect(() => {
-    const clampSavedSizes = () => {
+    let measureFrame: number | null = null;
+    const measureLayout = () => {
+      measureFrame = null;
+      const workspaceWidth =
+        workspaceRef.current?.getBoundingClientRect().width ??
+        DEFAULT_WORKSPACE_MEASUREMENTS.workspaceWidth;
+      const columnHeight =
+        setupColumnRef.current?.getBoundingClientRect().height ??
+        DEFAULT_WORKSPACE_MEASUREMENTS.columnHeight;
+      const measuredSidebarWidth =
+        setupColumnRef.current?.getBoundingClientRect().width ??
+        DEFAULT_WORKSPACE_MEASUREMENTS.sidebarWidth;
+      const measuredSourcePaneHeight =
+        sourcePaneRef.current?.getBoundingClientRect().height ??
+        DEFAULT_WORKSPACE_MEASUREMENTS.sourcePaneHeight;
+      const widthLimits = sidebarWidthLimitsFor(workspaceWidth);
+      const heightLimits = sourcePaneHeightLimitsFor(columnHeight);
+
+      setWorkspaceMeasurements((current) => {
+        const next = {
+          workspaceWidth,
+          columnHeight,
+          sidebarWidth: measuredSidebarWidth,
+          sourcePaneHeight: measuredSourcePaneHeight,
+        };
+        return current.workspaceWidth === next.workspaceWidth &&
+          current.columnHeight === next.columnHeight &&
+          current.sidebarWidth === next.sidebarWidth &&
+          current.sourcePaneHeight === next.sourcePaneHeight
+          ? current
+          : next;
+      });
       setSidebarWidth((current) =>
-        current === null ? null : clampSidebarWidth(current),
+        current === null
+          ? null
+          : clampTo(current, widthLimits.min, widthLimits.max),
       );
       setSourcePaneHeight((current) =>
-        current === null ? null : clampSourcePaneHeight(current),
+        current === null
+          ? null
+          : clampTo(current, heightLimits.min, heightLimits.max),
       );
     };
-    window.addEventListener("resize", clampSavedSizes);
-    return () => window.removeEventListener("resize", clampSavedSizes);
+    const scheduleMeasurement = () => {
+      if (measureFrame !== null) return;
+      measureFrame = window.requestAnimationFrame(measureLayout);
+    };
+    const observer =
+      typeof ResizeObserver === "undefined"
+        ? null
+        : new ResizeObserver(scheduleMeasurement);
+    if (workspaceRef.current) observer?.observe(workspaceRef.current);
+    if (setupColumnRef.current) observer?.observe(setupColumnRef.current);
+    if (sourcePaneRef.current) observer?.observe(sourcePaneRef.current);
+    window.addEventListener("resize", scheduleMeasurement);
+    scheduleMeasurement();
+
+    return () => {
+      observer?.disconnect();
+      window.removeEventListener("resize", scheduleMeasurement);
+      if (measureFrame !== null) window.cancelAnimationFrame(measureFrame);
+    };
   }, []);
 
   const pendingSource = useMemo<VideoSourceDescriptor | null>(() => {
@@ -722,7 +1103,6 @@ export default function VideoWorkbench() {
 
   useEffect(() => {
     const controller = new AbortController();
-    setIsConversationListLoading(true);
     void listConversations(controller.signal)
       .then((items) => {
         setConversationItems(items);
@@ -808,21 +1188,25 @@ export default function VideoWorkbench() {
   }
 
   function updateChatSetting(
-    setting: "deepThinking" | "webSearch",
+    setting: "deepThinking" | "webSearch" | "fullRecall",
     enabled: boolean,
   ) {
     const nextDeepThinking =
       setting === "deepThinking" ? enabled : deepThinkingEnabled;
     const nextWebSearch =
       setting === "webSearch" ? enabled : webSearchEnabled;
+    const nextFullRecall =
+      setting === "fullRecall" ? enabled : fullRecallEnabled;
     setDeepThinkingEnabled(nextDeepThinking);
     setWebSearchEnabled(nextWebSearch);
+    setFullRecallEnabled(nextFullRecall);
     try {
       window.localStorage.setItem(
         CHAT_SETTINGS_STORAGE_KEY,
         JSON.stringify({
           deepThinking: nextDeepThinking,
           webSearch: nextWebSearch,
+          fullRecall: nextFullRecall,
         }),
       );
     } catch {
@@ -833,31 +1217,15 @@ export default function VideoWorkbench() {
   function sidebarWidthLimits() {
     const workspaceWidth =
       workspaceRef.current?.getBoundingClientRect().width ??
-      MIN_SIDEBAR_WIDTH + MIN_CONVERSATION_WIDTH + WORKSPACE_RESIZER_SIZE;
-    return {
-      min: MIN_SIDEBAR_WIDTH,
-      max: Math.max(
-        MIN_SIDEBAR_WIDTH,
-        workspaceWidth - MIN_CONVERSATION_WIDTH - WORKSPACE_RESIZER_SIZE,
-      ),
-    };
+      workspaceMeasurements.workspaceWidth;
+    return sidebarWidthLimitsFor(workspaceWidth);
   }
 
   function sourcePaneHeightLimits() {
     const columnHeight =
       setupColumnRef.current?.getBoundingClientRect().height ??
-      MIN_SOURCE_PANE_HEIGHT + MIN_HISTORY_PANE_HEIGHT + PANE_RESIZER_SIZE;
-    return {
-      min: MIN_SOURCE_PANE_HEIGHT,
-      max: Math.max(
-        MIN_SOURCE_PANE_HEIGHT,
-        columnHeight - MIN_HISTORY_PANE_HEIGHT - PANE_RESIZER_SIZE,
-      ),
-    };
-  }
-
-  function clampTo(value: number, minimum: number, maximum: number) {
-    return Math.min(maximum, Math.max(minimum, value));
+      workspaceMeasurements.columnHeight;
+    return sourcePaneHeightLimitsFor(columnHeight);
   }
 
   function clampSidebarWidth(value: number) {
@@ -1338,6 +1706,10 @@ export default function VideoWorkbench() {
     runTokenRef.current = runToken;
     fetchVideoAbortRef.current?.abort();
     analyzeAbortRef.current?.abort();
+    transcriptAbortRef.current?.abort();
+    transcriptAbortRef.current = null;
+    setIsExtractingTranscript(false);
+    setTranscriptExtractionProgress(null);
     stopReply();
     const controller = new AbortController();
     fetchVideoAbortRef.current = controller;
@@ -1438,6 +1810,136 @@ export default function VideoWorkbench() {
     }
   }
 
+  async function handleExtractTranscript() {
+    if (
+      isExtractingTranscript ||
+      phase !== "ready" ||
+      !summary ||
+      !activeSource ||
+      !activeConversationId ||
+      !videoPreview
+    ) {
+      return;
+    }
+
+    transcriptAbortRef.current?.abort();
+    const controller = new AbortController();
+    transcriptAbortRef.current = controller;
+    transcriptProgressStartedAtRef.current = performance.now();
+    setIsExtractingTranscript(true);
+    setTranscriptExtractionProgress(0.04);
+    showNotice("正在准备分析音轨并重新提取字幕……", "success");
+
+    let bilibiliJobId: string | null = null;
+    let mediaJobId: string | null = null;
+    let retainTimedOutJob = false;
+    let completed = false;
+    try {
+      if (activeSource.kind === "bilibili") {
+        const restoredBvid =
+          activeSource.bvid ?? extractBvid(activeSource.sourceUrl ?? "");
+        if (!restoredBvid) throw new Error("无法识别原视频的 BV 号。");
+        const prepared = await downloadBilibiliVideo(restoredBvid, {
+          signal: controller.signal,
+          directSummaryMaxSeconds: qwenDirectSummaryMaxSeconds,
+        });
+        bilibiliJobId = prepared.jobId;
+      } else {
+        let file: File;
+        if (activeSource.kind === "upload") {
+          if (!selectedVideo) {
+            throw new Error("请先重新选择本地视频，再提取字幕。");
+          }
+          file = selectedVideo.file;
+        } else {
+          if (!activeSource.sourceUrl) {
+            throw new Error("原视频直链不可用，无法提取字幕。");
+          }
+          file = await downloadRemoteVideoFile(
+            activeSource.sourceUrl,
+            controller.signal,
+          );
+        }
+        const prepared = await prepareMediaAnalysis(file, {
+          sourceKind: activeSource.kind,
+          ...(activeSource.kind === "url" && activeSource.sourceUrl
+            ? { sourceUrl: activeSource.sourceUrl }
+            : {}),
+          directSummaryMaxSeconds: qwenDirectSummaryMaxSeconds,
+          signal: controller.signal,
+        });
+        mediaJobId = prepared.jobId;
+      }
+      setTranscriptExtractionProgress((current) =>
+        Math.max(current ?? 0, 0.16),
+      );
+
+      let nextTranscript: VideoTranscript;
+      try {
+        nextTranscript = bilibiliJobId
+          ? await extractBilibiliTranscript(
+              bilibiliJobId,
+              transcriptLanguages,
+              controller.signal,
+            )
+          : await extractMediaTranscript(
+              mediaJobId as string,
+              transcriptLanguages,
+              controller.signal,
+            );
+      } catch (error) {
+        if (!isTranscriptTimeout(error)) throw error;
+        retainTimedOutJob = true;
+        nextTranscript = unavailableTimedOutTranscript(transcriptLanguages);
+      }
+
+      if (transcriptAbortRef.current !== controller) return;
+      setTranscriptExtractionProgress((current) =>
+        Math.max(current ?? 0, 0.96),
+      );
+      const saved = await saveConversationTranscript(
+        activeConversationId,
+        nextTranscript,
+      );
+      if (transcriptAbortRef.current !== controller) return;
+      setTranscript(saved);
+      touchConversationItem(activeConversationId);
+      completed = true;
+      setTranscriptExtractionProgress(1);
+      window.setTimeout(() => {
+        setTranscriptExtractionProgress((current) =>
+          current === 1 ? null : current,
+        );
+      }, 650);
+      showNotice(
+        saved.status === "ready"
+          ? "字幕已重新提取并覆盖原记录。"
+          : saved.error ?? "字幕暂不可用。",
+        saved.status === "ready" ? "success" : "error",
+      );
+    } catch (error) {
+      if (
+        transcriptAbortRef.current !== controller ||
+        (error instanceof DOMException && error.name === "AbortError")
+      ) {
+        return;
+      }
+      showNotice(
+        error instanceof Error ? error.message : "字幕提取失败，请稍后重试。",
+      );
+    } finally {
+      if (!retainTimedOutJob) {
+        if (bilibiliJobId) void releaseBilibiliAnalysis(bilibiliJobId);
+        if (mediaJobId) void releaseMediaAnalysis(mediaJobId);
+      }
+      if (transcriptAbortRef.current === controller) {
+        transcriptAbortRef.current = null;
+        setIsExtractingTranscript(false);
+        if (!completed) setTranscriptExtractionProgress(null);
+      }
+    }
+  }
+
   async function handleAnalyze() {
     if (isFetchingVideo) return;
     if (!pendingSource) {
@@ -1452,6 +1954,10 @@ export default function VideoWorkbench() {
     const runToken = runTokenRef.current + 1;
     runTokenRef.current = runToken;
     analyzeAbortRef.current?.abort();
+    transcriptAbortRef.current?.abort();
+    transcriptAbortRef.current = null;
+    setIsExtractingTranscript(false);
+    setTranscriptExtractionProgress(null);
     stopReply();
     const controller = new AbortController();
     analyzeAbortRef.current = controller;
@@ -1469,6 +1975,11 @@ export default function VideoWorkbench() {
     setProcessingStages(stages);
     setStageIndex(0);
     setStageProgress(0.2);
+    setDisplayedProgress(0);
+    targetProgressRef.current = 0;
+    setProcessingDurationSeconds(
+      pendingSource.kind === "upload" ? selectedVideo?.duration ?? null : null,
+    );
     if (pendingSource.kind === "url" && pendingSource.sourceUrl) {
       showRemoteVideo(pendingSource.sourceUrl);
     } else if (pendingSource.kind === "upload") {
@@ -1478,6 +1989,7 @@ export default function VideoWorkbench() {
     let bilibiliAnalysisJobId: string | null = null;
     let mediaAnalysisJobId: string | null = null;
     let analysisTranscript: VideoTranscript | null = null;
+    let retainTimedOutTranscriptJob = false;
     try {
       let context: VideoModelContext;
       let analysisSource = pendingSource;
@@ -1495,6 +2007,7 @@ export default function VideoWorkbench() {
           },
         });
         mediaAnalysisJobId = prepared.jobId;
+        setProcessingDurationSeconds(prepared.durationSeconds);
         context = prepared.context;
         analysisTranscript = prepared.transcript ?? null;
         analysisSource = {
@@ -1516,6 +2029,7 @@ export default function VideoWorkbench() {
         );
         if (!downloaded) return;
         bilibiliAnalysisJobId = downloaded.jobId;
+        setProcessingDurationSeconds(downloaded.durationSeconds);
         if (runTokenRef.current !== runToken) return;
 
         analysisSource = {
@@ -1525,9 +2039,7 @@ export default function VideoWorkbench() {
           durationLabel: formatDuration(downloaded.durationSeconds),
           subtitle: `${downloaded.bvid} · ${formatFileSize(
             downloaded.sizeBytes,
-          )} · ${formatDuration(downloaded.durationSeconds)} · ${bilibiliAnalysisLabel(
-            downloaded,
-          )}`,
+          )} · ${formatDuration(downloaded.durationSeconds)}`,
         };
         setActiveSource(analysisSource);
         analysisTranscript = downloaded.transcript ?? null;
@@ -1559,6 +2071,7 @@ export default function VideoWorkbench() {
           },
         });
         mediaAnalysisJobId = prepared.jobId;
+        setProcessingDurationSeconds(prepared.durationSeconds);
         context = prepared.context;
         analysisTranscript = prepared.transcript ?? null;
         analysisSource = {
@@ -1587,17 +2100,25 @@ export default function VideoWorkbench() {
       if (transcriptExtractionEnabled) {
         setStageIndex(4);
         setStageProgress(0.1);
-        if (bilibiliAnalysisJobId) {
-          analysisTranscript = await extractBilibiliTranscript(
-            bilibiliAnalysisJobId,
+        try {
+          if (bilibiliAnalysisJobId) {
+            analysisTranscript = await extractBilibiliTranscript(
+              bilibiliAnalysisJobId,
+              transcriptLanguages,
+              controller.signal,
+            );
+          } else if (mediaAnalysisJobId) {
+            analysisTranscript = await extractMediaTranscript(
+              mediaAnalysisJobId,
+              transcriptLanguages,
+              controller.signal,
+            );
+          }
+        } catch (error) {
+          if (!isTranscriptTimeout(error)) throw error;
+          retainTimedOutTranscriptJob = true;
+          analysisTranscript = unavailableTimedOutTranscript(
             transcriptLanguages,
-            controller.signal,
-          );
-        } else if (mediaAnalysisJobId) {
-          analysisTranscript = await extractMediaTranscript(
-            mediaAnalysisJobId,
-            transcriptLanguages,
-            controller.signal,
           );
         }
         if (runTokenRef.current !== runToken) return;
@@ -1615,6 +2136,8 @@ export default function VideoWorkbench() {
         id: nextMessageId("assistant"),
         role: "assistant",
         content: SUMMARY_READY_MESSAGE,
+        createdAt: result.usage.createdAt,
+        usage: result.usage,
       };
       setMessages([initialMessage]);
 
@@ -1623,7 +2146,7 @@ export default function VideoWorkbench() {
           source: analysisSource,
           summary: result.summary,
           activeModel: result.model,
-          messages: [{ role: initialMessage.role, content: initialMessage.content }],
+          messages: [conversationMessageForStorage(initialMessage)],
           ...(analysisTranscript ? { transcript: analysisTranscript } : {}),
         });
         if (runTokenRef.current !== runToken) return;
@@ -1667,10 +2190,10 @@ export default function VideoWorkbench() {
           : "处理没有完成，请检查素材后重试。",
       );
     } finally {
-      if (bilibiliAnalysisJobId) {
+      if (bilibiliAnalysisJobId && !retainTimedOutTranscriptJob) {
         void releaseBilibiliAnalysis(bilibiliAnalysisJobId);
       }
-      if (mediaAnalysisJobId) {
+      if (mediaAnalysisJobId && !retainTimedOutTranscriptJob) {
         void releaseMediaAnalysis(mediaAnalysisJobId);
       }
       if (analyzeAbortRef.current === controller) analyzeAbortRef.current = null;
@@ -1681,6 +2204,10 @@ export default function VideoWorkbench() {
     runTokenRef.current += 1;
     analyzeAbortRef.current?.abort();
     analyzeAbortRef.current = null;
+    transcriptAbortRef.current?.abort();
+    transcriptAbortRef.current = null;
+    setIsExtractingTranscript(false);
+    setTranscriptExtractionProgress(null);
     fetchVideoAbortRef.current?.abort();
     fetchVideoAbortRef.current = null;
     askAbortRef.current?.abort();
@@ -1696,6 +2223,9 @@ export default function VideoWorkbench() {
     setProcessingStages([]);
     setStageIndex(-1);
     setStageProgress(0);
+    setDisplayedProgress(0);
+    targetProgressRef.current = 0;
+    setProcessingDurationSeconds(null);
     setIsFetchingVideo(false);
     clearVideoPreview();
     setMessages([]);
@@ -1707,6 +2237,8 @@ export default function VideoWorkbench() {
     setMode("upload");
     setQuestion("");
     setIsReplying(false);
+    setIsUsageMenuOpen(false);
+    setCopiedMessageId(null);
     setNotice(null);
   }
 
@@ -1723,6 +2255,9 @@ export default function VideoWorkbench() {
     runTokenRef.current = runToken;
     analyzeAbortRef.current?.abort();
     analyzeAbortRef.current = null;
+    transcriptAbortRef.current?.abort();
+    transcriptAbortRef.current = null;
+    setIsExtractingTranscript(false);
     fetchVideoAbortRef.current?.abort();
     fetchVideoAbortRef.current = null;
     setIsFetchingVideo(false);
@@ -1748,12 +2283,34 @@ export default function VideoWorkbench() {
       setActiveModel(conversation.activeModel);
       setActiveSource(conversation.source);
       setActiveConversationId(conversation.id);
+      setIsUsageMenuOpen(false);
+      setCopiedMessageId(null);
       setMessages(
-        conversation.messages.map(({ id: messageId, role, content }) => ({
-          id: messageId,
-          role,
-          content,
-        })),
+        conversation.messages.map(
+          ({
+            id: messageId,
+            role,
+            content,
+            reasoningContent,
+            reasoningDurationSeconds,
+            webSources,
+            stopped,
+            createdAt,
+            usage,
+          }) => ({
+            id: messageId,
+            role,
+            content,
+            createdAt,
+            ...(reasoningContent ? { reasoningContent } : {}),
+            ...(reasoningDurationSeconds !== undefined
+              ? { reasoningDurationSeconds }
+              : {}),
+            ...(webSources?.length ? { webSources } : {}),
+            ...(stopped ? { stopped: true } : {}),
+            ...(usage ? { usage } : {}),
+          }),
+        ),
       );
       setProcessingStages([]);
       setStageIndex(-1);
@@ -1859,44 +2416,61 @@ export default function VideoWorkbench() {
     }
   }
 
-  async function askQuestion(rawQuestion: string) {
+  async function askQuestion(
+    rawQuestion: string,
+    options: {
+      history?: ChatMessage[];
+      replaceMessages?: ChatMessage[];
+    } = {},
+  ) {
     const trimmed = rawQuestion.trim();
     if (!trimmed || !summary || !activeSource || isReplying || askAbortRef.current) return;
 
     const controller = new AbortController();
     askAbortRef.current = controller;
+    const sentAt = currentTimestamp();
 
     const userMessage: ChatMessage = {
       id: nextMessageId("user"),
       role: "user",
       content: trimmed,
+      createdAt: sentAt,
+    };
+    const assistantMessage: ChatMessage = {
+      id: nextMessageId("assistant"),
+      role: "assistant",
+      content: "",
+      createdAt: sentAt + 1,
+      isStreaming: true,
+      streamLabel: "正在准备回答",
     };
     pendingReplyRef.current = {
       controller,
       userMessage,
+      assistantMessage,
       conversationId: activeConversationId,
     };
-    setMessages((current) => [...current, userMessage]);
+    setMessages((current) => [
+      ...(options.replaceMessages ?? current),
+      userMessage,
+      assistantMessage,
+    ]);
     setQuestion("");
     setIsReplying(true);
 
     try {
-      const transcriptContext = transcriptForConversationContext(transcript);
       const result = await askVideo(
         {
           question: trimmed,
-          source: activeSource,
-          summary,
-          ...(transcriptContext
-            ? {
-                context: {
-                  transcript: transcriptContext,
-                },
-              }
-            : {}),
-          history: messages.slice(-12).map(({ role, content }) => ({ role, content })),
+          ...(activeConversationId
+            ? { conversationId: activeConversationId }
+            : { source: activeSource, summary }),
+          history: (options.history ?? messages)
+            .slice(-10)
+            .map(({ role, content }) => ({ role, content })),
           reasoningMode: deepThinkingEnabled ? "pro" : "flash",
           webSearchEnabled,
+          fullRecallEnabled,
           ...(webSearchEnabled
             ? {
                 searchContext: {
@@ -1910,50 +2484,187 @@ export default function VideoWorkbench() {
               }
             : {}),
         },
+        {
+          onEvent: (event) => {
+            const pending = pendingReplyRef.current;
+            if (
+              askAbortRef.current !== controller ||
+              pending?.controller !== controller
+            ) {
+              return;
+            }
+            if (event.type === "phase") {
+              pending.assistantMessage = {
+                ...pending.assistantMessage,
+                streamLabel: event.label,
+              };
+            } else if (event.type === "reasoning_delta") {
+              const receivedAt = Date.now();
+              pending.reasoningStartedAt ??= receivedAt;
+              pending.reasoningLastAt = receivedAt;
+              pending.assistantMessage = {
+                ...pending.assistantMessage,
+                reasoningContent:
+                  (pending.assistantMessage.reasoningContent ?? "") +
+                  event.delta,
+                streamLabel: "正在深度思考",
+              };
+            } else if (event.type === "answer_delta") {
+              if (pending.reasoningStartedAt !== undefined) {
+                pending.reasoningLastAt = Date.now();
+              }
+              pending.assistantMessage = {
+                ...pending.assistantMessage,
+                content: pending.assistantMessage.content + event.delta,
+                streamLabel: "正在生成回答",
+              };
+            } else {
+              return;
+            }
+            const nextAssistant = pending.assistantMessage;
+            setMessages((current) =>
+              current.map((message) =>
+                message.id === nextAssistant.id ? nextAssistant : message,
+              ),
+            );
+          },
+        },
         controller.signal,
       );
       if (askAbortRef.current !== controller) return;
-      const assistantMessage: ChatMessage = {
-        id: nextMessageId("assistant"),
-        role: "assistant",
+      const pending = pendingReplyRef.current;
+      if (pending?.controller !== controller) return;
+      const completedAssistant: ChatMessage = {
+        ...pending.assistantMessage,
         content: result.answer,
+        createdAt: result.usage.createdAt,
+        usage: result.usage,
+        isStreaming: false,
+        streamLabel: undefined,
+        ...(result.reasoningContent
+          ? { reasoningContent: result.reasoningContent }
+          : {}),
+        ...(result.reasoningDurationSeconds !== undefined
+          ? {
+              reasoningDurationSeconds:
+                result.reasoningDurationSeconds,
+            }
+          : {}),
+        ...(result.webSources?.length
+          ? { webSources: result.webSources }
+          : {}),
       };
-      setMessages((current) => [
-        ...current,
-        assistantMessage,
-      ]);
+      pending.assistantMessage = completedAssistant;
+      setMessages((current) =>
+        current.map((message) =>
+          message.id === completedAssistant.id ? completedAssistant : message,
+        ),
+      );
 
-      if (activeConversationId) {
-        const conversationId = activeConversationId;
-        void appendConversationMessages(conversationId, [
-          { role: userMessage.role, content: userMessage.content },
-          { role: assistantMessage.role, content: assistantMessage.content },
-        ])
-          .then(() => touchConversationItem(conversationId))
-          .catch((error: unknown) => {
-            setConversationListError(
-              error instanceof Error
-                ? `回答已生成，但未保存：${error.message}`
-                : "回答已生成，但未能保存到对话历史。",
-            );
-          });
+      if (pending.conversationId) {
+        const conversationId = pending.conversationId;
+        try {
+          const savedMessages = await appendConversationMessages(
+            conversationId,
+            [
+              { role: userMessage.role, content: userMessage.content },
+              conversationMessageForStorage(completedAssistant),
+            ],
+          );
+          const savedUser = savedMessages[0];
+          const savedAssistant = savedMessages[1];
+          setMessages((current) =>
+            current.map((message) => {
+              if (message.id === userMessage.id && savedUser) {
+                return { ...message, id: savedUser.id };
+              }
+              if (message.id === completedAssistant.id && savedAssistant) {
+                return { ...message, id: savedAssistant.id };
+              }
+              return message;
+            }),
+          );
+          touchConversationItem(conversationId);
+        } catch (error) {
+          setConversationListError(
+            error instanceof Error
+              ? `回答已生成，但未保存：${error.message}`
+              : "回答已生成，但未能保存到对话历史。",
+          );
+        }
       }
     } catch (error) {
       if (error instanceof DOMException && error.name === "AbortError") return;
       if (askAbortRef.current !== controller) return;
-      setMessages((current) => [
-        ...current,
-        {
-          id: nextMessageId("assistant"),
-          role: "assistant",
-          content: error instanceof Error ? `回答失败：${error.message}` : "回答失败，请稍后重试。",
-        },
-      ]);
+      const pending = pendingReplyRef.current;
+      if (pending?.controller !== controller) return;
+      const failedAssistant: ChatMessage = {
+        ...pending.assistantMessage,
+        content:
+          error instanceof Error
+            ? `回答失败：${error.message}`
+            : "回答失败，请稍后重试。",
+        isStreaming: false,
+        streamLabel: undefined,
+      };
+      pending.assistantMessage = failedAssistant;
+      setMessages((current) =>
+        current.map((message) =>
+          message.id === failedAssistant.id ? failedAssistant : message,
+        ),
+      );
     } finally {
       if (askAbortRef.current === controller) {
         askAbortRef.current = null;
         pendingReplyRef.current = null;
         setIsReplying(false);
+      }
+    }
+  }
+
+  async function copyMessage(message: ChatMessage) {
+    try {
+      await navigator.clipboard.writeText(message.content);
+      setCopiedMessageId(message.id);
+      window.setTimeout(() => {
+        setCopiedMessageId((current) =>
+          current === message.id ? null : current,
+        );
+      }, 1_500);
+    } catch {
+      showNotice("复制失败，请检查浏览器剪贴板权限。");
+    }
+  }
+
+  async function resendAssistantAnswer(messageIndex: number) {
+    if (isReplying || resendingMessageId) return;
+    for (let index = messageIndex - 1; index >= 0; index -= 1) {
+      const candidate = messages[index];
+      if (candidate.role === "user" && candidate.content.trim()) {
+        const retainedMessages = messages.slice(0, index);
+        setResendingMessageId(messages[messageIndex]?.id ?? candidate.id);
+        try {
+          if (activeConversationId) {
+            await truncateConversationMessages(
+              activeConversationId,
+              candidate.id,
+            );
+            touchConversationItem(activeConversationId);
+          }
+          await askQuestion(candidate.content, {
+            history: retainedMessages,
+            replaceMessages: retainedMessages,
+          });
+        } catch (error) {
+          setConversationListError(
+            error instanceof Error
+              ? `无法重新发送：${error.message}`
+              : "无法重新发送这条问题。",
+          );
+        } finally {
+          setResendingMessageId(null);
+        }
+        return;
       }
     }
   }
@@ -1971,12 +2682,58 @@ export default function VideoWorkbench() {
     controller.abort();
     setIsReplying(false);
 
-    if (pendingReply?.conversationId) {
+    if (pendingReply) {
+      const duration =
+        pendingReply.reasoningStartedAt === undefined
+          ? pendingReply.assistantMessage.reasoningDurationSeconds
+          : Math.max(
+              1,
+              Math.round(
+                ((pendingReply.reasoningLastAt ??
+                  pendingReply.reasoningStartedAt) -
+                  pendingReply.reasoningStartedAt) /
+                  1_000,
+              ),
+            );
+      const stoppedAssistant: ChatMessage = {
+        ...pendingReply.assistantMessage,
+        content:
+          pendingReply.assistantMessage.content.trim() || "已停止生成。",
+        ...(duration !== undefined
+          ? { reasoningDurationSeconds: duration }
+          : {}),
+        stopped: true,
+        isStreaming: false,
+        streamLabel: undefined,
+      };
+      setMessages((current) =>
+        current.map((message) =>
+          message.id === stoppedAssistant.id ? stoppedAssistant : message,
+        ),
+      );
+
+      if (!pendingReply.conversationId) return;
       const { conversationId, userMessage } = pendingReply;
       void appendConversationMessages(conversationId, [
         { role: userMessage.role, content: userMessage.content },
+        conversationMessageForStorage(stoppedAssistant),
       ])
-        .then(() => touchConversationItem(conversationId))
+        .then((savedMessages) => {
+          const savedUser = savedMessages[0];
+          const savedAssistant = savedMessages[1];
+          setMessages((current) =>
+            current.map((message) => {
+              if (message.id === userMessage.id && savedUser) {
+                return { ...message, id: savedUser.id };
+              }
+              if (message.id === stoppedAssistant.id && savedAssistant) {
+                return { ...message, id: savedAssistant.id };
+              }
+              return message;
+            }),
+          );
+          touchConversationItem(conversationId);
+        })
         .catch((error: unknown) => {
           setConversationListError(
             error instanceof Error
@@ -1996,18 +2753,56 @@ export default function VideoWorkbench() {
     void askQuestion(question);
   }
 
-  const progress =
+  const targetProgress =
     processingStages.length > 0
-      ? Math.round(
-          ((stageIndex + Math.max(0, Math.min(1, stageProgress))) /
-            processingStages.length) *
-            100,
-        )
+      ? ((stageIndex + Math.max(0, Math.min(1, stageProgress))) /
+          processingStages.length) *
+        100
       : 0;
+  const activeEstimatedStage: EstimatedAnalysisStage | null =
+    processingStages[stageIndex]?.startsWith("Qwen")
+      ? "qwen"
+      : processingStages[stageIndex]?.startsWith("FunASR")
+        ? "transcript"
+        : null;
 
-  restoreConversationRef.current = (id) => {
-    void handleSelectConversation(id);
-  };
+  useEffect(() => {
+    if (phase !== "processing" || !activeEstimatedStage) return;
+    const startedAt = performance.now();
+    const initialProgress = activeEstimatedStage === "qwen" ? 0.15 : 0.1;
+    const timer = window.setInterval(() => {
+      const estimate = estimatedStageProgress(
+        activeEstimatedStage,
+        performance.now() - startedAt,
+        processingDurationSeconds,
+        initialProgress,
+      );
+      setStageProgress((current) => Math.max(current, estimate));
+    }, 400);
+    return () => window.clearInterval(timer);
+  }, [activeEstimatedStage, phase, processingDurationSeconds]);
+
+  useEffect(() => {
+    targetProgressRef.current = targetProgress;
+  }, [targetProgress]);
+
+  useEffect(() => {
+    if (phase !== "processing") return;
+    const timer = window.setInterval(() => {
+      setDisplayedProgress((current) =>
+        advanceDisplayedProgress(current, targetProgressRef.current),
+      );
+    }, 200);
+    return () => window.clearInterval(timer);
+  }, [phase]);
+
+  const progress = Math.round(displayedProgress);
+
+  useEffect(() => {
+    restoreConversationRef.current = (id) => {
+      void handleSelectConversation(id);
+    };
+  });
 
   const shownSource = activeSource ?? pendingSource;
   const activeConversationTitle = activeConversationId
@@ -2062,14 +2857,59 @@ export default function VideoWorkbench() {
           {videoPreview.durationLabel ? <span>{videoPreview.durationLabel}</span> : null}
           {videoPreview.resolutionLabel ? <span>{videoPreview.resolutionLabel}</span> : null}
         </div>
-        {placement === "side" && videoPreview.kind === "local" ? (
-          <button
-            className="video-preview-change"
-            type="button"
-            onClick={() => fileInputRef.current?.click()}
-          >
-            更改
-          </button>
+        {placement === "side" ? (
+          <div className="video-preview-actions">
+            {videoPreview.kind === "local" ? (
+              <button
+                className="video-preview-change"
+                type="button"
+                disabled={isExtractingTranscript}
+                onClick={() => fileInputRef.current?.click()}
+              >
+                更改
+              </button>
+            ) : null}
+            {phase === "ready" && summary && activeConversationId ? (
+              <button
+                className="video-preview-transcript"
+                type="button"
+                disabled={isExtractingTranscript}
+                onClick={() => void handleExtractTranscript()}
+              >
+                {isExtractingTranscript && transcriptExtractionProgress !== null
+                  ? `正在提取 `
+                  : "提取字幕"}
+              </button>
+            ) : null}
+            {transcriptExtractionProgress !== null ? (
+              <div
+                className="transcript-extraction-progress"
+                role="progressbar"
+                aria-label="字幕提取进度"
+                aria-valuemin={0}
+                aria-valuemax={100}
+                aria-valuenow={Math.round(
+                  transcriptExtractionProgress * 100,
+                )}
+              >
+                <div className="transcript-extraction-progress-label">
+                  <span>字幕提取进度</span>
+                  <strong>
+                    {Math.round(transcriptExtractionProgress * 100)}%
+                  </strong>
+                </div>
+                <div className="transcript-extraction-progress-track">
+                  <span
+                    style={{
+                      width: `${Math.round(
+                        transcriptExtractionProgress * 100,
+                      )}%`,
+                    }}
+                  />
+                </div>
+              </div>
+            ) : null}
+          </div>
         ) : null}
       </div>
     );
@@ -2225,8 +3065,22 @@ export default function VideoWorkbench() {
       ? {}
       : { "--source-pane-height": `${sourcePaneHeight}px` }),
   } as CSSProperties;
-  const workspaceWidthBounds = sidebarWidthLimits();
-  const paneHeightBounds = sourcePaneHeightLimits();
+  const workspaceWidthBounds = sidebarWidthLimitsFor(
+    workspaceMeasurements.workspaceWidth,
+  );
+  const paneHeightBounds = sourcePaneHeightLimitsFor(
+    workspaceMeasurements.columnHeight,
+  );
+  const measuredSidebarWidth = clampTo(
+    workspaceMeasurements.sidebarWidth,
+    workspaceWidthBounds.min,
+    workspaceWidthBounds.max,
+  );
+  const measuredSourcePaneHeight = clampTo(
+    workspaceMeasurements.sourcePaneHeight,
+    paneHeightBounds.min,
+    paneHeightBounds.max,
+  );
 
   return (
     <main className="app-shell">
@@ -2279,6 +3133,7 @@ export default function VideoWorkbench() {
             className={`sidebar-pane source-pane ${
               sourcePaneCollapsed ? "collapsed" : ""
             }`}
+            ref={sourcePaneRef}
           >
             <button
               className="pane-collapse-button source-collapse-button"
@@ -2540,12 +3395,7 @@ export default function VideoWorkbench() {
             aria-orientation="horizontal"
             aria-valuemin={paneHeightBounds.min}
             aria-valuemax={paneHeightBounds.max}
-            aria-valuenow={
-              sourcePaneHeight ??
-              setupColumnRef.current?.firstElementChild?.getBoundingClientRect()
-                .height ??
-              paneHeightBounds.min
-            }
+            aria-valuenow={sourcePaneHeight ?? measuredSourcePaneHeight}
             tabIndex={sourcePaneCollapsed || historyPaneCollapsed ? -1 : 0}
             onPointerDown={(event) => beginResize("rows", event)}
             onKeyDown={handlePaneResizeKeyDown}
@@ -2724,11 +3574,7 @@ export default function VideoWorkbench() {
           aria-orientation="vertical"
           aria-valuemin={workspaceWidthBounds.min}
           aria-valuemax={workspaceWidthBounds.max}
-          aria-valuenow={
-            sidebarWidth ??
-            setupColumnRef.current?.getBoundingClientRect().width ??
-            workspaceWidthBounds.min
-          }
+          aria-valuenow={sidebarWidth ?? measuredSidebarWidth}
           tabIndex={sidebarVisible ? 0 : -1}
           onPointerDown={(event) => beginResize("columns", event)}
           onKeyDown={handleWorkspaceResizeKeyDown}
@@ -2748,15 +3594,82 @@ export default function VideoWorkbench() {
                 </p>
               ) : null}
             </div>
-            <span className={`phase-badge ${phase}`}>
-              {phase === "processing"
-                  ? "处理中"
-                : phase === "ready"
-                  ? "对话"
-                  : phase === "error"
-                    ? "需重试"
-                    : "未开始"}
-            </span>
+            <div className="conversation-header-actions">
+              {usageRecords.length > 0 ? (
+                <div className="conversation-usage" ref={usageMenuRef}>
+                  <button
+                    className="conversation-usage-summary"
+                    type="button"
+                    aria-expanded={isUsageMenuOpen}
+                    onClick={() => setIsUsageMenuOpen((current) => !current)}
+                    title={`${formatUsageTokens(
+                      conversationUsageTotals.totalTokens,
+                    )} tokens，预估 ${formatEstimatedCost(
+                      conversationUsageTotals.estimatedCostCnyMicros,
+                    )}，搜索 ${conversationUsageTotals.searchCount} 次`}
+                  >
+                    <span>
+                      总{" "}
+                      {formatCompactUsageTokens(
+                        conversationUsageTotals.totalTokens,
+                      )}{" "}
+                      tokens · 预估{" "}
+                      {formatEstimatedCost(
+                        conversationUsageTotals.estimatedCostCnyMicros,
+                      )}{" "}
+                      · 搜索 {conversationUsageTotals.searchCount} 次
+                    </span>
+                    <i aria-hidden="true">⌄</i>
+                  </button>
+                  {isUsageMenuOpen ? (
+                    <div className="conversation-usage-popover">
+                      <div className="conversation-usage-heading">
+                        <strong>用量记录</strong>
+                        <span>模型费用为预估值</span>
+                      </div>
+                      <div className="conversation-usage-list">
+                        {usageRecords.map(({ messageId, usage }, index) => (
+                          <div
+                            className="conversation-usage-row"
+                            key={`${messageId}-${usage.createdAt}`}
+                          >
+                            <span>
+                              {usage.kind === "summary"
+                                ? "视频总结"
+                                : `问答 ${
+                                    usageRecords
+                                      .slice(0, index + 1)
+                                      .filter(
+                                        (record) =>
+                                          record.usage.kind === "answer",
+                                      ).length
+                                  }`}
+                            </span>
+                            <span>
+                              {formatUsageTokens(usage.totalTokens)} tokens ·{" "}
+                              {formatEstimatedCost(
+                                usage.estimatedCostCnyMicros,
+                              )}{" "}
+                              · 搜索 {usage.searchCount} 次 ·{" "}
+                              {formatUsageTime(usage.createdAt)}
+                            </span>
+                          </div>
+                        ))}
+                      </div>
+                    </div>
+                  ) : null}
+                </div>
+              ) : null}
+              {phase !== "ready" ? (
+  <span className={`phase-badge ${phase}`}>
+    {phase === "processing"
+      ? "处理中"
+      : phase === "error"
+        ? "需重试"
+        : "未开始"}
+  </span>
+) : null}
+            </div>
           </div>
 
           <div className="conversation-scroll" aria-live="polite">
@@ -2785,10 +3698,12 @@ export default function VideoWorkbench() {
                 <div className="processing-heading">
                   <div>
                     <span>正在构建视频上下文</span>
-                    <strong>{progress}%</strong>
+                    <strong title="Qwen 与字幕阶段为基于视频时长的保守估算">
+                      {progress}%
+                    </strong>
                   </div>
                   <div className="progress-track" aria-hidden="true">
-                    <span style={{ width: `${progress}%` }} />
+                    <span style={{ width: `${displayedProgress}%` }} />
                   </div>
                 </div>
 
@@ -2886,9 +3801,9 @@ export default function VideoWorkbench() {
                               !videoPreview || timestampToSeconds(item.time) === null
                             }
                             onClick={() => seekToTimeline(item.time)}
-                            aria-label={`跳转到 ${item.time}`}
+                            aria-label={`跳转到 ${formatTimelineTimestamp(item.time)}`}
                           >
-                            <time>{item.time}</time>
+                            <time>{formatTimelineTimestamp(item.time)}</time>
                           </button>
                           <div>
                             <strong>{item.title}</strong>
@@ -2944,32 +3859,187 @@ export default function VideoWorkbench() {
                 </div>
 
                 <div className="message-list">
-                  {messages.map((message) => (
-                    <div className={`message ${message.role}`} key={message.id}>
-                      <span className="message-avatar" aria-hidden="true">
-                        {message.role === "assistant" ? "帧" : "你"}
-                      </span>
-                      <div>
-                        <strong>{message.role === "assistant" ? "帧记 AI" : "你"}</strong>
-                        <MarkdownMessage content={message.content} />
+                  {messages.map((message, messageIndex) => (
+                    <div
+                      className={`message ${message.role}${
+                        message.id === lastAssistantMessageId
+                          ? " is-latest-assistant"
+                          : ""
+                      }${
+                        message.id === hoveredMessageId
+                          ? " is-actions-visible"
+                          : ""
+                      }`}
+                      key={message.id}
+                      onPointerEnter={() => setHoveredMessageId(message.id)}
+                      onPointerLeave={() =>
+                        setHoveredMessageId((current) =>
+                          current === message.id ? null : current,
+                        )
+                      }
+                      onPointerCancel={() =>
+                        setHoveredMessageId((current) =>
+                          current === message.id ? null : current,
+                        )
+                      }
+                    >
+                      <div className="message-body">
+                        {message.role === "assistant" &&
+                        message.reasoningContent ? (
+                          <ReasoningPanel
+                            content={message.reasoningContent}
+                            durationSeconds={message.reasoningDurationSeconds}
+                            isStreaming={message.isStreaming}
+                            hasAnswer={Boolean(message.content)}
+                          />
+                        ) : null}
+                        <div
+                          className={
+                            message.role === "assistant"
+                              ? "message-answer-card"
+                              : "message-user-answer"
+                          }
+                        >
+                          {message.content ? (
+                            <MarkdownMessage
+                              content={message.content}
+                              onVideoTimeClick={
+                                message.role === "assistant" && videoPreview
+                                  ? seekToSeconds
+                                  : undefined
+                              }
+                            />
+                          ) : message.isStreaming ? (
+                            <span
+                              className="stream-status"
+                              aria-label={message.streamLabel ?? "正在生成回答"}
+                            >
+                              <span>{message.streamLabel ?? "正在生成回答"}</span>
+                              <i />
+                              <i />
+                              <i />
+                            </span>
+                          ) : null}
+                          {message.role === "assistant" &&
+                          message.webSources?.length ? (
+                            <WebSourcesPanel sources={message.webSources} />
+                          ) : null}
+                          {message.stopped &&
+                          message.content !== "已停止生成。" ? (
+                            <span className="message-stopped">已停止生成</span>
+                          ) : null}
+                          {message.role === "assistant" &&
+                          !message.isStreaming ? (
+                            <div className="message-answer-footer">
+                              <div className="message-answer-actions">
+                                <button
+                                  type="button"
+                                  onClick={() => void copyMessage(message)}
+                                  disabled={!message.content}
+                                  aria-label={
+                                    copiedMessageId === message.id
+                                      ? "已复制回答"
+                                      : "复制回答"
+                                  }
+                                  title={
+                                    copiedMessageId === message.id
+                                      ? "已复制"
+                                      : "复制"
+                                  }
+                                >
+                                  {copiedMessageId === message.id ? (
+                                    <span aria-hidden="true">✓</span>
+                                  ) : (
+                                    <svg
+                                      viewBox="0 0 24 24"
+                                      aria-hidden="true"
+                                    >
+                                      <rect
+                                        x="8"
+                                        y="8"
+                                        width="11"
+                                        height="11"
+                                        rx="2"
+                                      />
+                                      <path d="M16 8V6a2 2 0 0 0-2-2H6a2 2 0 0 0-2 2v8a2 2 0 0 0 2 2h2" />
+                                    </svg>
+                                  )}
+                                </button>
+                                {messages
+                                  .slice(0, messageIndex)
+                                  .some(
+                                    (candidate) =>
+                                      candidate.role === "user",
+                                  ) ? (
+                                  <button
+                                    type="button"
+                                    onClick={() => {
+                                      void resendAssistantAnswer(messageIndex);
+                                    }}
+                                    disabled={
+                                      isReplying ||
+                                      Boolean(resendingMessageId)
+                                    }
+                                    aria-label="重新发送上一条问题"
+                                    title="重发"
+                                  >
+                                    <svg
+                                      viewBox="0 0 24 24"
+                                      aria-hidden="true"
+                                    >
+                                      <path d="M4 10V5m0 0h5M4 5l4 4a7 7 0 1 1-1.2 8.8" />
+                                    </svg>
+                                  </button>
+                                ) : null}
+                              </div>
+                              <time dateTime={new Date(message.createdAt).toISOString()}>
+                                {formatAnswerTime(message.createdAt)}
+                              </time>
+                            </div>
+                          ) : null}
+                          {message.role === "user" ? (
+                            <div className="message-answer-footer">
+                              <div className="message-answer-actions">
+                                <button
+                                  type="button"
+                                  onClick={() => void copyMessage(message)}
+                                  disabled={!message.content}
+                                  aria-label={
+                                    copiedMessageId === message.id
+                                      ? "已复制消息"
+                                      : "复制消息"
+                                  }
+                                  title={
+                                    copiedMessageId === message.id
+                                      ? "已复制"
+                                      : "复制"
+                                  }
+                                >
+                                  {copiedMessageId === message.id ? (
+                                    <span aria-hidden="true">✓</span>
+                                  ) : (
+                                    <svg
+                                      viewBox="0 0 24 24"
+                                      aria-hidden="true"
+                                    >
+                                      <rect
+                                        x="8"
+                                        y="8"
+                                        width="11"
+                                        height="11"
+                                        rx="2"
+                                      />
+                                      <path d="M16 8V6a2 2 0 0 0-2-2H6a2 2 0 0 0-2 2v8a2 2 0 0 0 2 2h2" />
+                                    </svg>
+                                  )}
+                                </button>
+                              </div>
+                            </div>
+                          ) : null}
+                        </div>
                       </div>
                     </div>
                   ))}
-                  {isReplying ? (
-                    <div className="message assistant">
-                      <span className="message-avatar" aria-hidden="true">
-                        帧
-                      </span>
-                      <div>
-                        <strong>帧记 AI</strong>
-                        <span className="typing-indicator" aria-label="正在生成回答">
-                          <i />
-                          <i />
-                          <i />
-                        </span>
-                      </div>
-                    </div>
-                  ) : null}
                 </div>
               </div>
             ) : null}
@@ -3000,6 +4070,19 @@ export default function VideoWorkbench() {
                 >
                   <span aria-hidden="true">◎</span>
                   联网搜索
+                </button>
+                <button
+                  type="button"
+                  aria-pressed={fullRecallEnabled}
+                  onClick={() =>
+                    updateChatSetting("fullRecall", !fullRecallEnabled)
+                  }
+                >
+                  <svg viewBox="0 0 24 24" aria-hidden="true">
+                    <path d="M4 5.5A2.5 2.5 0 0 1 6.5 3H11v16H6.5A2.5 2.5 0 0 0 4 21.5z" />
+                    <path d="M20 5.5A2.5 2.5 0 0 0 17.5 3H13v16h4.5a2.5 2.5 0 0 1 2.5 2.5z" />
+                  </svg>
+                  完整回顾
                 </button>
               </div>
             ) : null}
@@ -3044,7 +4127,7 @@ export default function VideoWorkbench() {
                 )}
               </button>
             </form>
-            <p className="composer-caption">AI 结果可能有误，请结合原视频核对重要信息。</p>
+            <p className="composer-caption">内容由AI生成，请仔细甄别。</p>
           </div>
         </section>
       </div>

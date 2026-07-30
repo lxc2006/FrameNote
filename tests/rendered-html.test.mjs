@@ -28,6 +28,72 @@ async function request(pathname, init, bindings = {}) {
   );
 }
 
+async function readSseEvents(response) {
+  const text = await response.text();
+  return text
+    .split(/\r?\n\r?\n/)
+    .map((frame) =>
+      frame
+        .split(/\r?\n/)
+        .filter((line) => line.startsWith("data:"))
+        .map((line) => line.slice(5).trimStart())
+        .join("\n"),
+    )
+    .filter(Boolean)
+    .map((data) => JSON.parse(data));
+}
+
+async function readAskStream(response) {
+  const events = await readSseEvents(response);
+  const error = events.find((event) => event.type === "error");
+  assert.equal(error, undefined, JSON.stringify(error));
+  const done = events.findLast((event) => event.type === "done");
+  assert.ok(done, `Missing done event: ${JSON.stringify(events)}`);
+  return { events, done };
+}
+
+function writeOpenAiChatStream(
+  response,
+  { content, model, reasoningContent = "", usage },
+) {
+  response.writeHead(200, { "content-type": "text/event-stream" });
+  if (reasoningContent) {
+    response.write(`data: ${JSON.stringify({
+      id: "chatcmpl-test-stream",
+      object: "chat.completion.chunk",
+      created: 0,
+      model,
+      choices: [{
+        index: 0,
+        delta: { reasoning_content: reasoningContent },
+        finish_reason: null,
+      }],
+    })}\n\n`);
+  }
+  response.write(`data: ${JSON.stringify({
+    id: "chatcmpl-test-stream",
+    object: "chat.completion.chunk",
+    created: 0,
+    model,
+    choices: [{
+      index: 0,
+      delta: { content },
+      finish_reason: null,
+    }],
+  })}\n\n`);
+  if (usage) {
+    response.write(`data: ${JSON.stringify({
+      id: "chatcmpl-test-stream",
+      object: "chat.completion.chunk",
+      created: 0,
+      model,
+      choices: [],
+      usage,
+    })}\n\n`);
+  }
+  response.end("data: [DONE]\n\n");
+}
+
 function normalizeSql(sql) {
   return sql.replace(/\s+/g, " ").trim().toLowerCase();
 }
@@ -74,6 +140,7 @@ class FakeD1Database {
   constructor() {
     this.conversations = new Map();
     this.messages = [];
+    this.messageDetails = new Map();
     this.transcripts = new Map();
     this.schemaStatements = [];
   }
@@ -140,6 +207,17 @@ class FakeD1Database {
     }
 
     if (
+      query.startsWith(
+        "select message_id, reasoning_content, reasoning_duration_seconds, web_sources_json, usage_json, stopped from conversation_message_details where conversation_id = ?",
+      )
+    ) {
+      const [conversationId] = parameters;
+      return [...this.messageDetails.values()]
+        .filter((detail) => detail.conversation_id === conversationId)
+        .map((detail) => ({ ...detail }));
+    }
+
+    if (
       query ===
       "select transcript_json from conversation_transcripts where conversation_id = ?"
     ) {
@@ -155,6 +233,19 @@ class FakeD1Database {
       const [id, ownerId] = parameters;
       const conversation = this.conversations.get(id);
       return conversation?.owner_id === ownerId ? [{ id }] : [];
+    }
+
+    if (
+      query ===
+      "select sequence from conversation_messages where id = ? and conversation_id = ?"
+    ) {
+      const [id, conversationId] = parameters;
+      const message = this.messages.find(
+        (candidate) =>
+          candidate.id === id &&
+          candidate.conversation_id === conversationId,
+      );
+      return message ? [{ sequence: message.sequence }] : [];
     }
 
     if (
@@ -232,6 +323,64 @@ class FakeD1Database {
       return successfulD1Result();
     }
 
+    if (query.startsWith("insert into conversation_message_details")) {
+      const [
+        message_id,
+        conversation_id,
+        reasoning_content,
+        reasoning_duration_seconds,
+        web_sources_json,
+        usage_json,
+        stopped,
+      ] = parameters;
+      this.messageDetails.set(message_id, {
+        message_id,
+        conversation_id,
+        reasoning_content,
+        reasoning_duration_seconds,
+        web_sources_json,
+        usage_json,
+        stopped,
+      });
+      return successfulD1Result();
+    }
+    if (query.startsWith("delete from conversation_message_details where conversation_id in")) {
+      const [id, ownerId] = parameters;
+      const conversation = this.conversations.get(id);
+      if (conversation?.owner_id !== ownerId) return successfulD1Result(0);
+      let changes = 0;
+      for (const [messageId, detail] of this.messageDetails) {
+        if (detail.conversation_id === id) {
+          this.messageDetails.delete(messageId);
+          changes += 1;
+        }
+      }
+      return successfulD1Result(changes);
+    }
+
+    if (
+      query.startsWith(
+        "delete from conversation_message_details where conversation_id = ? and message_id in",
+      )
+    ) {
+      const [conversationId, scopedConversationId, sequence] = parameters;
+      assert.equal(conversationId, scopedConversationId);
+      const removedIds = new Set(
+        this.messages
+          .filter(
+            (message) =>
+              message.conversation_id === conversationId &&
+              message.sequence >= sequence,
+          )
+          .map((message) => message.id),
+      );
+      let changes = 0;
+      for (const messageId of removedIds) {
+        if (this.messageDetails.delete(messageId)) changes += 1;
+      }
+      return successfulD1Result(changes);
+    }
+
     if (
       query.startsWith("insert into conversation_messages") &&
       query.includes("coalesce(max(sequence), -1) + 1")
@@ -286,6 +435,20 @@ class FakeD1Database {
       const before = this.messages.length;
       this.messages = this.messages.filter(
         (message) => message.conversation_id !== id,
+      );
+      return successfulD1Result(before - this.messages.length);
+    }
+
+    if (
+      query ===
+      "delete from conversation_messages where conversation_id = ? and sequence >= ?"
+    ) {
+      const [conversationId, sequence] = parameters;
+      const before = this.messages.length;
+      this.messages = this.messages.filter(
+        (message) =>
+          message.conversation_id !== conversationId ||
+          message.sequence < sequence,
       );
       return successfulD1Result(before - this.messages.length);
     }
@@ -440,7 +603,8 @@ test("persists owner-scoped video conversations through their D1 lifecycle", asy
         messages: [
           {
             role: "assistant",
-            content: "总结已经生成，可以继续追问。",
+            content:
+              "总结已经生成，可以继续追问。\n\n参考来源：\n- [1 · 旧版来源](https://example.com/legacy)\n\n访问了 1 个网页",
           },
         ],
         activeModel: "qwen3.5-omni-plus",
@@ -462,7 +626,7 @@ test("persists owner-scoped video conversations through their D1 lifecycle", asy
   assert.equal(created.messages.length, 1);
   assert.equal(created.activeModel, "qwen3.5-omni-plus");
   assert.deepEqual(created.transcript, transcript);
-  assert.equal(new Set(database.schemaStatements).size, 5);
+  assert.equal(new Set(database.schemaStatements).size, 6);
   assert.ok(
     database.schemaStatements.every((statement) =>
       statement.includes("if not exists"),
@@ -494,6 +658,33 @@ test("persists owner-scoped video conversations through their D1 lifecycle", asy
     detail.messages.map(({ role, content }) => ({ role, content })),
     [{ role: "assistant", content: "总结已经生成，可以继续追问。" }],
   );
+  assert.deepEqual(detail.messages[0].webSources, [{
+    index: 1,
+    title: "旧版来源",
+    url: "https://example.com/legacy",
+  }]);
+
+  const replacementTranscript = {
+    status: "unavailable",
+    language: "auto",
+    text: "",
+    cues: [],
+    error: "字幕提取超过 22 分钟，暂不可用。",
+  };
+  const transcriptResponse = await request(
+    `/api/conversations/${created.id}/transcript`,
+    {
+      method: "PUT",
+      headers: ownerHeaders,
+      body: JSON.stringify({ transcript: replacementTranscript }),
+    },
+    { DB: database },
+  );
+  assert.equal(transcriptResponse.status, 200);
+  assert.deepEqual(
+    (await transcriptResponse.json()).transcript,
+    replacementTranscript,
+  );
 
   const appendResponse = await request(
     `/api/conversations/${created.id}/messages`,
@@ -503,14 +694,26 @@ test("persists owner-scoped video conversations through their D1 lifecycle", asy
       body: JSON.stringify({
         messages: [
           { role: "user", content: "音乐在中段有什么变化？" },
-          { role: "assistant", content: "中段鼓点略微增强，但整体仍然舒缓。" },
+          {
+            role: "assistant",
+            content: "中段鼓点略微增强，但整体仍然舒缓。[1](https://example.com/music)",
+            reasoningContent: "先核对音轨摘要，再组织回答。",
+            reasoningDurationSeconds: 3,
+            webSources: [{
+              index: 1,
+              title: "音乐资料",
+              url: "https://example.com/music",
+            }],
+            stopped: true,
+          },
         ],
       }),
     },
     { DB: database },
   );
   assert.equal(appendResponse.status, 201);
-  assert.equal((await appendResponse.json()).messages.length, 2);
+  const appendedMessages = (await appendResponse.json()).messages;
+  assert.equal(appendedMessages.length, 2);
 
   const detailAfterAppendResponse = await request(
     `/api/conversations/${created.id}`,
@@ -523,8 +726,41 @@ test("persists owner-scoped video conversations through their D1 lifecycle", asy
     [
       { role: "assistant", content: "总结已经生成，可以继续追问。" },
       { role: "user", content: "音乐在中段有什么变化？" },
-      { role: "assistant", content: "中段鼓点略微增强，但整体仍然舒缓。" },
+      {
+        role: "assistant",
+        content: "中段鼓点略微增强，但整体仍然舒缓。[1](https://example.com/music)",
+      },
     ],
+  );
+  const detailedMessage = detailAfterAppend.messages.at(-1);
+  assert.equal(detailedMessage.reasoningContent, "先核对音轨摘要，再组织回答。");
+  assert.equal(detailedMessage.reasoningDurationSeconds, 3);
+  assert.equal(detailedMessage.webSources[0].title, "音乐资料");
+  assert.equal(detailedMessage.stopped, true);
+
+  const truncateResponse = await request(
+    `/api/conversations/${created.id}/messages`,
+    {
+      method: "DELETE",
+      headers: ownerHeaders,
+      body: JSON.stringify({ fromMessageId: appendedMessages[0].id }),
+    },
+    { DB: database },
+  );
+  assert.equal(truncateResponse.status, 204);
+  const detailAfterTruncateResponse = await request(
+    `/api/conversations/${created.id}`,
+    { headers: { "oai-authenticated-user-email": "viewer@example.com" } },
+    { DB: database },
+  );
+  const detailAfterTruncate =
+    (await detailAfterTruncateResponse.json()).conversation;
+  assert.deepEqual(
+    detailAfterTruncate.messages.map(({ role, content }) => ({
+      role,
+      content,
+    })),
+    [{ role: "assistant", content: "总结已经生成，可以继续追问。" }],
   );
 
   const renameResponse = await request(
@@ -574,6 +810,158 @@ test("persists owner-scoped video conversations through their D1 lifecycle", asy
     { DB: database },
   );
   assert.deepEqual((await emptyListResponse.json()).conversations, []);
+});
+
+test("recalls stored transcript evidence on demand and returns a persistent video time", async (t) => {
+  const database = new FakeD1Database();
+  const ownerHeaders = {
+    "content-type": "application/json",
+    "oai-authenticated-user-email": "viewer@example.com",
+  };
+  const modelRequests = [];
+  const provider = createServer(async (req, res) => {
+    let rawBody = "";
+    for await (const chunk of req) rawBody += chunk;
+    const body = JSON.parse(rawBody);
+    modelRequests.push(body);
+    const systemPrompt = body.messages[0]?.content ?? "";
+    let content;
+    if (systemPrompt.includes("视频回顾规划器")) {
+      content = JSON.stringify({
+        targets: ["summary", "transcript"],
+        query: "列车 到站",
+        reason: "用户要求定位视频中的具体内容。",
+        timeRange: { startSeconds: 0, endSeconds: 60 },
+        fullReview: false,
+      });
+    } else if (systemPrompt.includes("视频证据重排器")) {
+      const input = JSON.parse(body.messages[1].content);
+      content = JSON.stringify({
+        selected: input.candidates
+          .filter((candidate) => candidate.source === "transcript")
+          .slice(0, 1)
+          .map((candidate) => ({ id: candidate.id, relevance: 0.99 })),
+      });
+    } else {
+      content = "视频在 00:12 提到列车即将到站。";
+    }
+    if (body.stream) {
+      writeOpenAiChatStream(res, { content, model: body.model });
+      return;
+    }
+    res.writeHead(200, { "content-type": "application/json" });
+    res.end(JSON.stringify({
+      id: "chatcmpl-recall-test",
+      object: "chat.completion",
+      created: 0,
+      model: body.model,
+      choices: [{
+        index: 0,
+        message: { role: "assistant", content },
+        finish_reason: "stop",
+      }],
+    }));
+  });
+  provider.listen(0, "127.0.0.1");
+  await once(provider, "listening");
+  t.after(() => provider.close());
+  const address = provider.address();
+  assert.ok(address && typeof address === "object");
+
+  const createResponse = await request(
+    "/api/conversations",
+    {
+      method: "POST",
+      headers: ownerHeaders,
+      body: JSON.stringify({
+        source: {
+          kind: "upload",
+          title: "站台",
+          subtitle: "station.mp4",
+          durationLabel: "01:00",
+        },
+        summary: {
+          title: "站台视频",
+          overview: "视频记录了站台广播和列车到站。",
+          keyPoints: [{
+            time: "00:12",
+            title: "到站广播",
+            detail: "广播提醒乘客注意站台安全。",
+          }],
+          chapters: [{
+            time: "00:00",
+            title: "站台等待",
+            description: "乘客在站台等待列车。",
+          }],
+        },
+        messages: [{
+          role: "assistant",
+          content: "总结生成完毕。",
+        }],
+        transcript: {
+          status: "ready",
+          language: "zh",
+          text: "请站在黄色安全线内，列车即将到站。",
+          cues: [{
+            startSeconds: 12.5,
+            endSeconds: 14.2,
+            text: "请站在黄色安全线内，列车即将到站。",
+          }],
+        },
+      }),
+    },
+    { DB: database },
+  );
+  assert.equal(createResponse.status, 201);
+  const conversation = (await createResponse.json()).conversation;
+
+  const askResponse = await request(
+    "/api/model/ask",
+    {
+      method: "POST",
+      headers: ownerHeaders,
+      body: JSON.stringify({
+        conversationId: conversation.id,
+        question: "00:13 讲了什么？",
+        reasoningMode: "flash",
+        fullRecallEnabled: true,
+      }),
+    },
+    {
+      DB: database,
+      DEEPSEEK_API_KEY: "deepseek-test-key",
+      DEEPSEEK_BASE_URL: `http://127.0.0.1:${address.port}/deepseek`,
+      DEEPSEEK_FLASH_MODEL: "deepseek-v4-flash",
+    },
+  );
+  const { done: answer, events } = await readAskStream(askResponse);
+  assert.equal(askResponse.status, 200, JSON.stringify(answer));
+  assert.ok(events.some((event) => event.type === "answer_delta"));
+  assert.equal(
+    answer.answer,
+    "视频在 [[video:12.000|00:12]] 提到列车即将到站。",
+  );
+  assert.equal(modelRequests.length, 3);
+  const planner = modelRequests.find((body) =>
+    body.messages[0]?.content?.includes("视频回顾规划器"),
+  );
+  const reranker = modelRequests.find((body) =>
+    body.messages[0]?.content?.includes("视频证据重排器"),
+  );
+  const finalAnswer = modelRequests.find((body) =>
+    body.messages[0]?.content?.includes("后续对话助手"),
+  );
+  assert.ok(planner);
+  assert.ok(reranker);
+  assert.ok(finalAnswer);
+  assert.doesNotMatch(planner.messages[1].content, /黄色安全线/);
+  assert.match(reranker.messages[1].content, /黄色安全线/);
+  assert.match(
+    finalAnswer.messages.find((message) =>
+      message.content?.includes?.("【按需回顾证据"),
+    ).content,
+    /\[字幕 00:12 ~ 00:14\]/,
+  );
 });
 
 test("persists new summaries without a legacy takeaway", async () => {
@@ -838,6 +1226,50 @@ test("uses Qwen for analysis and selects the requested DeepSeek follow-up model"
       providerRequest.body.model === "deepseek-v4-pro" ||
       providerRequest.body.model === "deepseek-v4-flash"
     ) {
+      const systemPrompt = providerRequest.body.messages[0]?.content ?? "";
+      const plannerInput = providerRequest.body.messages[1]?.content ?? "";
+      let content = "结论：模型调用链路可用。";
+      if (systemPrompt.includes("视频回顾规划器")) {
+        const plannerContext = JSON.parse(plannerInput);
+        content = plannerContext.userQuestion.includes("00:08")
+          ? JSON.stringify({
+              targets: ["transcript"],
+              query: "完成调用验证",
+              reason: "用户询问明确视频时间。",
+              timeRange: { startSeconds: 0, endSeconds: 53 },
+              fullReview: false,
+            })
+          : JSON.stringify({
+              targets: [],
+              query: plannerContext.userQuestion,
+              reason: "精简视频记忆足以回答。",
+              timeRange: null,
+              fullReview: false,
+            });
+      } else if (systemPrompt.includes("视频证据重排器")) {
+        const rerankContext = JSON.parse(plannerInput);
+        const selected = rerankContext.candidates
+          .filter((candidate) => candidate.source === "transcript")
+          .slice(0, 1)
+          .map((candidate) => ({ id: candidate.id, relevance: 0.98 }));
+        content = JSON.stringify({ selected });
+      } else if (
+        providerRequest.body.messages.slice(1).some((message) =>
+          message.content?.includes?.("【按需回顾证据"),
+        )
+      ) {
+        content = "调用验证发生在 00:08。";
+      }
+      if (providerRequest.body.stream) {
+        writeOpenAiChatStream(res, {
+          content,
+          model: providerRequest.body.model,
+          ...(providerRequest.body.model === "deepseek-v4-pro"
+            ? { reasoningContent: "先核对视频记忆，再形成结论。" }
+            : {}),
+        });
+        return;
+      }
       res.writeHead(200, { "content-type": "application/json" });
       res.end(JSON.stringify({
         id: "chatcmpl-deepseek-test",
@@ -848,7 +1280,7 @@ test("uses Qwen for analysis and selects the requested DeepSeek follow-up model"
           index: 0,
           message: {
             role: "assistant",
-            content: "结论：模型调用链路可用。依据见 00:01。",
+            content,
           },
           finish_reason: "stop",
         }],
@@ -1092,26 +1524,70 @@ test("uses Qwen for analysis and selects the requested DeepSeek follow-up model"
     },
   );
   assert.equal(askResponse.status, 200);
-  const askPayload = await askResponse.json();
+  const { done: askPayload, events: askEvents } =
+    await readAskStream(askResponse);
   assert.equal(askPayload.provider, "deepseek");
   assert.equal(askPayload.model, "deepseek-v4-pro");
-  assert.equal(askPayload.answer, "结论：模型调用链路可用。依据见 00:01。");
-  const askProviderRequest = providerRequests[askProviderRequestIndex];
+  assert.equal(askPayload.answer, "结论：模型调用链路可用。");
+  assert.equal(askPayload.reasoningContent, "先核对视频记忆，再形成结论。");
+  assert.ok(askEvents.some((event) => event.type === "reasoning_delta"));
+  const askProviderRequest = providerRequests
+    .slice(askProviderRequestIndex)
+    .find((request) =>
+      request.body.messages[0]?.content?.includes("后续对话助手"),
+    );
+  assert.ok(askProviderRequest);
   assert.equal(askProviderRequest.authorization, "Bearer deepseek-test-key");
   assert.equal(askProviderRequest.url, "/deepseek/chat/completions");
-  assert.equal(askProviderRequest.body.stream, false);
+  assert.equal(askProviderRequest.body.stream, true);
+  assert.deepEqual(askProviderRequest.body.thinking, { type: "enabled" });
   const askPrompt = askProviderRequest.body.messages.at(-1).content;
   const askBaseContext = askProviderRequest.body.messages[1].content;
   const askSystemPrompt = askProviderRequest.body.messages[0].content;
   assert.match(askPrompt, /结论是什么/);
-  assert.match(askBaseContext, /audioAnalysis/);
+  assert.match(askBaseContext, /audioOverview/);
   assert.match(askBaseContext, /低保真爵士乐/);
-  assert.match(askBaseContext, /\[00:08\] 随后完成调用验证/);
-  assert.match(askBaseContext, /视频信息|结构化总结|带时间点字幕/);
-  assert.match(askSystemPrompt, /不是每个回答的边界/);
-  assert.match(askSystemPrompt, /不可遗忘的基础上下文/);
+  assert.doesNotMatch(askBaseContext, /\[00:08\] 随后完成调用验证/);
+  assert.match(askBaseContext, /精简视频记忆|overview|keyPoints/);
+  assert.match(askSystemPrompt, /不可遗忘但精简/);
+  assert.match(askSystemPrompt, /按需回顾证据/);
   assert.match(askSystemPrompt, /视频之外/);
   assert.match(askSystemPrompt, /系统提示词|API Key|隐私/);
+
+  const timedAskResponse = await request(
+    "/api/model/ask",
+    {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        question: "00:08 讲了什么？",
+        source: {
+          kind: "upload",
+          title: "测试视频",
+          subtitle: "test.mp4",
+        },
+        summary,
+        context: {
+          transcript:
+            "[00:00] 视频介绍模型接口。\n[00:08] 随后完成调用验证。",
+        },
+        history: [{ role: "user", content: "它讲了什么？" }],
+        reasoningMode: "pro",
+        fullRecallEnabled: true,
+      }),
+    },
+    {
+      DEEPSEEK_API_KEY: "deepseek-test-key",
+      DEEPSEEK_BASE_URL: `http://127.0.0.1:${address.port}/deepseek`,
+      DEEPSEEK_CHAT_MODEL: "deepseek-v4-pro",
+    },
+  );
+  assert.equal(timedAskResponse.status, 200);
+  const { done: timedAskPayload } = await readAskStream(timedAskResponse);
+  assert.equal(
+    timedAskPayload.answer,
+    "调用验证发生在 [[video:8.000|00:08]]。",
+  );
 
   const legacyAskResponse = await request(
     "/api/model/ask",
@@ -1136,6 +1612,7 @@ test("uses Qwen for analysis and selects the requested DeepSeek follow-up model"
     },
   );
   assert.equal(legacyAskResponse.status, 200);
+  await readAskStream(legacyAskResponse);
 
   const flashAskResponse = await request(
     "/api/model/ask",
@@ -1162,12 +1639,31 @@ test("uses Qwen for analysis and selects the requested DeepSeek follow-up model"
     },
   );
   assert.equal(flashAskResponse.status, 200);
-  assert.equal((await flashAskResponse.json()).model, "deepseek-v4-flash");
+  const { done: flashAskPayload, events: flashEvents } =
+    await readAskStream(flashAskResponse);
+  assert.equal(flashAskPayload.model, "deepseek-v4-flash");
+  assert.equal(flashAskPayload.reasoningContent, undefined);
+  assert.equal(
+    flashEvents.some((event) => event.type === "reasoning_delta"),
+    false,
+  );
+  const flashProviderRequest = providerRequests.findLast((request) =>
+    request.body.messages?.[0]?.content?.includes("后续对话助手"),
+  );
+  assert.deepEqual(flashProviderRequest.body.thinking, { type: "disabled" });
 });
 
 test("plans a search, reads four pages and returns persistent citations", async (t) => {
   const modelRequests = [];
   const extractedUrls = [];
+  const providerUsage = {
+    prompt_tokens: 100,
+    completion_tokens: 20,
+    total_tokens: 120,
+    prompt_cache_hit_tokens: 40,
+    prompt_cache_miss_tokens: 60,
+    completion_tokens_details: { reasoning_tokens: 0 },
+  };
   const upstream = createServer(async (req, res) => {
     let rawBody = "";
     for await (const chunk of req) rawBody += chunk;
@@ -1210,16 +1706,32 @@ test("plans a search, reads four pages and returns persistent citations", async 
     if (req.url === "/deepseek/chat/completions") {
       const body = JSON.parse(rawBody);
       modelRequests.push(body);
-      const isPlanner = body.messages[0]?.content?.includes("联网检索规划器");
-      const content = isPlanner
+      const systemPrompt = body.messages[0]?.content ?? "";
+      const content = systemPrompt.includes("视频回顾规划器")
         ? JSON.stringify({
+            targets: [],
+            query: "测试作品 最新版本",
+            reason: "精简视频记忆已经足够规划联网检索。",
+            timeRange: null,
+            fullReview: false,
+          })
+        : systemPrompt.includes("联网检索规划器")
+          ? JSON.stringify({
             decision: "search",
             query: "测试作品 官方资料 最新版本",
             reason: "用户要求核实当前资料。",
             searchLanguage: "zh-CN",
             countryCode: "CN",
           })
-        : "官方资料显示当前版本已经更新。[1] 第二个独立来源给出了相同结论。[2]";
+          : "官方资料显示当前版本已经更新。[1] 第二个独立来源给出了相同结论。[2]";
+      if (body.stream) {
+        writeOpenAiChatStream(res, {
+          content,
+          model: body.model,
+          usage: providerUsage,
+        });
+        return;
+      }
       res.writeHead(200, { "content-type": "application/json" });
       res.end(JSON.stringify({
         id: "chatcmpl-web-search-test",
@@ -1231,6 +1743,7 @@ test("plans a search, reads four pages and returns persistent citations", async 
           message: { role: "assistant", content },
           finish_reason: "stop",
         }],
+        usage: providerUsage,
       }));
       return;
     }
@@ -1280,6 +1793,7 @@ test("plans a search, reads four pages and returns persistent citations", async 
         },
         history: [{ role: "user", content: "刚才说的是哪个作品？" }],
         webSearchEnabled: true,
+        fullRecallEnabled: true,
         reasoningMode: "flash",
         searchContext: {
           locale: "zh-CN",
@@ -1299,19 +1813,48 @@ test("plans a search, reads four pages and returns persistent citations", async 
     },
   );
 
-  const payload = await response.json();
+  const { done: payload, events } = await readAskStream(response);
   assert.equal(response.status, 200, JSON.stringify(payload));
   assert.equal(payload.webSearchUsed, true);
   assert.equal(payload.visitedPageCount, 4);
+  assert.equal(payload.usage.totalTokens, 360);
+  assert.equal(payload.usage.searchCount, 1);
+  assert.equal(payload.usage.calls.length, 3);
+  assert.deepEqual(
+    payload.usage.calls.map((call) => call.operation),
+    ["recall_plan", "web_search_plan", "chat_answer"],
+  );
   assert.match(payload.answer, /\[1\]\(https:\/\/source1\.example\/article\)/);
-  assert.match(payload.answer, /参考来源/);
-  assert.match(payload.answer, /访问了 4 个网页/);
+  assert.doesNotMatch(payload.answer, /参考来源|访问了 4 个网页/);
+  assert.deepEqual(
+    payload.webSources.map(({ index, title }) => ({ index, title })),
+    [1, 2, 3, 4].map((index) => ({
+      index,
+      title: `正文来源 ${index}`,
+    })),
+  );
+  assert.ok(events.some((event) => event.type === "answer_delta"));
   assert.equal(extractedUrls.length, 4);
-  assert.equal(modelRequests.length, 2);
-  assert.match(modelRequests[0].messages[1].content, /测试作品/);
-  assert.match(modelRequests[0].messages[1].content, /作者提到作品最近可能更新/);
+  assert.equal(modelRequests.length, 3);
+  const recallPlannerRequest = modelRequests.find((item) =>
+    item.messages[0]?.content?.includes("视频回顾规划器"),
+  );
+  const searchPlannerRequest = modelRequests.find((item) =>
+    item.messages[0]?.content?.includes("联网检索规划器"),
+  );
+  const finalAnswerRequest = modelRequests.find((item) =>
+    item.messages[0]?.content?.includes("后续对话助手"),
+  );
+  assert.ok(recallPlannerRequest);
+  assert.ok(searchPlannerRequest);
+  assert.ok(finalAnswerRequest);
+  assert.match(searchPlannerRequest.messages[1].content, /测试作品/);
+  assert.doesNotMatch(
+    searchPlannerRequest.messages[1].content,
+    /作者提到作品最近可能更新/,
+  );
   assert.match(
-    modelRequests[1].messages.find((message) =>
+    finalAnswerRequest.messages.find((message) =>
       message.content?.includes?.("联网搜索资料"),
     ).content,
     /passages/,
@@ -1326,6 +1869,7 @@ test("removes disposable starter assets and keeps model choice decoupled", async
     engine,
     qwenEngine,
     deepseekEngine,
+    videoRecall,
     workbench,
     bilibiliClient,
     conversationClient,
@@ -1342,6 +1886,7 @@ test("removes disposable starter assets and keeps model choice decoupled", async
     readFile(new URL("../lib/video-engine.ts", import.meta.url), "utf8"),
     readFile(new URL("../lib/server/qwen-video-engine.ts", import.meta.url), "utf8"),
     readFile(new URL("../lib/server/deepseek-conversation-engine.ts", import.meta.url), "utf8"),
+    readFile(new URL("../lib/server/video-recall.ts", import.meta.url), "utf8"),
     readFile(new URL("../app/VideoWorkbench.tsx", import.meta.url), "utf8"),
     readFile(new URL("../lib/client/bilibili-client.ts", import.meta.url), "utf8"),
     readFile(new URL("../lib/client/conversation-client.ts", import.meta.url), "utf8"),
@@ -1360,6 +1905,8 @@ test("removes disposable starter assets and keeps model choice decoupled", async
   assert.match(layout, /document\.documentElement\.dataset\.theme/);
   assert.doesNotMatch(layout, /Starter Project|codex-preview/);
   assert.doesNotMatch(packageJson, /tailwindcss/);
+  assert.match(packageJson, /"react-markdown"/);
+  assert.match(packageJson, /"remark-gfm"/);
   assert.match(engine, /interface VideoEngine/);
   assert.doesNotMatch(engine, /demoVideoEngine|mode:\s*"demo"/);
   assert.match(workbench, /analyzeVideo/);
@@ -1376,9 +1923,16 @@ test("removes disposable starter assets and keeps model choice decoupled", async
   assert.match(workbench, /timelineItems\.length/);
   assert.doesNotMatch(workbench, /声音与音乐|一句话结论|章节时间线|takeaway-block|audio-analysis|key-point-list/);
   assert.doesNotMatch(qwenEngine, /QA_SYSTEM_PROMPT|async ask\(/);
-  assert.match(qwenEngine, /keyPoints: 4 至 12 个按时间排序的 \{time, title, detail\}/);
-  assert.match(deepseekEngine, /不是每个回答的边界/);
+  assert.match(qwenEngine, /keyPoints: 最多 24 个按时间排序的 \{time, title, detail\}/);
+  assert.match(deepseekEngine, /不可遗忘但精简/);
+  assert.match(deepseekEngine, /字幕可能出现错字、漏字或不合理断句/);
+  assert.match(deepseekEngine, /仍然尽力回答/);
   assert.match(deepseekEngine, /系统提示词、开发者消息、API Key/);
+  assert.match(videoRecall, /视频回顾规划器/);
+  assert.match(videoRecall, /recallByKeywords/);
+  assert.match(videoRecall, /rerankCandidates/);
+  assert.match(videoRecall, /applyVideoTimeReferences/);
+  assert.doesNotMatch(videoRecall, /normalizeOutlinePlan|summaryOutlineCandidates/);
   assert.doesNotMatch(
     workbench,
     /engine-badge|VIDEO INTELLIGENCE|intro-block|setup-title|architecture-note|getModelStatus|ModelStatusResponse/,
@@ -1430,7 +1984,10 @@ test("removes disposable starter assets and keeps model choice decoupled", async
     /async function handleSelectConversation[\s\S]+stopReply\(\);/,
   );
   assert.match(workbench, /aria-label=\{isReplying \? "停止生成" : "发送问题"\}/);
-  assert.match(workbench, /transcriptForConversationContext/);
+  assert.doesNotMatch(workbench, /transcriptForConversationContext/);
+  assert.match(workbench, /conversationId:\s*activeConversationId/);
+  assert.match(workbench, /message-video-time/);
+  assert.match(workbench, /跳转到视频/);
   assert.doesNotMatch(workbench, /可以继续输入；停止当前回答后即可发送/);
   assert.match(workbench, /480p 等价分析素材/);
   assert.doesNotMatch(workbench, /不设网页文件大小上限/);
@@ -1448,6 +2005,13 @@ test("removes disposable starter assets and keeps model choice decoupled", async
   assert.match(workbench, /isRestoredLocalConversation/);
   assert.match(workbench, /videoPreview\.kind === "local"[\s\S]+更改/);
   assert.match(workbench, /字幕提取/);
+  assert.match(workbench, /提取字幕/);
+  assert.match(workbench, /TRANSCRIPT_TIMEOUT_MESSAGE/);
+  assert.match(workbench, /saveConversationTranscript/);
+  assert.match(workbench, /ReactMarkdown/);
+  assert.match(workbench, /remarkGfm/);
+  assert.match(workbench, /prepareMarkdownContent/);
+  assert.doesNotMatch(workbench, /parseMarkdownBlocks|renderTextMarkdown|renderInlineMarkdown/);
   assert.match(workbench, /FunASR Nano＋CT-Punc/);
   assert.match(workbench, /transcriptExtractionEnabled/);
   assert.match(workbench, /语言选择/);
@@ -1488,7 +2052,7 @@ test("removes disposable starter assets and keeps model choice decoupled", async
     /setSummary\(null\)|setMessages\(\[\]\)|setActiveConversationId\(null\)|setPhase\("error"\)/,
   );
   assert.match(workbench, /MarkdownMessage/);
-  assert.match(workbench, /\? `\[\$\{link\[1\]\}\]` : link\[1\]/);
+  assert.match(workbench, /\/\^\\d\{1,2\}\$\/\.test\(label\) \? `\[\$\{label\}\]` : children/);
   assert.match(workbench, /timeline-seek/);
   assert.match(workbench, /seekToTimeline/);
   assert.doesNotMatch(workbench, /summary-mode|>结构化</);
@@ -1563,7 +2127,31 @@ test("removes disposable starter assets and keeps model choice decoupled", async
     styles,
     /\.video-preview-meta\s*\{[^}]*var\(--ui-font-size\)/s,
   );
-  assert.match(styles, /html\[data-theme="dark"\] \.message\.assistant \.message-avatar/);
+  assert.doesNotMatch(workbench, /message-avatar|帧记 AI/);
+  assert.doesNotMatch(styles, /\.message-avatar/);
+  assert.equal(workbench.includes("is-actions-visible"), true);
+  assert.equal(workbench.includes("onPointerEnter"), true);
+  assert.equal(
+    styles.includes(".message.is-actions-visible .message-answer-footer"),
+    true,
+  );
+  assert.match(styles, /\.message\.assistant > \.message-body/);
+  assert.equal(styles.includes("gap: 34px;"), true);
+  assert.equal(styles.includes("width: min(80%, 1100px);"), true);
+  assert.equal(
+    styles.includes(
+      'html[data-theme="dark"] .message-answer-card > .stream-status',
+    ),
+    true,
+  );
+  assert.match(
+    styles,
+    /\.message-video-time\s*\{[^}]*background:\s*#ffffff;[^}]*color:\s*#1684d8;/s,
+  );
+  assert.match(
+    styles,
+    /html\[data-theme="dark"\] \.message-video-time\s*\{[^}]*background:\s*#2a2a2d;[^}]*color:\s*#6cc1fb;/s,
+  );
   assert.doesNotMatch(workbench, /new-task-button|新建任务/);
   assert.doesNotMatch(workbench, /download-option|switch-wrap|下载公开视频，再进行总结/);
   assert.match(styles, /\.conversation-library\s*\{[^}]*display:\s*flex/s);

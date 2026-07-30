@@ -4,12 +4,24 @@ import type {
   VideoSourceDescriptor,
   VideoSummary,
 } from "./video-engine";
+import type { ConversationUsageRecord } from "./model-usage";
 
 export interface ConversationMessage {
   id: string;
   role: "assistant" | "user";
   content: string;
   createdAt: number;
+  reasoningContent?: string;
+  reasoningDurationSeconds?: number;
+  webSources?: ConversationWebSource[];
+  stopped?: boolean;
+  usage?: ConversationUsageRecord;
+}
+
+export interface ConversationWebSource {
+  index: number;
+  title: string;
+  url: string;
 }
 
 export interface ConversationListItem {
@@ -31,7 +43,18 @@ export interface ConversationDetail extends ConversationListItem {
 export interface CreateConversationInput {
   source: VideoSourceDescriptor;
   summary: VideoSummary;
-  messages: Array<Pick<ConversationMessage, "role" | "content">>;
+  messages: ConversationMessageInput[];
   activeModel?: string | null;
   transcript?: VideoTranscript;
 }
+
+export type ConversationMessageInput = Pick<
+  ConversationMessage,
+  | "role"
+  | "content"
+  | "reasoningContent"
+  | "reasoningDurationSeconds"
+  | "webSources"
+  | "stopped"
+  | "usage"
+>;

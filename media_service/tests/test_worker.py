@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 import subprocess
 import tempfile
 import unittest
@@ -11,9 +12,11 @@ from yt_dlp import YoutubeDL
 
 from media_service.worker import (
     DOWNLOAD_FRAGMENT_CONCURRENCY,
+    DOWNLOAD_RETRIES,
     WorkerFailure,
     browser_compatible_format,
     classify_download_error,
+    download_network_options,
     estimate_download_bytes,
     load_analysis_builder,
     probe_source_media,
@@ -54,6 +57,19 @@ class WorkerValidationTests(unittest.TestCase):
 
     def test_downloads_four_fragments_concurrently(self) -> None:
         self.assertEqual(DOWNLOAD_FRAGMENT_CONCURRENCY, 4)
+
+    def test_download_network_retries_and_supports_explicit_proxy(self) -> None:
+        with patch.dict(
+            os.environ,
+            {"FRAMENOTE_MEDIA_PROXY": "http://127.0.0.1:7890"},
+        ):
+            options = download_network_options()
+
+        self.assertEqual(options["proxy"], "http://127.0.0.1:7890")
+        self.assertEqual(options["retries"], DOWNLOAD_RETRIES)
+        self.assertEqual(options["fragment_retries"], DOWNLOAD_RETRIES)
+        self.assertEqual(options["retry_sleep_functions"]["http"](1), 1.0)
+        self.assertEqual(options["retry_sleep_functions"]["http"](10), 10.0)
 
     def test_analysis_pipeline_loads_from_the_isolated_worker(self) -> None:
         self.assertTrue(callable(load_analysis_builder()))

@@ -1,4 +1,8 @@
 import OpenAI from "openai";
+import {
+  normalizeModelCallUsage,
+  type ModelUsageSink,
+} from "../model-usage";
 import { getDeepSeekConfig, type DeepSeekConfig } from "./deepseek-config";
 import type {
   WebSearchPlan,
@@ -31,6 +35,7 @@ export async function planWebSearch(
   context: WebSearchPlanningContext,
   signal?: AbortSignal,
   config: DeepSeekConfig = getDeepSeekConfig(),
+  onUsage?: ModelUsageSink,
 ): Promise<WebSearchPlan> {
   if (!config.apiKey) {
     return {
@@ -62,6 +67,13 @@ ${JSON.stringify(plannerContext(context))}`,
     },
     { signal },
   );
+  const usage = normalizeModelCallUsage(completion.usage, {
+    provider: "deepseek",
+    model: config.flashModel,
+    operation: "web_search_plan",
+    deepSeekTier: "flash",
+  });
+  if (usage) onUsage?.(usage);
   const content = completion.choices[0]?.message.content?.trim();
   if (!content) {
     return { decision: "skip", reason: "搜索规划模型返回了空结果。" };
@@ -90,8 +102,7 @@ function plannerContext(context: WebSearchPlanningContext) {
       description: context.source.description?.slice(0, 8_000) ?? null,
     },
     summary: context.summary,
-    relevantTranscript: selectTranscriptContext(context),
-    recentConversation: (context.history ?? []).slice(-10).map((message) => ({
+    recentConversation: (context.history ?? []).slice(-8).map((message) => ({
       role: message.role,
       content: message.content.slice(0, 2_000),
     })),

@@ -43,6 +43,23 @@ export const conversationMessages = sqliteTable(
   ],
 );
 
+export const conversationMessageDetails = sqliteTable(
+  "conversation_message_details",
+  {
+    messageId: text("message_id")
+      .primaryKey()
+      .references(() => conversationMessages.id, { onDelete: "cascade" }),
+    conversationId: text("conversation_id")
+      .notNull()
+      .references(() => conversations.id, { onDelete: "cascade" }),
+    reasoningContent: text("reasoning_content"),
+    reasoningDurationSeconds: integer("reasoning_duration_seconds"),
+    webSourcesJson: text("web_sources_json"),
+    usageJson: text("usage_json"),
+    stopped: integer("stopped", { mode: "boolean" }).notNull().default(false),
+  },
+);
+
 export const conversationTranscripts = sqliteTable(
   "conversation_transcripts",
   {
