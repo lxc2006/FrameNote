@@ -14,10 +14,7 @@ import type {
   VideoSourceDescriptor,
   VideoSummary,
 } from "../video-engine";
-import {
-  normalizeModelCallUsage,
-  type ModelCallUsage,
-} from "../model-usage";
+import { normalizeModelCallUsage, type ModelCallUsage } from "../model-usage";
 import { getQwenConfig, type QwenConfig } from "./qwen-config";
 
 const SUMMARY_SYSTEM_PROMPT = `你是“帧记”的视频分析引擎。请只依据用户提供的视频、画面、音频和转写文本总结，不得用常识补写素材中没有出现的事实。
@@ -25,7 +22,7 @@ const SUMMARY_SYSTEM_PROMPT = `你是“帧记”的视频分析引擎。请只�
 必须分别检查视觉与声音，不能只描述画面。只要提供了独立音轨或含内嵌音轨的视频，就必须实际听取并分析可辨的讲话、字幕、音乐和环境声。声音信息应融入内容概览和时间线：讲话/字幕用于还原观点和事实，音乐/环境声只在影响理解、节奏、段落变化或用户判断时提及。不要单独写“营造氛围、表达情绪、增强叙事性”这类空泛审美分析；纯音乐/氛围音乐只记录可听见的节奏、速度、音色、乐器特征、是否有人声以及可靠的时间变化。流派或乐器不确定时使用“具有……特征”等保守表述，不得猜测具体曲名、艺人或来源。不得依据标题、画面或场景臆测声音。
 用简体中文输出一个 JSON 对象，不要输出 Markdown 代码块或 JSON 之外的文字。JSON 必须包含：
 - title: 简洁标题
-- overview: 较为详细的内容概览，面向用户解释“这个视频讲了什么/发生了什么/值得注意什么”。如果视频包含多个观点、步骤、事件或转折，必须在概览中有条理地覆盖，不要只写一个笼统主题。
+- overview: 详细但不冗余地叙述视频内容与总结，可分段，面向用户解释“这个视频讲了什么、发生了什么、值得注意什么、表达了什么”等等。如果视频包含多个观点、步骤、事件或转折，必须在概览中有条理地覆盖，不要只写一个笼统主题。
 - keyPoints: 最多 24 个按时间排序的 {time, title, detail}。这是主要时间线，数量必须根据视频时长和真实内容变化自适应，24 只是硬上限而不是目标；不得为了凑数量，每个时间点details需要有内容，有意义。只有主题、事件、观点、步骤、场景或声音出现有意义变化时才新增时间点，相邻且内容相近的片段必须合并。时间线必须从开头的重要内容覆盖到结尾的最后一个重要内容，不能只密集描述前半段。time 使用 HH:MM:SS 或 MM:SS；detail 要把该时间段的画面、讲话/字幕、音乐或环境声中真正影响理解的信息合并说明。
 - chapters: 2 至 8 个按时间排序的粗章节 {time, title, description}，用于兼容旧结构；description 可以比 keyPoints 更概括。
 - audioAnalysis: {status, summary, music, soundscape, temporalChanges, uncertainty?}
@@ -323,32 +320,37 @@ function normalizeSummaryTimestamps(
       : formatTimestamp(frameTimes[frameIndex]);
   };
 
-  return clampSummaryTimestamps({
-    ...summary,
-    keyPoints: summary.keyPoints.map((item) => ({
-      ...item,
-      ...(item.time ? { time: remap(item.time) } : {}),
-    })),
-    chapters: summary.chapters.map((item) => ({
-      ...item,
-      time: remap(item.time) ?? item.time,
-    })),
-    evidence: summary.evidence?.map((item) => ({
-      ...item,
-      time: remap(item.time) ?? item.time,
-    })),
-    ...(summary.audioAnalysis
-      ? {
-          audioAnalysis: {
-            ...summary.audioAnalysis,
-            temporalChanges: summary.audioAnalysis.temporalChanges.map((item) => ({
-              ...item,
-              time: remap(item.time) ?? item.time,
-            })),
-          },
-        }
-      : {}),
-  }, context.durationSeconds);
+  return clampSummaryTimestamps(
+    {
+      ...summary,
+      keyPoints: summary.keyPoints.map((item) => ({
+        ...item,
+        ...(item.time ? { time: remap(item.time) } : {}),
+      })),
+      chapters: summary.chapters.map((item) => ({
+        ...item,
+        time: remap(item.time) ?? item.time,
+      })),
+      evidence: summary.evidence?.map((item) => ({
+        ...item,
+        time: remap(item.time) ?? item.time,
+      })),
+      ...(summary.audioAnalysis
+        ? {
+            audioAnalysis: {
+              ...summary.audioAnalysis,
+              temporalChanges: summary.audioAnalysis.temporalChanges.map(
+                (item) => ({
+                  ...item,
+                  time: remap(item.time) ?? item.time,
+                }),
+              ),
+            },
+          }
+        : {}),
+    },
+    context.durationSeconds,
+  );
 }
 
 function clampSummaryTimestamps(
@@ -380,10 +382,12 @@ function clampSummaryTimestamps(
       ? {
           audioAnalysis: {
             ...summary.audioAnalysis,
-            temporalChanges: summary.audioAnalysis.temporalChanges.map((item) => ({
-              ...item,
-              time: clampTime(item.time),
-            })),
+            temporalChanges: summary.audioAnalysis.temporalChanges.map(
+              (item) => ({
+                ...item,
+                time: clampTime(item.time),
+              }),
+            ),
           },
         }
       : {}),
@@ -417,13 +421,14 @@ function formatPreciseTimestamp(value: number) {
   const minutes = Math.floor((milliseconds % 3_600_000) / 60_000);
   const seconds = Math.floor((milliseconds % 60_000) / 1_000);
   const remainder = milliseconds % 1_000;
-  const main = hours > 0
-    ? [hours, minutes, seconds]
-        .map((part) => String(part).padStart(2, "0"))
-        .join(":")
-    : [minutes, seconds]
-        .map((part) => String(part).padStart(2, "0"))
-        .join(":");
+  const main =
+    hours > 0
+      ? [hours, minutes, seconds]
+          .map((part) => String(part).padStart(2, "0"))
+          .join(":")
+      : [minutes, seconds]
+          .map((part) => String(part).padStart(2, "0"))
+          .join(":");
   return `${main}.${String(remainder).padStart(3, "0")}`;
 }
 
@@ -433,8 +438,12 @@ function formatTimestamp(value: number) {
   const minutes = Math.floor((seconds % 3_600) / 60);
   const remainder = seconds % 60;
   return hours > 0
-    ? [hours, minutes, remainder].map((part) => String(part).padStart(2, "0")).join(":")
-    : [minutes, remainder].map((part) => String(part).padStart(2, "0")).join(":");
+    ? [hours, minutes, remainder]
+        .map((part) => String(part).padStart(2, "0"))
+        .join(":")
+    : [minutes, remainder]
+        .map((part) => String(part).padStart(2, "0"))
+        .join(":");
 }
 
 export function parseVideoSummary(
@@ -499,9 +508,7 @@ export function parseVideoSummary(
 function limitTimelinePoints<T>(items: T[], maximum: number) {
   if (items.length <= maximum) return items;
   return Array.from({ length: maximum }, (_, index) => {
-    const position = Math.round(
-      (index * (items.length - 1)) / (maximum - 1),
-    );
+    const position = Math.round((index * (items.length - 1)) / (maximum - 1));
     return items[position];
   });
 }
@@ -531,10 +538,7 @@ function parseAudioAnalysis(value: unknown): SummaryAudioAnalysis {
   const result: SummaryAudioAnalysis = {
     status,
     summary: requiredString(object.summary, "audioAnalysis.summary"),
-    music: normalizeAudioDescription(
-      object.music,
-      "audioAnalysis.music",
-    ),
+    music: normalizeAudioDescription(object.music, "audioAnalysis.music"),
     soundscape: normalizeAudioDescription(
       object.soundscape,
       "audioAnalysis.soundscape",

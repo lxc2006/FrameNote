@@ -1,8 +1,5 @@
 import OpenAI from "openai";
-import {
-  normalizeModelCallUsage,
-  type ModelUsageSink,
-} from "../model-usage";
+import { normalizeModelCallUsage, type ModelUsageSink } from "../model-usage";
 import type {
   VideoConversationMessage,
   VideoSourceDescriptor,
@@ -97,7 +94,8 @@ const TRANSCRIPT_CHUNK_SECONDS = 45;
 const TRANSCRIPT_CHUNK_CHARACTERS = 700;
 
 const RECALL_PLANNER_PROMPT = `你是“帧记”的视频回顾规划器，只判断当前问题是否需要读取冷存档，不回答用户问题。
-系统每轮已经固定提供：视频标题、来源、时长、最多 2000 字简介、完整内容概览、按时间均匀取样的 8 条时间线，以及最近 10 条对话。只有这些信息不足时才回顾冷存档。
+系统每轮已经固定提供：视频标题、来源、时长、最多 2000 字简介、完整内容概览、按时间均匀取样的 8 条时间线，以及最近 10 条对话。
+当这些信息不足以回答用户现在的问题时，则需要回顾冷存档。
 
 必须返回一个 JSON 对象：
 {"targets":["summary"|"transcript"|"history"],"query":"检索词","reason":"简短原因","timeRange":{"startSeconds":0,"endSeconds":60}|null,"fullReview":false}
@@ -151,9 +149,7 @@ export function buildVideoMemory(
   };
 }
 
-export function compactSummaryForPlanning(
-  summary: VideoSummary,
-): VideoSummary {
+export function compactSummaryForPlanning(summary: VideoSummary): VideoSummary {
   const keyPoints = memoryTimeline(summary);
   return {
     title: summary.title,
@@ -192,11 +188,7 @@ export async function prepareVideoRecall(
   if (!plan.targets.length) return { plan, items: [] };
 
   const allCandidates = buildCandidates(context);
-  const candidates = recallByKeywords(
-    allCandidates,
-    plan,
-    context.question,
-  );
+  const candidates = recallByKeywords(allCandidates, plan, context.question);
   if (!candidates.length) return { plan, items: [] };
 
   const selected = await rerankCandidates(
@@ -365,10 +357,10 @@ function normalizePlan(
     : [];
   const query =
     typeof value.query === "string" && value.query.trim()
-      ? value.query.replace(/\s+/g, " ").trim().slice(
-          0,
-          MAX_PLANNER_QUERY_CHARACTERS,
-        )
+      ? value.query
+          .replace(/\s+/g, " ")
+          .trim()
+          .slice(0, MAX_PLANNER_QUERY_CHARACTERS)
       : question.trim().slice(0, MAX_PLANNER_QUERY_CHARACTERS);
   const reason =
     typeof value.reason === "string" && value.reason.trim()
@@ -555,8 +547,7 @@ function transcriptCandidates(
   for (const cue of cues) {
     const beginsNewGroup =
       current.length > 0 &&
-      (cue.startSeconds - current[0].startSeconds >=
-        TRANSCRIPT_CHUNK_SECONDS ||
+      (cue.startSeconds - current[0].startSeconds >= TRANSCRIPT_CHUNK_SECONDS ||
         currentCharacters + cue.text.length > TRANSCRIPT_CHUNK_CHARACTERS);
     if (beginsNewGroup) {
       groups.push(current);
@@ -575,10 +566,7 @@ function transcriptCandidates(
     key: `transcript-${index}`,
     source: "transcript",
     text: group
-      .map(
-        (cue) =>
-          `[${formatTimestamp(cue.startSeconds)}] ${cue.text.trim()}`,
-      )
+      .map((cue) => `[${formatTimestamp(cue.startSeconds)}] ${cue.text.trim()}`)
       .filter(Boolean)
       .join("\n"),
     order: index,
@@ -597,9 +585,9 @@ function cuesFromTimedText(value: string): VideoTranscriptCue[] {
   const parsed = value
     .split(/\r?\n/)
     .map((line) => {
-      const match = line.trim().match(
-        /^\[((?:\d{1,3}:)?\d{1,2}:\d{2}(?:\.\d+)?)\]\s*(.+)$/,
-      );
+      const match = line
+        .trim()
+        .match(/^\[((?:\d{1,3}:)?\d{1,2}:\d{2}(?:\.\d+)?)\]\s*(.+)$/);
       if (!match) return null;
       const startSeconds = timestampToSeconds(match[1]);
       if (startSeconds === null) return null;
@@ -642,9 +630,10 @@ function recallByKeywords(
   for (const original of candidates) {
     if (!bySource.has(original.source)) continue;
     const normalized = normalizeSearchText(original.text);
-    let score = normalizedQuery.length >= 3 && normalized.includes(normalizedQuery)
-      ? 18
-      : 0;
+    let score =
+      normalizedQuery.length >= 3 && normalized.includes(normalizedQuery)
+        ? 18
+        : 0;
     for (const term of terms) {
       if (normalized.includes(term)) {
         score += Math.min(8, Math.max(1.5, term.length * 1.25));
@@ -766,7 +755,8 @@ async function rerankCandidates(
     if (!Array.isArray(payload.selected)) return fallback;
     const byKey = new Map(candidates.map((item) => [item.key, item]));
     const selected = payload.selected.flatMap((entry) => {
-      if (!entry || typeof entry !== "object" || Array.isArray(entry)) return [];
+      if (!entry || typeof entry !== "object" || Array.isArray(entry))
+        return [];
       const id = (entry as Record<string, unknown>).id;
       return typeof id === "string" && byKey.has(id) ? [byKey.get(id)!] : [];
     });
@@ -801,7 +791,9 @@ function fallbackSelection(
             ? right.order - left.order
             : left.order - right.order),
       );
-    selected.push(...sourceCandidates.slice(0, target === "transcript" ? 4 : 2));
+    selected.push(
+      ...sourceCandidates.slice(0, target === "transcript" ? 4 : 2),
+    );
   }
   return [...new Map(selected.map((item) => [item.key, item])).values()]
     .sort((left, right) => right.score - left.score || left.order - right.order)
@@ -837,7 +829,9 @@ function addTranscriptNeighbors(
   const result: RecallCandidate[] = [];
   for (const item of selected) {
     if (item.source === "transcript") {
-      const position = transcript.findIndex((candidate) => candidate.key === item.key);
+      const position = transcript.findIndex(
+        (candidate) => candidate.key === item.key,
+      );
       if (position > 0) result.push(transcript[position - 1]);
       result.push(item);
       if (position >= 0 && position + 1 < transcript.length) {
@@ -907,7 +901,9 @@ function searchTerms(value: string) {
       if (!COMMON_TERMS.has(triple)) terms.add(triple);
     }
   }
-  return [...terms].sort((left, right) => right.length - left.length).slice(0, 80);
+  return [...terms]
+    .sort((left, right) => right.length - left.length)
+    .slice(0, 80);
 }
 
 function bestTranscriptAnchor(
@@ -978,7 +974,8 @@ function normalizeSearchText(value: string) {
 function transcriptQuality(value: string) {
   const compact = value.replace(/\s+/g, "");
   if (!compact) return 0;
-  const replacementPenalty = (compact.match(/[�□]/g)?.length ?? 0) / compact.length;
+  const replacementPenalty =
+    (compact.match(/[�□]/g)?.length ?? 0) / compact.length;
   const uniqueRatio = new Set(compact).size / compact.length;
   const repeatedPenalty = /(.{2,12})\1{3,}/u.test(compact) ? 0.35 : 0;
   return Math.max(

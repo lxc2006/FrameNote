@@ -1565,14 +1565,17 @@ html[data-resizing] .sidebar-pane-content {
 .conversation-header {
   position: relative;
   z-index: 5;
-  display: flex;
+  display: grid;
   min-height: 72px;
   align-items: center;
-  justify-content: space-between;
+
+  /* 左侧标题自适应，右侧操作区保持自身宽度 */
+  grid-template-columns: minmax(0, 1fr) max-content;
+
   padding: 12px 20px;
   border-bottom: 1px solid var(--line);
   background: rgba(255, 255, 255, 0.95);
-  gap: 16px;
+  column-gap: 16px;
 }
 
 .conversation-header > div {
@@ -1580,7 +1583,7 @@ html[data-resizing] .sidebar-pane-content {
 }
 
 .conversation-header > div:first-child {
-  flex: 1 1 auto;
+  min-width: 0;
 }
 
 .conversation-header h2 {
@@ -1639,22 +1642,26 @@ html[data-resizing] .sidebar-pane-content {
 
 .conversation-header-actions {
   display: flex;
-  min-width: 0;
+  min-width: max-content;
+  flex: 0 0 auto;
   align-items: center;
   justify-content: flex-end;
-  flex: 0 1 auto;
   gap: 9px;
 }
 
 .conversation-usage {
   position: relative;
-  min-width: 0;
+  flex: 0 0 auto;
 }
 
 .conversation-usage-summary {
   display: flex;
-  min-width: 0;
-  max-width: 360px;
+
+  /* 不允许按钮在缩放时被压缩 */
+  width: max-content;
+  min-width: max-content;
+  max-width: none;
+
   min-height: 32px;
   align-items: center;
   padding: 0 10px 0 12px;
@@ -1667,14 +1674,9 @@ html[data-resizing] .sidebar-pane-content {
   font-size: max(10px, calc(var(--ui-font-size) - 4px));
   font-weight: 700;
   gap: 8px;
-  transition: border-color 150ms ease, background 150ms ease,
-    transform 90ms ease;
 }
 
 .conversation-usage-summary > span {
-  overflow: hidden;
-  min-width: 0;
-  text-overflow: ellipsis;
   white-space: nowrap;
 }
 

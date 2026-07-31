@@ -10,7 +10,7 @@ type InlineVideoToken =
     };
 
 const VIDEO_TIME_MARKER =
-  /\[\[video:(\d+(?:\.\d+)?)\|((?:\d{2}:)?\d{2}:\d{2})\]\]/g;
+  /\[\[\s*video\s*:\s*(?:(\d+(?:\.\d+)?)\s*\|\s*)?((?:\d{2}:)?\d{2}:\d{2})\s*\]\]/gi;
 const VIDEO_TIME_HREF = /^framenote-video:(\d+(?:\.\d+)?)$/;
 
 export function prepareMarkdownContent(content: string) {
@@ -78,26 +78,80 @@ function videoTimeLink(label: string, seconds: number) {
 function tokenizeVideoTimes(value: string): InlineVideoToken[] {
   const rawTokens: InlineVideoToken[] = [];
   let cursor = 0;
+
   for (const match of value.matchAll(VIDEO_TIME_MARKER)) {
     const index = match.index ?? 0;
+
     if (index > cursor) {
-      rawTokens.push({ kind: "text", value: value.slice(cursor, index) });
+      rawTokens.push({
+        kind: "text",
+        value: value.slice(cursor, index),
+      });
     }
+
+    // match[1]：旧格式中的隐藏秒数，例如 47.000
+    // match[2]：新旧格式都有的可见时间，例如 00:47
+    const legacySecondsText = match[1];
     const label = match[2];
-    // 可见时间是唯一跳转依据，避免旧记录的隐藏秒数与显示文本不一致。
-    const seconds = timestampToSeconds(label) ?? Number(match[1]);
-    rawTokens.push({ kind: "time", seconds, label });
+
+    const labelSeconds = timestampToSeconds(label);
+
+    if (labelSeconds === null) {
+      // 时间格式不合法，保留原始文本，不转换成按钮
+      rawTokens.push({
+        kind: "text",
+        value: match[0],
+      });
+    } else {
+      /*
+       * 新格式：
+       * [[video:00:47]]
+       *
+       * 旧格式：
+       * [[video:47.000|00:47]]
+       *
+       * 两种格式最终都以用户看得见的 00:47 为准。
+       */
+      if (legacySecondsText !== undefined) {
+        const legacySeconds = Number(legacySecondsText);
+
+        if (
+          Number.isFinite(legacySeconds) &&
+          Math.abs(legacySeconds - labelSeconds) > 0.5
+        ) {
+          console.warn("视频时间标记两侧不一致，已采用可见时间", {
+            marker: match[0],
+            hiddenSeconds: legacySeconds,
+            visibleTime: label,
+            visibleSeconds: labelSeconds,
+          });
+        }
+      }
+
+      rawTokens.push({
+        kind: "time",
+        seconds: labelSeconds,
+        label,
+      });
+    }
+
     cursor = index + match[0].length;
   }
+
   if (cursor < value.length) {
-    rawTokens.push({ kind: "text", value: value.slice(cursor) });
+    rawTokens.push({
+      kind: "text",
+      value: value.slice(cursor),
+    });
   }
 
   const folded: InlineVideoToken[] = [];
+
   for (let index = 0; index < rawTokens.length; index += 1) {
     const first = rawTokens[index];
     const separator = rawTokens[index + 1];
     const second = rawTokens[index + 2];
+
     if (
       first?.kind === "time" &&
       separator?.kind === "text" &&
@@ -105,6 +159,7 @@ function tokenizeVideoTimes(value: string): InlineVideoToken[] {
       /^(?:\s|至|到|[-–—~～])*$/.test(separator.value)
     ) {
       if (Math.abs(first.seconds - second.seconds) <= 2) {
+        // 两个端点太接近，只保留第一个
         folded.push(first);
       } else {
         folded.push({
@@ -115,22 +170,30 @@ function tokenizeVideoTimes(value: string): InlineVideoToken[] {
           endLabel: second.label,
         });
       }
+
       index += 2;
       continue;
     }
+
     folded.push(first);
   }
 
   const seenTimes: number[] = [];
+
   return folded.filter((token) => {
-    if (token.kind === "text") return true;
+    if (token.kind === "text") {
+      return true;
+    }
+
     if (token.kind === "range") {
       seenTimes.push(token.startSeconds, token.endSeconds);
       return true;
     }
+
     if (seenTimes.some((seconds) => Math.abs(seconds - token.seconds) <= 2)) {
       return false;
     }
+
     seenTimes.push(token.seconds);
     return true;
   });
