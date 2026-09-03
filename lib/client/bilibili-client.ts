@@ -2,11 +2,9 @@ import type {
   BilibiliApiErrorBody,
   BilibiliArtifact,
   BilibiliJobSnapshot,
+  BilibiliPreviewResponse,
 } from "../bilibili-api";
-import {
-  BILIBILI_ANALYSIS_DOWNLOAD_VARIANT,
-  DEFAULT_BILIBILI_DOWNLOAD_VARIANT,
-} from "../bilibili-api";
+import { BILIBILI_ANALYSIS_DOWNLOAD_VARIANT } from "../bilibili-api";
 import type {
   TranscriptLanguage,
   VideoModelContext,
@@ -42,18 +40,7 @@ export interface BilibiliDownloadResult {
   height?: number;
 }
 
-export interface BilibiliPreparedDownloadResult {
-  playbackUrl: string;
-  downloadUrl: string;
-  filename: string;
-  bvid: string;
-  title: string;
-  description?: string;
-  durationSeconds: number;
-  sizeBytes: number;
-  width?: number;
-  height?: number;
-}
+export type BilibiliPreviewResult = BilibiliPreviewResponse;
 
 interface BilibiliDownloadOptions {
   signal?: AbortSignal;
@@ -65,7 +52,11 @@ export class BilibiliClientError extends Error {
   readonly code: string;
   readonly retryable: boolean;
 
-  constructor(message: string, code = "BILIBILI_DOWNLOAD_FAILED", retryable = false) {
+  constructor(
+    message: string,
+    code = "BILIBILI_DOWNLOAD_FAILED",
+    retryable = false,
+  ) {
     super(message);
     this.name = "BilibiliClientError";
     this.code = code;
@@ -73,73 +64,62 @@ export class BilibiliClientError extends Error {
   }
 }
 
-export async function prepareBilibiliVideoDownload(
+export async function prepareBilibiliVideoPreview(
   bvid: string,
   options: BilibiliDownloadOptions = {},
-): Promise<BilibiliPreparedDownloadResult> {
+): Promise<BilibiliPreviewResult> {
   throwIfAborted(options.signal);
-  options.onProgress?.({ stage: "preparing", progress: 0, phase: "queued" });
 
-  let jobId: string | undefined;
-  let keepArtifact = false;
-  const deadline = Date.now() + MAX_JOB_WAIT_MS;
+  options.onProgress?.({
+    stage: "preparing",
+    progress: 0,
+    phase: "queued",
+  });
+
   try {
-    let snapshot = await requestJob("/api/bilibili/jobs", {
+    const response = await fetch("/api/bilibili/preview", {
       method: "POST",
-      headers: { "content-type": "application/json" },
-      body: JSON.stringify({
-        bvid,
-        variant: DEFAULT_BILIBILI_DOWNLOAD_VARIANT,
-      }),
+      headers: {
+        accept: "application/json",
+        "content-type": "application/json",
+      },
+      body: JSON.stringify({ bvid }),
       signal: options.signal,
     });
-    jobId = snapshot.jobId;
-    reportServerProgress(snapshot, options.onProgress);
-
-    while (
-      (snapshot.status === "queued" || snapshot.status === "running") &&
-      !snapshot.error
+    const data = (await response.json().catch(() => null)) as
+      | BilibiliPreviewResponse
+      | BilibiliApiErrorBody
+      | null;
+    if (!response.ok || !data || "error" in data) {
+      const upstream = data && "error" in data ? data.error : undefined;
+      throw new BilibiliClientError(
+        upstream?.message ?? `B 站预览解析失败（HTTP ${response.status}）。`,
+        upstream?.code ?? "BILIBILI_RESOLVE_FAILED",
+        upstream?.retryable ?? response.status >= 500,
+      );
+    }
+    if (
+      typeof data.playbackUrl !== "string" ||
+      !data.playbackUrl ||
+      typeof data.bvid !== "string" ||
+      typeof data.title !== "string" ||
+      !Number.isFinite(data.durationSeconds) ||
+      data.durationSeconds <= 0
     ) {
-      if (Date.now() >= deadline) {
-        throw new BilibiliClientError(
-          "最高画质下载任务超过 22 分钟仍未完成，已自动取消。",
-          "BILIBILI_JOB_TIMEOUT",
-          true,
-        );
-      }
-      await abortableDelay(POLL_INTERVAL_MS, options.signal);
-      snapshot = await requestJob(`/api/bilibili/jobs/${jobId}`, {
-        signal: options.signal,
-      });
-      reportServerProgress(snapshot, options.onProgress);
+      throw new BilibiliClientError(
+        "媒体服务没有返回有效的 B 站 CDN 播放信息。",
+        "BILIBILI_PLAYBACK_URL_MISSING",
+        true,
+      );
     }
-
-    if (snapshot.status !== "succeeded" || !snapshot.artifact) {
-      throw snapshotError(snapshot, "最高画质视频下载失败。");
-    }
-
-    const durationSeconds = requireDuration(snapshot);
-    validateArtifact(snapshot.artifact, durationSeconds);
-    keepArtifact = true;
-    options.onProgress?.({ stage: "downloading", progress: 1, phase: "ready" });
-
-    return {
-      playbackUrl: snapshot.artifact.playbackUrl,
-      downloadUrl: snapshot.artifact.downloadUrl,
-      filename: snapshot.artifact.filename,
-      bvid: snapshot.source.bvid,
-      title: sourceTitle(snapshot),
-      description: snapshot.source.description,
-      durationSeconds,
-      sizeBytes: snapshot.artifact.sizeBytes,
-      width: snapshot.artifact.width,
-      height: snapshot.artifact.height,
-    };
+    options.onProgress?.({
+      stage: "downloading",
+      progress: 1,
+      phase: "ready",
+    });
+    return data;
   } catch (error) {
     throw normalizeDownloadError(error, options.signal);
-  } finally {
-    // 成功后由签名 URL 和服务端 TTL 管理成品；立即删除会让浏览器下载失效。
-    if (jobId && !keepArtifact) void cleanupJob(jobId);
   }
 }
 
@@ -154,24 +134,20 @@ export async function downloadBilibiliVideo(
   let keepJob = false;
   const deadline = Date.now() + MAX_JOB_WAIT_MS;
   try {
-    let snapshot = await requestJob(
-      "/api/bilibili/jobs",
-      {
-        method: "POST",
-        headers: { "content-type": "application/json" },
-        body: JSON.stringify({
-          bvid,
-          variant: BILIBILI_ANALYSIS_DOWNLOAD_VARIANT,
-          ...(options.directSummaryMaxSeconds
-            ? {
-                directSummaryMaxSeconds:
-                  options.directSummaryMaxSeconds,
-              }
-            : {}),
-        }),
-        signal: options.signal,
-      },
-    );
+    let snapshot = await requestJob("/api/bilibili/jobs", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        bvid,
+        variant: BILIBILI_ANALYSIS_DOWNLOAD_VARIANT,
+        ...(options.directSummaryMaxSeconds
+          ? {
+              directSummaryMaxSeconds: options.directSummaryMaxSeconds,
+            }
+          : {}),
+      }),
+      signal: options.signal,
+    });
     jobId = snapshot.jobId;
     reportServerProgress(snapshot, options.onProgress);
 
@@ -249,15 +225,12 @@ export async function extractBilibiliTranscript(
 ): Promise<VideoTranscript> {
   throwIfAborted(signal);
   const deadline = Date.now() + MAX_JOB_WAIT_MS;
-  let snapshot = await requestJob(
-    `/api/bilibili/jobs/${jobId}/transcript`,
-    {
-      method: "POST",
-      headers: { "content-type": "application/json" },
-      body: JSON.stringify({ languages }),
-      signal,
-    },
-  );
+  let snapshot = await requestJob(`/api/bilibili/jobs/${jobId}/transcript`, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ languages }),
+    signal,
+  });
 
   while (snapshot.analysis?.transcript.status === "pending") {
     if (Date.now() >= deadline) {
@@ -348,7 +321,10 @@ async function downloadAnalysisEvidence(
     );
     options.onProgress?.({
       stage: "downloading",
-      progress: Math.min(0.98, (index + batch.length) / Math.max(1, frames.length)),
+      progress: Math.min(
+        0.98,
+        (index + batch.length) / Math.max(1, frames.length),
+      ),
       phase: "analyzing",
     });
   }
@@ -497,11 +473,12 @@ function reportServerProgress(
 }
 
 function snapshotError(snapshot: BilibiliJobSnapshot, fallbackMessage: string) {
-  const fallback = snapshot.status === "cancelled"
-    ? "B站视频下载已取消。"
-    : snapshot.status === "expired"
-      ? "B站视频下载结果已过期，请重新开始。"
-      : fallbackMessage;
+  const fallback =
+    snapshot.status === "cancelled"
+      ? "B站视频下载已取消。"
+      : snapshot.status === "expired"
+        ? "B站视频下载结果已过期，请重新开始。"
+        : fallbackMessage;
   return new BilibiliClientError(
     snapshot.error?.message ?? fallback,
     snapshot.error?.code ?? `BILIBILI_${snapshot.status.toUpperCase()}`,
@@ -542,9 +519,7 @@ function validateArtifact(
   durationSeconds: number,
   maxBytes?: number,
 ) {
-  if (
-    durationSeconds > MAX_VIDEO_DURATION_SECONDS
-  ) {
+  if (durationSeconds > MAX_VIDEO_DURATION_SECONDS) {
     throw new BilibiliClientError(
       `当前版本支持不超过 ${Math.round(
         MAX_VIDEO_DURATION_SECONDS / 60,
@@ -587,7 +562,10 @@ function validateArtifact(
         true,
       );
     }
-    if (globalThis.location?.protocol === "https:" && mediaUrl.protocol !== "https:") {
+    if (
+      globalThis.location?.protocol === "https:" &&
+      mediaUrl.protocol !== "https:"
+    ) {
       throw new BilibiliClientError(
         "当前页面使用 HTTPS，媒体服务也必须提供 HTTPS 播放和下载地址。",
         "INSECURE_MEDIA_SERVICE",
@@ -603,7 +581,10 @@ function validateArtifact(
       true,
     );
   }
-  if (!/^video\//i.test(artifact.mimeType) || !/^[a-f0-9]{64}$/i.test(artifact.sha256)) {
+  if (
+    !/^video\//i.test(artifact.mimeType) ||
+    !/^[a-f0-9]{64}$/i.test(artifact.sha256)
+  ) {
     throw new BilibiliClientError(
       "媒体服务返回的文件元数据无效。",
       "INVALID_MEDIA_METADATA",

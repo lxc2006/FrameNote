@@ -32,7 +32,6 @@ def settings_for(root: Path, max_queued: int = 2) -> Settings:
         max_queued=max_queued,
         max_duration_seconds=3_600,
         max_bytes=500 * 1024 * 1024,
-        download_max_bytes=1024 * 1024 * 1024,
         job_timeout_seconds=60,
         artifact_ttl_seconds=60,
         signed_url_ttl_seconds=30,
@@ -67,14 +66,14 @@ class JobRecordTests(unittest.TestCase):
                 command[:5],
                 [sys.executable, "-I", "-u", "-X", "utf8=1"],
             )
-            self.assertEqual(command[command.index("--variant") + 1], "preview")
+            self.assertEqual(command[command.index("--variant") + 1], "analysis")
             self.assertEqual(
                 command[command.index("--direct-summary-max-seconds") + 1],
                 "0",
             )
             self.assertEqual(
                 command[command.index("--max-bytes") + 1],
-                str(1024 * 1024 * 1024),
+                str(500 * 1024 * 1024),
             )
             analysis_command = manager._worker_command(
                 JobRecord(
@@ -143,6 +142,44 @@ class JobRecordTests(unittest.TestCase):
 
 
 class QueueTests(unittest.IsolatedAsyncioTestCase):
+    async def test_artifact_event_registers_analysis_output(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            manager = JobManager(settings_for(root))
+            job_id = str(uuid.uuid4())
+            job_dir = root / job_id
+            job_dir.mkdir()
+            manager._jobs[job_id] = JobRecord(
+                job_id=job_id,
+                bvid="BV1xx411c7mD",
+                status="running",
+                phase="analyzing",
+                progress=0.99,
+                queue_slot_held=False,
+            )
+
+            await manager._handle_worker_message(
+                job_id,
+                {
+                    "event": "artifact",
+                    "artifactFile": "artifact.mp4",
+                    "filename": "analysis.mp4",
+                    "mimeType": "video/mp4",
+                    "sizeBytes": 1024,
+                    "sha256": "a" * 64,
+                    "width": 852,
+                    "height": 480,
+                },
+            )
+
+            registered = await manager.get(job_id)
+            self.assertIsNotNone(registered)
+            self.assertEqual(registered.artifact_file, "artifact.mp4")
+            self.assertEqual(registered.artifact_size_bytes, 1024)
+            self.assertEqual(registered.artifact_width, 852)
+            self.assertEqual(registered.artifact_height, 480)
+            self.assertEqual(registered.phase, "ready")
+
     async def test_queue_limit_and_cancelled_slot_release(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             manager = JobManager(settings_for(Path(temporary)))

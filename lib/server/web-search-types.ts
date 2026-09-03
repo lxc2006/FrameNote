@@ -18,13 +18,14 @@ export interface WebSearchPlanningContext {
   question: string;
   source: VideoSourceDescriptor;
   summary: VideoSummary;
-  transcript?: string;
   history?: VideoConversationMessage[];
   locale: string;
   region: string;
   timeZone: string;
-  transcriptLanguage?: string;
   currentDate: string;
+  routeReason?: string;
+  missingFacts?: string[];
+  forceSearch?: boolean;
 }
 
 export interface WebSearchSource {

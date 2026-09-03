@@ -27,7 +27,7 @@ class CorsConfigTests(unittest.TestCase):
             with self.subTest(value=value), self.assertRaises(RuntimeError):
                 parse_cors_origins(value)
 
-    def test_local_origins_and_variant_size_limits_are_defaults(self) -> None:
+    def test_local_origins_and_analysis_limit_are_defaults(self) -> None:
         with patch.dict(os.environ, {}, clear=True):
             settings = Settings.from_env()
         self.assertEqual(
@@ -35,7 +35,6 @@ class CorsConfigTests(unittest.TestCase):
             ("http://localhost:3000", "http://127.0.0.1:3000"),
         )
         self.assertEqual(settings.max_bytes, 500 * 1024 * 1024)
-        self.assertEqual(settings.download_max_bytes, 1024 * 1024 * 1024)
         self.assertEqual(settings.job_timeout_seconds, 1_200)
         self.assertTrue(settings.allow_tokenless_loopback)
 

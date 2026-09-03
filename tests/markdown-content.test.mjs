@@ -37,3 +37,12 @@ test("prepares standard Markdown while normalizing FrameNote video times", () =>
   assert.equal(parseVideoTimeHref("framenote-video:713"), 713);
   assert.equal(parseVideoTimeHref("javascript:alert(1)"), null);
 });
+
+test("removes external Markdown URLs attached to rendered video times", () => {
+  assert.equal(
+    prepareMarkdownContent(
+      "位置 [[video:00:11]](https://www.bilibili.com/video/BV1AB411C7mD?t=11)。",
+    ),
+    "位置 [00:11](framenote-video:11)。",
+  );
+});

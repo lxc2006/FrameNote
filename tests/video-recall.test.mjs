@@ -17,6 +17,21 @@ const summary = {
   chapters: [],
 };
 
+test("removes external Markdown URLs attached to video time markers", () => {
+  const answer = applyVerifiedVideoTimeReferences(
+    "位置 [[video:00:11]](https://www.bilibili.com/video/BV1AB411C7mD?t=11)。",
+  );
+
+  assert.equal(answer, "位置 [[video:00:11]]。");
+});
+
+test("keeps attached video-time URL examples inside code unchanged", () => {
+  const example =
+    "`[[video:00:11]](https://example.com/video?t=11)`\n\n```text\n[[video:00:12]](https://example.com/video?t=12)\n```";
+
+  assert.equal(applyVerifiedVideoTimeReferences(example), example);
+});
+
 test("links every verified plain video timestamp while leaving guesses plain", () => {
   const answer = applyVerifiedVideoTimeReferences(
     "四点在 01:26、02:05、02:29 和 03:04。旧的误判时间 08:56 不应跳转，代码 `02:29` 也不处理。",
@@ -59,7 +74,7 @@ test("uses only verified plain timestamps and leaves internal ids untouched", ()
   assert.match(answer, /\[\[video:149\.000\|02:29\]\]/);
 });
 
-test("compact memory keeps the complete overview and samples the whole timeline", async (t) => {
+test("compact memory keeps the complete overview and complete timeline", async (t) => {
   const vite = await createViteServer({
     appType: "custom",
     configFile: false,
@@ -104,7 +119,7 @@ test("compact memory keeps the complete overview and samples the whole timeline"
 
   assert.equal(memory.overview, overview);
   assert.equal(memory.video.description.length, 2_000);
-  assert.equal(memory.keyPoints.length, 8);
+  assert.equal(memory.keyPoints.length, 24);
   assert.equal(memory.keyPoints[0].title, "要点 1");
   assert.equal(memory.keyPoints.at(-1).title, "要点 24");
   assert.equal(memory.audioOverview.length, 700);

@@ -21,9 +21,8 @@ export interface BilibiliJobSource {
   description?: string;
 }
 
-export type BilibiliDownloadVariant = "preview" | "analysis";
+export type BilibiliDownloadVariant = "analysis";
 
-export const DEFAULT_BILIBILI_DOWNLOAD_VARIANT: BilibiliDownloadVariant = "preview";
 export const BILIBILI_ANALYSIS_DOWNLOAD_VARIANT: BilibiliDownloadVariant = "analysis";
 
 export interface BilibiliArtifact {
@@ -36,6 +35,19 @@ export interface BilibiliArtifact {
   expiresAt: string;
   width?: number;
   height?: number;
+}
+
+export interface BilibiliPreviewResponse {
+  playbackUrl: string;
+  audioPlaybackUrl?: string;
+  bvid: string;
+  title: string;
+  description?: string;
+  durationSeconds: number;
+  sizeBytes: number;
+  width?: number;
+  height?: number;
+  filename: string;
 }
 
 export interface BilibiliAnalysisFrame {

@@ -31,7 +31,6 @@ export interface AskVideoRequest {
   searchContext?: {
     locale?: string;
     timeZone?: string;
-    transcriptLanguage?: string;
   };
 }
 
@@ -54,7 +53,12 @@ export interface AskVideoResponse {
   usage: ConversationUsageRecord;
 }
 
-export type AskVideoStreamPhase = "recall" | "search" | "answer";
+export type AskVideoStreamPhase =
+  | "assess"
+  | "recall"
+  | "reassess"
+  | "search"
+  | "answer";
 
 export type AskVideoStreamEvent =
   | {

@@ -28,9 +28,16 @@ from fastapi import (
     status,
 )
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse, JSONResponse
+from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
+from starlette.background import BackgroundTask
 
 from .analysis_pipeline import complete_analysis_transcript
+from .bilibili_preview import BilibiliPreviewError, resolve_bilibili_preview
+from .bilibili_preview_proxy import (
+    BilibiliPreviewProxyError,
+    BilibiliPreviewSessionStore,
+    open_bilibili_preview_stream,
+)
 from .web_extract import extract_web_document
 from .service.config import Settings
 from .service.job_manager import JobManager, JobRecord, QueueCapacityError
@@ -39,6 +46,8 @@ from .service.models import (
     AnalysisFrameResponse,
     AnalysisResponse,
     ArtifactResponse,
+    BilibiliPreviewRequest,
+    BilibiliPreviewResponse,
     CreateJobRequest,
     ErrorResponse,
     JobListResponse,
@@ -83,6 +92,7 @@ async def lifespan(app: FastAPI):
         )
     manager = JobManager(SETTINGS)
     app.state.job_manager = manager
+    app.state.bilibili_preview_store = BilibiliPreviewSessionStore()
     app.state.transcription_tasks = {}
     if SETTINGS.signing_secret_is_ephemeral:
         LOGGER.warning(
@@ -115,8 +125,8 @@ if SETTINGS.cors_origins:
         CORSMiddleware,
         allow_origins=list(SETTINGS.cors_origins),
         allow_credentials=False,
-        allow_methods=["GET", "POST", "DELETE", "OPTIONS"],
-        allow_headers=["Authorization", "Content-Type"],
+        allow_methods=["GET", "HEAD", "POST", "DELETE", "OPTIONS"],
+        allow_headers=["Authorization", "Content-Type", "Range"],
         expose_headers=[
             "Location",
             "Content-Disposition",
@@ -131,6 +141,10 @@ if SETTINGS.cors_origins:
 
 def manager_from_request(request: Request) -> JobManager:
     return request.app.state.job_manager
+
+
+def preview_store_from_request(request: Request) -> BilibiliPreviewSessionStore:
+    return request.app.state.bilibili_preview_store
 
 
 async def require_api_access(request: Request) -> None:
@@ -298,13 +312,9 @@ def job_response(request: Request, job: JobRecord) -> JobResponse:
         and job.artifact_sha256
         and job.artifact_expires_at
     ):
-        link_expires = (
-            int(job.artifact_expires_at)
-            if job.variant == "preview"
-            else min(
-                int(job.artifact_expires_at),
-                int(time.time()) + SETTINGS.signed_url_ttl_seconds,
-            )
+        link_expires = min(
+            int(job.artifact_expires_at),
+            int(time.time()) + SETTINGS.signed_url_ttl_seconds,
         )
         signature = sign_download(
             SETTINGS.signing_secret, job.job_id, link_expires
@@ -427,6 +437,99 @@ async def health(request: Request) -> JSONResponse:
 )
 async def extract_web_page(body: WebExtractRequest) -> WebExtractResponse:
     return await extract_web_document(body.url)
+
+
+@app.post(
+    "/v1/bilibili/preview",
+    response_model=BilibiliPreviewResponse,
+    response_model_exclude_none=True,
+    dependencies=[Depends(require_api_access)],
+)
+async def resolve_bilibili_video_preview(
+    body: BilibiliPreviewRequest,
+    request: Request,
+    preview_store: BilibiliPreviewSessionStore = Depends(preview_store_from_request),
+) -> BilibiliPreviewResponse:
+    try:
+        preview = await resolve_bilibili_preview(body.bvid)
+    except BilibiliPreviewError as exc:
+        raise api_error(
+            status.HTTP_502_BAD_GATEWAY if exc.retryable else status.HTTP_503_SERVICE_UNAVAILABLE,
+            exc.code,
+            exc.message,
+        ) from exc
+    preview_session = preview_store.create(preview)
+    preview_base_url = (
+        f"{get_public_base_url(request)}/v1/bilibili/preview/"
+        f"{preview_session.session_id}"
+    )
+    return BilibiliPreviewResponse(
+        playbackUrl=f"{preview_base_url}/video",
+        audioPlaybackUrl=(
+            f"{preview_base_url}/audio" if preview.audio_track is not None else None
+        ),
+        bvid=preview.bvid,
+        title=preview.title,
+        description=preview.description,
+        durationSeconds=preview.duration_seconds,
+        sizeBytes=preview.size_bytes,
+        width=preview.width,
+        height=preview.height,
+        filename=preview.filename,
+    )
+
+
+async def _stream_bilibili_preview_track(
+    request: Request,
+    session_id: str,
+    track_kind: str,
+    preview_store: BilibiliPreviewSessionStore,
+) -> StreamingResponse:
+    try:
+        track = preview_store.track(
+            session_id,
+            "audio" if track_kind == "audio" else "video",
+        )
+        upstream = await open_bilibili_preview_stream(
+            track,
+            request.headers.get("range"),
+        )
+    except BilibiliPreviewProxyError as exc:
+        raise api_error(exc.status_code, exc.code, exc.message) from exc
+    return StreamingResponse(
+        upstream.response.aiter_raw(),
+        status_code=upstream.response.status_code,
+        headers=upstream.response_headers(),
+        background=BackgroundTask(upstream.close),
+    )
+
+
+@app.get("/v1/bilibili/preview/{session_id}/video")
+async def stream_bilibili_preview_video(
+    request: Request,
+    session_id: str,
+    preview_store: BilibiliPreviewSessionStore = Depends(preview_store_from_request),
+) -> StreamingResponse:
+    return await _stream_bilibili_preview_track(
+        request,
+        session_id,
+        "video",
+        preview_store,
+    )
+
+
+@app.get("/v1/bilibili/preview/{session_id}/audio")
+async def stream_bilibili_preview_audio(
+    request: Request,
+    session_id: str,
+    preview_store: BilibiliPreviewSessionStore = Depends(preview_store_from_request),
+) -> StreamingResponse:
+    return await _stream_bilibili_preview_track(
+        request,
+        session_id,
+        "audio",
+        preview_store,
+    )
 
 
 @app.post(

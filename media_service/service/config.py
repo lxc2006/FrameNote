@@ -90,7 +90,6 @@ class Settings:
     max_queued: int
     max_duration_seconds: int
     max_bytes: int
-    download_max_bytes: int
     job_timeout_seconds: int
     artifact_ttl_seconds: int
     signed_url_ttl_seconds: int
@@ -136,12 +135,6 @@ class Settings:
                 500 * 1024 * 1024,
                 1024 * 1024,
                 500 * 1024 * 1024,
-            ),
-            download_max_bytes=_bounded_int(
-                "FRAMENOTE_MEDIA_DOWNLOAD_MAX_BYTES",
-                1024 * 1024 * 1024,
-                1024 * 1024,
-                2 * 1024 * 1024 * 1024,
             ),
             job_timeout_seconds=_bounded_int(
                 "FRAMENOTE_MEDIA_JOB_TIMEOUT_SECONDS", 1_200, 60, 7_200

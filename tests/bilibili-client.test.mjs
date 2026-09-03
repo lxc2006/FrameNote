@@ -70,7 +70,7 @@ test("surfaces a Bilibili job error instead of rejecting its snapshot", async (t
   }
 });
 
-test("prepares separate highest-quality playback and download URLs without buffering media", async (t) => {
+test("resolves 1080p Bilibili CDN tracks through the local media service", async (t) => {
   const vite = await createViteServer({
     appType: "custom",
     configFile: false,
@@ -81,29 +81,19 @@ test("prepares separate highest-quality playback and download URLs without buffe
 
   const originalFetch = globalThis.fetch;
   const requests = [];
-  const playbackUrl = "https://media.example.com/signed/highest-compatible.mp4?download=0";
-  const artifactUrl = "https://media.example.com/signed/highest-compatible.mp4";
-  const snapshot = {
-    jobId: "22222222-2222-4222-8222-222222222222",
-    status: "succeeded",
-    phase: "ready",
-    progress: 1,
-    source: {
-      bvid: "BV1nx411u79K",
-      title: "最高画质测试视频",
-      durationSeconds: 600,
-    },
-    artifact: {
-      playbackUrl,
-      downloadUrl: artifactUrl,
-      filename: "最高画质测试视频.mp4",
-      mimeType: "video/mp4",
-      sizeBytes: 5 * 1024 * 1024 * 1024,
-      sha256: "a".repeat(64),
-      expiresAt: "2099-01-01T00:00:00Z",
-      width: 1920,
-      height: 1080,
-    },
+  const playbackUrl = "https://cdn.example.com/video-1080p.mp4";
+  const audioPlaybackUrl = "https://cdn.example.com/audio.m4a";
+  const responseBody = {
+    playbackUrl,
+    audioPlaybackUrl,
+    bvid: "BV1nx411u79K",
+    title: "最高画质测试视频",
+    description: "公开视频简介",
+    durationSeconds: 600,
+    sizeBytes: 5 * 1024 * 1024,
+    width: 1920,
+    height: 1080,
+    filename: "BV1nx411u79K.mp4",
   };
 
   globalThis.fetch = async (input, init = {}) => {
@@ -112,8 +102,8 @@ test("prepares separate highest-quality playback and download URLs without buffe
       url: String(input),
       body: init.body ? JSON.parse(String(init.body)) : undefined,
     });
-    return new Response(JSON.stringify(snapshot), {
-      status: 202,
+    return new Response(JSON.stringify(responseBody), {
+      status: 200,
       headers: { "content-type": "application/json" },
     });
   };
@@ -121,22 +111,22 @@ test("prepares separate highest-quality playback and download URLs without buffe
     globalThis.fetch = originalFetch;
   });
 
-  const { prepareBilibiliVideoDownload } = await vite.ssrLoadModule(
+  const { prepareBilibiliVideoPreview } = await vite.ssrLoadModule(
     `/lib/client/bilibili-client.ts?manual-download=${Date.now()}`,
   );
-  const result = await prepareBilibiliVideoDownload("BV1nx411u79K");
+  const result = await prepareBilibiliVideoPreview("BV1nx411u79K");
 
   assert.equal(result.playbackUrl, playbackUrl);
-  assert.equal(result.downloadUrl, artifactUrl);
-  assert.equal(result.filename, snapshot.artifact.filename);
-  assert.equal(result.sizeBytes, snapshot.artifact.sizeBytes);
+  assert.equal(result.audioPlaybackUrl, audioPlaybackUrl);
+  assert.equal(result.title, "最高画质测试视频");
+  assert.equal(result.description, "公开视频简介");
+  assert.equal(result.durationSeconds, 600);
+  assert.equal(result.sizeBytes, 5 * 1024 * 1024);
   assert.equal(result.width, 1920);
   assert.equal(result.height, 1080);
   assert.deepEqual(requests.map(({ method }) => method), ["POST"]);
-  assert.deepEqual(requests[0].body, {
-    bvid: "BV1nx411u79K",
-    variant: "preview",
-  });
+  assert.equal(requests[0].url, "/api/bilibili/preview");
+  assert.deepEqual(requests[0].body, { bvid: "BV1nx411u79K" });
 });
 
 test("rejects AI analysis artifacts above 500 MB before buffering media", async (t) => {
@@ -203,7 +193,7 @@ test("rejects AI analysis artifacts above 500 MB before buffering media", async 
   assert.ok(!requests.some(({ url }) => url === artifactUrl));
 });
 
-test("rejects a prepared video without an inline playback URL", async (t) => {
+test("rejects a preview response without a playback URL", async (t) => {
   const vite = await createViteServer({
     appType: "custom",
     configFile: false,
@@ -214,33 +204,18 @@ test("rejects a prepared video without an inline playback URL", async (t) => {
 
   const originalFetch = globalThis.fetch;
   const requests = [];
-  const snapshot = {
-    jobId: "44444444-4444-4444-8444-444444444444",
-    status: "succeeded",
-    phase: "ready",
-    progress: 1,
-    source: {
-      bvid: "BV1nx411u79K",
-      title: "缺少播放地址的视频",
-      durationSeconds: 80,
-    },
-    artifact: {
-      downloadUrl: "https://media.example.com/signed/download.mp4",
-      filename: "video.mp4",
-      mimeType: "video/mp4",
-      sizeBytes: 1024,
-      sha256: "b".repeat(64),
-      expiresAt: "2099-01-01T00:00:00Z",
-    },
+  const responseBody = {
+    bvid: "BV1nx411u79K",
+    title: "缺少播放地址",
+    durationSeconds: 60,
+    sizeBytes: 0,
+    filename: "BV1nx411u79K.mp4",
   };
 
   globalThis.fetch = async (input, init = {}) => {
     requests.push({ method: init.method ?? "GET", url: String(input) });
-    if (init.method === "DELETE") {
-      return new Response(null, { status: 204 });
-    }
-    return new Response(JSON.stringify(snapshot), {
-      status: 202,
+    return new Response(JSON.stringify(responseBody), {
+      status: 200,
       headers: { "content-type": "application/json" },
     });
   };
@@ -248,19 +223,19 @@ test("rejects a prepared video without an inline playback URL", async (t) => {
     globalThis.fetch = originalFetch;
   });
 
-  const { BilibiliClientError, prepareBilibiliVideoDownload } =
+  const { BilibiliClientError, prepareBilibiliVideoPreview } =
     await vite.ssrLoadModule(
       `/lib/client/bilibili-client.ts?missing-playback=${Date.now()}`,
     );
   await assert.rejects(
-    prepareBilibiliVideoDownload("BV1nx411u79K"),
+    prepareBilibiliVideoPreview("BV1nx411u79K"),
     (error) => {
       assert.ok(error instanceof BilibiliClientError);
-      assert.equal(error.code, "INVALID_DOWNLOAD_URL");
+      assert.equal(error.code, "BILIBILI_PLAYBACK_URL_MISSING");
       return true;
     },
   );
-  assert.deepEqual(requests.map(({ method }) => method), ["POST", "DELETE"]);
+  assert.deepEqual(requests.map(({ method }) => method), ["POST"]);
 });
 
 test("returns a trusted low-resolution media job without buffering the video", async (t) => {

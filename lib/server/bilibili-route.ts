@@ -1,11 +1,11 @@
 import type {
   BilibiliApiErrorBody,
-  BilibiliDownloadVariant,
   BilibiliJobSnapshot,
+  BilibiliPreviewResponse,
   CreateBilibiliJobRequest,
 } from "../bilibili-api";
 import type { TranscriptLanguage } from "../video-engine";
-import { DEFAULT_BILIBILI_DOWNLOAD_VARIANT } from "../bilibili-api";
+import { BILIBILI_ANALYSIS_DOWNLOAD_VARIANT } from "../bilibili-api";
 import {
   BilibiliConfigurationError,
 } from "./bilibili-config";
@@ -32,10 +32,6 @@ const JOB_PHASES = new Set([
   "merging",
   "analyzing",
   "ready",
-]);
-const SUPPORTED_DOWNLOAD_VARIANTS = new Set<BilibiliDownloadVariant>([
-  "preview",
-  "analysis",
 ]);
 const SUPPORTED_TRANSCRIPT_LANGUAGES = new Set<TranscriptLanguage>([
   "zh",
@@ -86,13 +82,10 @@ export async function readCreateBilibiliJobRequest(
   const variantValue = (value as Record<string, unknown>).variant;
   const variant =
     variantValue === undefined
-      ? DEFAULT_BILIBILI_DOWNLOAD_VARIANT
+      ? BILIBILI_ANALYSIS_DOWNLOAD_VARIANT
       : variantValue;
-  if (
-    typeof variant !== "string" ||
-    !SUPPORTED_DOWNLOAD_VARIANTS.has(variant as BilibiliDownloadVariant)
-  ) {
-    throw new BilibiliInputError("variant 只支持 preview 或 analysis。");
+  if (variant !== BILIBILI_ANALYSIS_DOWNLOAD_VARIANT) {
+    throw new BilibiliInputError("variant 只支持 analysis。");
   }
   const directSummaryMaxSecondsValue = (
     value as Record<string, unknown>
@@ -111,12 +104,6 @@ export async function readCreateBilibiliJobRequest(
       "directSummaryMaxSeconds 必须是 0 到 900 之间的整数。",
     );
   }
-  if (variant === "preview" && directSummaryMaxSeconds !== 0) {
-    throw new BilibiliInputError(
-      "preview 任务不能设置直接总结时长。",
-    );
-  }
-
   return {
     bvid: `BV${bvid.trim().slice(2)}`,
     variant: variant as CreateBilibiliJobRequest["variant"],
@@ -124,6 +111,35 @@ export async function readCreateBilibiliJobRequest(
       ? { directSummaryMaxSeconds }
       : {}),
   };
+}
+
+export async function readBilibiliPreviewRequest(request: Request) {
+  const contentType = request.headers.get("content-type") ?? "";
+  if (!contentType.toLowerCase().startsWith("application/json")) {
+    throw new BilibiliInputError("请求必须使用 application/json。");
+  }
+  const contentLength = Number(request.headers.get("content-length"));
+  if (Number.isFinite(contentLength) && contentLength > MAX_CONTROL_BODY_BYTES) {
+    throw new BilibiliInputError("B 站预览请求体过大。");
+  }
+  const raw = await request.text();
+  if (new TextEncoder().encode(raw).byteLength > MAX_CONTROL_BODY_BYTES) {
+    throw new BilibiliInputError("B 站预览请求体过大。");
+  }
+  let value: unknown;
+  try {
+    value = JSON.parse(raw);
+  } catch {
+    throw new BilibiliInputError("请求体不是有效 JSON。");
+  }
+  if (!value || typeof value !== "object" || Array.isArray(value)) {
+    throw new BilibiliInputError("请求体必须是对象。");
+  }
+  const bvid = (value as Record<string, unknown>).bvid;
+  if (typeof bvid !== "string" || !BVID_PATTERN.test(bvid.trim())) {
+    throw new BilibiliInputError("bvid 必须是有效的 BV 号。");
+  }
+  return { bvid: `BV${bvid.trim().slice(2)}` };
 }
 
 export function validateBilibiliJobId(value: string) {
@@ -238,6 +254,34 @@ export async function proxyBilibiliJson(response: Response) {
       502,
       "INVALID_MEDIA_RESPONSE",
       "B站媒体服务返回了无效任务状态。",
+      true,
+    );
+  }
+  return noStoreJson(body, { status: response.status });
+}
+
+export async function proxyBilibiliPreviewJson(response: Response) {
+  const raw = await response.text();
+  let body: unknown = null;
+  try {
+    body = raw ? JSON.parse(raw) : null;
+  } catch {
+    body = null;
+  }
+  if (!response.ok) {
+    const upstream = parseUpstreamError(body);
+    return bilibiliErrorResponse(
+      normalizeUpstreamStatus(response.status),
+      upstream.code,
+      upstream.message,
+      upstream.retryable,
+    );
+  }
+  if (!isBilibiliPreview(body)) {
+    return bilibiliErrorResponse(
+      502,
+      "INVALID_PREVIEW_RESPONSE",
+      "B 站媒体服务返回了无效的预览信息。",
       true,
     );
   }
@@ -465,6 +509,51 @@ function isArtifact(value: unknown) {
     /^[a-f0-9]{64}$/i.test(artifact.sha256) &&
     typeof artifact.expiresAt === "string" &&
     Number.isFinite(Date.parse(artifact.expiresAt))
+  );
+}
+
+function isBilibiliPreview(value: unknown): value is BilibiliPreviewResponse {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return false;
+  const preview = value as Record<string, unknown>;
+  for (const key of ["playbackUrl", "audioPlaybackUrl"] as const) {
+    const url = preview[key];
+    if (
+      url !== undefined &&
+      (typeof url !== "string" || url.length > 16_384 || !/^https?:\/\//i.test(url))
+    ) {
+      return false;
+    }
+  }
+  return (
+    typeof preview.playbackUrl === "string" &&
+    typeof preview.bvid === "string" &&
+    BVID_PATTERN.test(preview.bvid) &&
+    typeof preview.title === "string" &&
+    preview.title.length > 0 &&
+    preview.title.length <= 1_000 &&
+    (preview.description === undefined ||
+      (typeof preview.description === "string" && preview.description.length <= 20_000)) &&
+    typeof preview.durationSeconds === "number" &&
+    Number.isFinite(preview.durationSeconds) &&
+    preview.durationSeconds > 0 &&
+    typeof preview.sizeBytes === "number" &&
+    Number.isSafeInteger(preview.sizeBytes) &&
+    preview.sizeBytes >= 0 &&
+    optionalPositiveDimension(preview.width) &&
+    optionalPositiveDimension(preview.height) &&
+    typeof preview.filename === "string" &&
+    preview.filename.length > 0 &&
+    preview.filename.length <= 255
+  );
+}
+
+function optionalPositiveDimension(value: unknown) {
+  return (
+    value === undefined ||
+    (typeof value === "number" &&
+      Number.isSafeInteger(value) &&
+      value > 0 &&
+      value <= 4_320)
   );
 }
 

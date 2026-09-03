@@ -8,14 +8,25 @@ interface TimedRecallEvidence {
   }>;
 }
 
+const VIDEO_TIME_EXTERNAL_LINK =
+  /```[\s\S]*?```|~~~[\s\S]*?~~~|`[^`\n]+`|(\[\[\s*video\s*:[^\]\r\n]+\]\])\s*\(\s*<?https?:\/\/[^)\s>]+>?(?:\s+["'][^"'\r\n]*["'])?\s*\)/gi;
+
 export function applyVerifiedVideoTimeReferences(
   answer: string,
   evidence?: TimedRecallEvidence,
   summary?: VideoSummary,
 ) {
+  const sanitizedAnswer = stripVideoTimeExternalLinks(answer);
   const verifiedTimes = collectVerifiedTimes(summary, evidence);
-  if (!verifiedTimes.length) return answer;
-  return linkVerifiedPlainTimestamps(answer, verifiedTimes);
+  if (!verifiedTimes.length) return sanitizedAnswer;
+  return linkVerifiedPlainTimestamps(sanitizedAnswer, verifiedTimes);
+}
+
+function stripVideoTimeExternalLinks(answer: string) {
+  return answer.replace(
+    VIDEO_TIME_EXTERNAL_LINK,
+    (match, videoMarker: string | undefined) => videoMarker ?? match,
+  );
 }
 
 function collectVerifiedTimes(

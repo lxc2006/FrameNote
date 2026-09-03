@@ -134,15 +134,9 @@ function parseSearchContext(value: unknown) {
     "searchContext.timeZone",
     100,
   );
-  const transcriptLanguage = optionalString(
-    object.transcriptLanguage,
-    "searchContext.transcriptLanguage",
-    80,
-  );
   return {
     ...(locale ? { locale } : {}),
     ...(timeZone ? { timeZone } : {}),
-    ...(transcriptLanguage ? { transcriptLanguage } : {}),
   };
 }
 

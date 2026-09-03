@@ -52,7 +52,7 @@ class JobRecord:
     source_kind: str = "bilibili"
     source_name: str | None = None
     source_url: str | None = None
-    variant: str = "preview"
+    variant: str = "analysis"
     direct_summary_max_seconds: int = 0
     status: str = "queued"
     phase: str = "queued"
@@ -174,7 +174,7 @@ class JobManager:
     async def create(
         self,
         bvid: str,
-        variant: str = "preview",
+        variant: str = "analysis",
         direct_summary_max_seconds: int = 0,
     ) -> JobRecord:
         async with self._lock:
@@ -340,7 +340,7 @@ class JobManager:
             "--max-duration",
             str(self.settings.max_duration_seconds),
             "--max-bytes",
-            str(self._max_bytes_for_variant(job.variant)),
+            str(self.settings.max_bytes),
             "--direct-summary-max-seconds",
             str(job.direct_summary_max_seconds),
         ]
@@ -351,13 +351,6 @@ class JobManager:
             if job.source_url:
                 command.extend(("--source-url", job.source_url))
         return command
-
-    def _max_bytes_for_variant(self, variant: str) -> int:
-        return (
-            self.settings.max_bytes
-            if variant == "analysis"
-            else self.settings.download_max_bytes
-        )
 
     async def _run_worker(self, job_id: str) -> None:
         async with self._lock:
@@ -564,7 +557,7 @@ class JobManager:
                     and isinstance(mime_type, str)
                     and mime_type.startswith("video/")
                     and isinstance(size, int)
-                    and 0 < size <= self._max_bytes_for_variant(job.variant)
+                    and 0 < size <= self.settings.max_bytes
                     and isinstance(sha256, str)
                     and len(sha256) == 64
                     and all(char in "0123456789abcdef" for char in sha256)
@@ -642,10 +635,10 @@ class JobManager:
             artifact.is_file()
             and not artifact.is_symlink()
             and stat.st_size == job.artifact_size_bytes
-            and stat.st_size <= self._max_bytes_for_variant(job.variant)
+            and stat.st_size <= self.settings.max_bytes
         )
-        if not artifact_valid or job.variant != "analysis":
-            return artifact_valid
+        if not artifact_valid:
+            return False
         if job.analysis_manifest_file != "analysis-manifest.json":
             return False
         try:

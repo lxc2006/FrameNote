@@ -2,6 +2,8 @@ export type ModelUsageProvider = "qwen" | "deepseek";
 
 export type ModelUsageOperation =
   | "video_summary"
+  | "answer_readiness_initial"
+  | "answer_readiness_after_recall"
   | "recall_plan"
   | "recall_rerank"
   | "web_search_plan"
@@ -211,6 +213,8 @@ function parseModelCallUsage(value: unknown): ModelCallUsage | null {
       : null;
   const operation =
     record?.operation === "video_summary" ||
+    record?.operation === "answer_readiness_initial" ||
+    record?.operation === "answer_readiness_after_recall" ||
     record?.operation === "recall_plan" ||
     record?.operation === "recall_rerank" ||
     record?.operation === "web_search_plan" ||

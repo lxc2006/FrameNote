@@ -14,7 +14,7 @@ JobStatus = Literal[
 JobPhase = Literal[
     "queued", "resolving", "downloading", "merging", "analyzing", "ready"
 ]
-BilibiliDownloadVariant = Literal["preview", "analysis"]
+BilibiliDownloadVariant = Literal["analysis"]
 MediaSourceKind = Literal["upload", "bilibili", "url"]
 TranscriptLanguage = Literal["zh", "ja", "en"]
 WebExtractStatus = Literal["ok", "requires_browser", "skipped"]
@@ -33,7 +33,7 @@ class CreateJobRequest(BaseModel):
     model_config = ConfigDict(extra="forbid", str_strip_whitespace=False)
 
     bvid: str = Field(min_length=12, max_length=12)
-    variant: BilibiliDownloadVariant = "preview"
+    variant: BilibiliDownloadVariant = "analysis"
     directSummaryMaxSeconds: int = Field(default=0, ge=0, le=900)
 
     @field_validator("bvid")
@@ -42,6 +42,32 @@ class CreateJobRequest(BaseModel):
         if not is_valid_bvid(value):
             raise ValueError("bvid must be a 12-character BVID such as BV1xx411c7mD")
         return value
+
+
+class BilibiliPreviewRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid", str_strip_whitespace=False)
+
+    bvid: str = Field(min_length=12, max_length=12)
+
+    @field_validator("bvid")
+    @classmethod
+    def validate_bvid(cls, value: str) -> str:
+        if not is_valid_bvid(value):
+            raise ValueError("bvid must be a 12-character BVID such as BV1xx411c7mD")
+        return value
+
+
+class BilibiliPreviewResponse(BaseModel):
+    playbackUrl: str
+    audioPlaybackUrl: str | None = None
+    bvid: str
+    title: str
+    description: str | None = None
+    durationSeconds: float = Field(gt=0)
+    sizeBytes: int = Field(ge=0)
+    width: int | None = Field(default=None, gt=0)
+    height: int | None = Field(default=None, gt=0)
+    filename: str
 
 
 class SourceResponse(BaseModel):

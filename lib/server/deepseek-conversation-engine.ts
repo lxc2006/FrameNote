@@ -11,10 +11,12 @@ import type {
   VideoSummary,
 } from "../video-engine";
 import { getDeepSeekConfig, type DeepSeekConfig } from "./deepseek-config";
+import type { AnswerReadinessDecision } from "./answer-readiness";
 import type { WebSearchEvidence } from "./web-search";
 import {
   applyVideoTimeReferences,
-  buildVideoMemory,
+  buildCompactVideoMemory,
+  buildSummaryTimeline,
   recallEvidenceText,
   recentConversation,
   type VideoRecallEvidence,
@@ -24,7 +26,7 @@ const QA_SYSTEM_PROMPT = `你是“帧记”的视频后续对话助手。
 
 ## 一、角色与回答范围
 
-每次请求都会提供一份精简、底层且持续有效的“视频记忆”，其中包括视频标题、简介、来源、完整内容概览、部分时间线、声音概览、近期对话。
+每次请求都会提供一份精简、底层且持续有效的“视频记忆”，以及一条完整总结时间线（最多 24 条）和最近 5 轮对话。
 触发回顾时，可能另外提供若干“回顾证据”，它来自完整视频总结、ASR 字幕或较早历史对话。
 触发联网搜索时，可能另外提供若干相关“联网证据”。
 
@@ -35,7 +37,7 @@ const QA_SYSTEM_PROMPT = `你是“帧记”的视频后续对话助手。
 - 提供创作、学习、分析或实践建议；
 - 继续讨论由视频自然延伸出的相关话题。
 
-当问题明显拓展到视频之外但可以正常回答时，可以自然地直接回答，同时需要提醒用户讨论边界，即不作为通用聊天模型。
+如果用户问题和视频内容与近期对话无关，可以自然地直接回答，但是需要简要指出并提醒讨论边界。
 
 ## 二、信息来源与优先级
 
@@ -203,6 +205,7 @@ export class DeepSeekConversationEngine {
       reasoningMode?: "flash" | "pro";
       webSearch?: WebSearchEvidence;
       recall?: VideoRecallEvidence;
+      readiness?: AnswerReadinessDecision;
       signal?: AbortSignal;
       onReasoningDelta?: (delta: string) => void;
       onAnswerDelta?: (delta: string) => void;
@@ -216,7 +219,12 @@ export class DeepSeekConversationEngine {
       {
         role: "user",
         content: `【精简视频记忆｜每轮固定提供】
-${JSON.stringify(buildVideoMemory(source, summary))}`,
+${JSON.stringify(buildCompactVideoMemory(source, summary))}`,
+      },
+      {
+        role: "user",
+        content: `【完整总结时间线｜每轮固定提供，最多 24 条】
+${JSON.stringify(buildSummaryTimeline(summary))}`,
       },
       ...(options.recall?.items.length
         ? [
@@ -241,6 +249,14 @@ ${JSON.stringify(options.webSearch)}`,
           ]
         : []),
       ...boundedHistory(history),
+      ...(options.readiness
+        ? [
+            {
+              role: "system" as const,
+              content: finalEvidenceInstruction(options.readiness),
+            },
+          ]
+        : []),
       {
         role: "user",
         content: `用户问题：${normalizedQuestion}`,
@@ -332,6 +348,18 @@ ${JSON.stringify(options.webSearch)}`,
       }) satisfies ModelCallUsage | null,
     };
   }
+}
+
+function finalEvidenceInstruction(readiness: AnswerReadinessDecision) {
+  const conflictInstruction = readiness.conflicts.length
+    ? `可用资料存在以下冲突：${readiness.conflicts.join("；")}。回答时明确指出冲突，并说明更可信的倾向及依据。`
+    : "没有已识别的资料冲突；不要自行制造冲突。";
+  if (readiness.decision === "unable") {
+    return `【本轮回答约束】回答所必需的可靠资料没有取得。缺少：${
+      readiness.missingFacts.join("；") || "可核实的关键依据"
+    }。请直接说明当前资料无法确认；可以回答已有资料能够支持的部分，但不得猜测或编造。${conflictInstruction} 不得暴露内部判断流程。`;
+  }
+  return `【本轮回答约束】现有资料已足以回答。只使用实际提供的资料和可靠常识作答，不得编造。${conflictInstruction} 不得暴露内部判断流程。`;
 }
 
 function attachSearchReferences(answer: string, evidence: WebSearchEvidence) {

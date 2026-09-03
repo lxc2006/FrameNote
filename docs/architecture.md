@@ -27,9 +27,11 @@ interface AskVideoRequest {
 
 页面与公共 API 不感知具体模型，只消费标准化的任务状态、总结和回答。
 
+后续对话采用分层证据路由：先由 Flash 只读取精简视频记忆、完整总结时间线和最近 5 轮对话，判断能否准确回答；不足时按开关进入完整总结/字幕/久远对话回顾，并在回顾后再次检查；仍缺外部事实时才进入联网规划、正文抓取和交叉核对。最终 Flash/Pro 模型只接收本轮实际取得的证据。明确联网或明显时效、官方问题在联网开启时必经搜索，明确字幕/回顾问题在完整回顾开启时必经回顾。
+
 本地上传和 HTTPS 直链先由网页把原始文件流式提交到独立媒体服务。媒体服务使用 `ffprobe` 校验时长和轨道，再由原生 FFmpeg 转成最长边不超过 854px 的 H.264/AAC 临时素材。原始上传在转码完成后删除，分析素材在任务结束或 TTL 到期时删除；它们都不会写入对话数据库。
 
-当前 B站媒体分成两类任务：用户点击“获取视频”时，`preview` 任务准备默认最高兼容画质 MP4，网页使用签名播放 URL 通过 HTTP Range 边播放边缓存，并提供附件下载 URL；AI 总结另建 `analysis` 任务，只准备约 480p、最大 500 MB 的素材，绝不复用最高画质文件。
+当前 B 站预览和 AI 分析是两条独立路径：用户点击“获取视频”时，媒体服务调用 `yt-dlp` 且设置 `download=False`，只解析不超过 1080p 的最高可用 CDN 视频轨与音频轨。原始 CDN URL 和 yt-dlp 请求头保存在短期内存会话中，网页只获得媒体服务的随机代理 URL；代理转发单段 `Range`，向 B 站注入 Referer、User-Agent 等受控请求头并原样返回 `206`、`Content-Range` 等播放响应。网页同步播放两条轨道，由浏览器按需读取和缓存，不在项目中保存预览文件。AI 总结另建 `analysis` 任务，只准备约 480p、最大 500 MB 的素材。
 
 获取视频和生成总结时，Sites Worker 代理任务控制数据及本地/HTTPS 上传流；独立 FastAPI 服务以受控子进程运行 yt-dlp 和原生 FFmpeg。所有来源在得到低分辨率分析视频后按时长分流：短视频由服务端流式上传 DashScope 临时存储并直接交给 Qwen；长视频由媒体服务提取音轨和关键帧。Qwen 完成后再按用户设置启动 FunASR，字幕独立保存但不进入本次总结提示。B站对话保存 BV 号并自动恢复预览；本地对话不保存视频，恢复后由用户重新选择预览文件。
 
@@ -51,7 +53,7 @@ interface AskVideoRequest {
 
 ## 3. “先下载视频”的服务端语义
 
-当前采用临时任务文件：本地和 HTTPS 原始上传在低分辨率转码完成后删除；AI 分析素材在 Qwen/字幕步骤结束后由网页主动清理，异常时由 TTL 兜底。最高兼容画质 B 站文件在媒体服务保留期内通过签名 URL 提供 Range 播放和附件下载。B站对话不保存视频副本，恢复历史时依赖保存的 BV 号重新创建临时预览，因此不会持久化过期签名 URL。
+当前采用临时任务文件：本地和 HTTPS 原始上传在低分辨率转码完成后删除；AI 分析素材在 Qwen/字幕步骤结束后由网页主动清理，异常时由 TTL 兜底。B 站预览与分析任务分离，预览 URL 由媒体服务使用 `yt-dlp` 即时解析，不会生成或保存最高画质文件。B 站对话不保存视频副本或 CDN URL，恢复历史时依赖保存的 BV 号重新解析，避免复用已经过期的 CDN 签名。
 
 如果后续为了多实例共享而接入对象存储，对象也只作为带 TTL 的任务临时产物，不写入对话作为长期恢复依据。转写和总结可以临时读取媒体，但任务完成或 TTL 到期后必须删除。
 
@@ -59,7 +61,8 @@ interface AskVideoRequest {
 
 | 方法与路径 | 状态 | 作用 |
 | --- | --- | --- |
-| `POST /api/bilibili/jobs` | 已实现 | 以 `{"bvid":"BV...","variant":"preview\|analysis"}` 创建受控下载任务，返回 `202` |
+| `POST /api/bilibili/preview` | 已实现 | 使用 `yt-dlp` 解析最高 1080p 的 B 站 CDN 视频/音频轨，返回临时代理播放地址，不下载媒体 |
+| `POST /api/bilibili/jobs` | 已实现 | 以 `{"bvid":"BV...","variant":"analysis"}` 创建受控 AI 分析任务，返回 `202` |
 | `GET /api/bilibili/jobs/:id` | 已实现 | 查询解析、下载、合并与就绪状态 |
 | `POST /api/bilibili/jobs/:id/transcript` | 已实现 | Qwen 完成后异步启动 FunASR 字幕提取 |
 | `DELETE /api/bilibili/jobs/:id` | 已实现 | 取消任务并清理临时媒体 |
@@ -74,7 +77,7 @@ interface AskVideoRequest {
 当前 B站创建任务请求：
 
 ```json
-{"bvid":"BVxxxxxxxxxx","variant":"preview"}
+{"bvid":"BVxxxxxxxxxx","variant":"analysis"}
 ```
 
 当前 B站媒体任务契约：

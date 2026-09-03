@@ -75,7 +75,7 @@ class WorkerValidationTests(unittest.TestCase):
         self.assertTrue(callable(load_analysis_builder()))
 
     def test_browser_format_restricts_every_fallback_to_avc_and_aac(self) -> None:
-        branches = browser_compatible_format("analysis").split("/")
+        branches = browser_compatible_format().split("/")
         self.assertEqual(len(branches), 2)
         for branch in branches:
             with self.subTest(branch=branch):
@@ -88,38 +88,6 @@ class WorkerValidationTests(unittest.TestCase):
                 self.assertIn(
                     "[acodec~='^(?:aac|mp4a\\.40\\.)']", branch
                 )
-
-    def test_preview_format_uses_highest_compatible_resolution(self) -> None:
-        format_selector = browser_compatible_format("preview")
-        branches = format_selector.split("/")
-        self.assertEqual(len(branches), 2)
-        for branch in branches:
-            with self.subTest(branch=branch):
-                self.assertNotIn("[width<=", branch)
-                self.assertNotIn("[height<=", branch)
-                self.assertIn(
-                    "[vcodec~='^(?:h264|avc[13](?:\\.|$))']", branch
-                )
-                self.assertIn(
-                    "[acodec~='^(?:aac|mp4a\\.40\\.)']", branch
-                )
-
-        formats = [
-            self.format_info("avc-480", "mp4", 480, "avc1.640033", "none"),
-            self.format_info("avc-720", "mp4", 720, "avc1.640033", "none"),
-            self.format_info("avc-1080", "mp4", 1080, "avc1.640033", "none"),
-            self.format_info("aac", "m4a", None, "none", "mp4a.40.2"),
-        ]
-        downloader = YoutubeDL({"quiet": True, "no_warnings": True})
-        selected = downloader._select_formats(
-            formats,
-            downloader.build_format_selector(format_selector),
-        )
-        self.assertEqual(len(selected), 1)
-        self.assertEqual(
-            [item["format_id"] for item in selected[0]["requested_formats"]],
-            ["avc-1080", "aac"],
-        )
 
     def test_analysis_format_uses_480p_equivalent_streams(self) -> None:
         formats = [
@@ -137,7 +105,7 @@ class WorkerValidationTests(unittest.TestCase):
         downloader = YoutubeDL({"quiet": True, "no_warnings": True})
         selected = downloader._select_formats(
             formats,
-            downloader.build_format_selector(browser_compatible_format("analysis")),
+            downloader.build_format_selector(browser_compatible_format()),
         )
 
         self.assertEqual(len(selected), 1)
@@ -157,7 +125,7 @@ class WorkerValidationTests(unittest.TestCase):
         downloader = YoutubeDL({"quiet": True, "no_warnings": True})
         selected = downloader._select_formats(
             formats,
-            downloader.build_format_selector(browser_compatible_format("analysis")),
+            downloader.build_format_selector(browser_compatible_format()),
         )
 
         self.assertEqual(len(selected), 1)
@@ -177,7 +145,7 @@ class WorkerValidationTests(unittest.TestCase):
             downloader._select_formats(
                 formats,
                 downloader.build_format_selector(
-                    browser_compatible_format("analysis")
+                    browser_compatible_format()
                 ),
             ),
             [],
@@ -195,7 +163,7 @@ class WorkerValidationTests(unittest.TestCase):
         downloader = YoutubeDL({"quiet": True, "no_warnings": True})
         selected = downloader._select_formats(
             formats,
-            downloader.build_format_selector(browser_compatible_format("analysis")),
+            downloader.build_format_selector(browser_compatible_format()),
         )
 
         self.assertEqual([item["format_id"] for item in selected], ["progressive-avc"])
@@ -469,8 +437,7 @@ class WorkerValidationTests(unittest.TestCase):
         self.assertEqual(duration, 3_600)
         self.assertIsNone(description)
 
-    def test_preview_and_analysis_use_distinct_runtime_size_limits(self) -> None:
-        validate_runtime_limits("preview", 3_600, 1024 * 1024 * 1024)
+    def test_analysis_runtime_size_limit(self) -> None:
         analysis_limit = 500 * 1024 * 1024
         validate_runtime_limits("analysis", 3_600, analysis_limit, 900)
 

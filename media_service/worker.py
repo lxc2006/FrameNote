@@ -22,10 +22,9 @@ JOB_ID_RE = re.compile(
     re.ASCII,
 )
 FINAL_ARTIFACT_RE = re.compile(r"^artifact\.mp4$", re.IGNORECASE)
-SUPPORTED_VARIANTS = frozenset({"preview", "analysis"})
+SUPPORTED_VARIANTS = frozenset({"analysis"})
 ANALYSIS_MAX_EDGE = 854
 ANALYSIS_MAX_BYTES = 500 * 1024 * 1024
-PREVIEW_MAX_BYTES = 2 * 1024 * 1024 * 1024
 DOWNLOAD_FRAGMENT_CONCURRENCY = 4
 DOWNLOAD_RETRIES = 10
 BROWSER_VIDEO_CODECS = frozenset({"h264"})
@@ -57,12 +56,8 @@ def load_analysis_builder():
     return build_analysis_manifest
 
 
-def browser_compatible_format(variant: str) -> str:
-    dimension_filter = (
-        rf"[width<={ANALYSIS_MAX_EDGE}][height<={ANALYSIS_MAX_EDGE}]"
-        if variant == "analysis"
-        else ""
-    )
+def browser_compatible_format() -> str:
+    dimension_filter = rf"[width<={ANALYSIS_MAX_EDGE}][height<={ANALYSIS_MAX_EDGE}]"
     return (
         rf"bv{dimension_filter}[ext=mp4][vcodec~='^(?:h264|avc[13](?:\.|$))']"
         r"+ba[ext=m4a][acodec~='^(?:aac|mp4a\.40\.)']/"
@@ -589,7 +584,7 @@ def run_uploaded_media(args: argparse.Namespace) -> None:
         args.max_bytes,
         args.direct_summary_max_seconds,
     )
-    if args.variant != "analysis" or args.source_kind not in {"upload", "url"}:
+    if args.source_kind not in {"upload", "url"}:
         raise WorkerFailure("INVALID_SOURCE", "媒体分析来源无效。", False)
     state_root = Path(args.state_root)
     job_dir = resolve_job_dir(state_root, args.job_id)
@@ -676,18 +671,15 @@ def validate_runtime_limits(
     max_bytes: int,
     direct_summary_max_seconds: int = 0,
 ) -> None:
-    if variant not in SUPPORTED_VARIANTS:
+    if variant != "analysis":
         raise WorkerFailure(
             "INVALID_LIMIT",
-            "下载用途只支持 preview 或 analysis。",
+            "下载用途只支持 analysis。",
             False,
         )
     if not 1 <= max_duration <= 3_600:
         raise WorkerFailure("INVALID_LIMIT", "时长限制无效。", False)
-    maximum_bytes = (
-        ANALYSIS_MAX_BYTES if variant == "analysis" else PREVIEW_MAX_BYTES
-    )
-    if not 1 <= max_bytes <= maximum_bytes:
+    if not 1 <= max_bytes <= ANALYSIS_MAX_BYTES:
         raise WorkerFailure("INVALID_LIMIT", "文件限制无效。", False)
     if not 0 <= direct_summary_max_seconds <= 900:
         raise WorkerFailure("INVALID_LIMIT", "Qwen 直接总结时长限制无效。", False)
@@ -724,7 +716,7 @@ def run(args: argparse.Namespace) -> None:
         "ignoreconfig": True,
         "noplaylist": True,
         "playlist_items": "1",
-        "format": browser_compatible_format(args.variant),
+        "format": browser_compatible_format(),
         "format_sort": [
             "vcodec:h264",
             "acodec:aac",
@@ -796,8 +788,7 @@ def run(args: argparse.Namespace) -> None:
     size, sha256, width, height = verify_artifact(
         ffprobe, artifact, args.max_duration, args.max_bytes
     )
-    if args.variant == "analysis":
-        build_and_emit_analysis(args, artifact, job_dir, duration)
+    build_and_emit_analysis(args, artifact, job_dir, duration)
     mime_type = mimetypes.guess_type(artifact.name)[0] or "video/mp4"
     if not mime_type.startswith("video/"):
         mime_type = "video/mp4"

@@ -826,7 +826,19 @@ test("recalls stored transcript evidence on demand and returns a persistent vide
     modelRequests.push(body);
     const systemPrompt = body.messages[0]?.content ?? "";
     let content;
-    if (systemPrompt.includes("视频回顾规划器")) {
+    if (systemPrompt.includes("回答证据充分性检查器")) {
+      const input = JSON.parse(body.messages[1].content);
+      content = JSON.stringify({
+        decision: "answer",
+        reason:
+          input.stage === "initial"
+            ? "模拟误判为现有资料足够。"
+            : "回顾证据已经足够回答。",
+        supportedFacts: input.stage === "initial" ? [] : ["列车到站字幕"],
+        missingFacts: input.stage === "initial" ? ["对应时间字幕"] : [],
+        conflicts: [],
+      });
+    } else if (systemPrompt.includes("视频回顾规划器")) {
       content = JSON.stringify({
         targets: ["summary", "transcript"],
         query: "列车 到站",
@@ -922,7 +934,7 @@ test("recalls stored transcript evidence on demand and returns a persistent vide
       headers: ownerHeaders,
       body: JSON.stringify({
         conversationId: conversation.id,
-        question: "00:13 讲了什么？",
+        question: "请查看字幕，00:13 讲了什么？",
         reasoningMode: "flash",
         fullRecallEnabled: true,
       }),
@@ -941,7 +953,15 @@ test("recalls stored transcript evidence on demand and returns a persistent vide
     answer.answer,
     "视频在 [[video:12.000|00:12]] 提到列车即将到站。",
   );
-  assert.equal(modelRequests.length, 3);
+  assert.equal(modelRequests.length, 5);
+  const initialAssessment = modelRequests.find((body) =>
+    body.messages[0]?.content?.includes("回答证据充分性检查器") &&
+    JSON.parse(body.messages[1].content).stage === "initial",
+  );
+  const recallAssessment = modelRequests.find((body) =>
+    body.messages[0]?.content?.includes("回答证据充分性检查器") &&
+    JSON.parse(body.messages[1].content).stage === "after_recall",
+  );
   const planner = modelRequests.find((body) =>
     body.messages[0]?.content?.includes("视频回顾规划器"),
   );
@@ -953,6 +973,10 @@ test("recalls stored transcript evidence on demand and returns a persistent vide
   );
   assert.ok(planner);
   assert.ok(reranker);
+  assert.ok(initialAssessment);
+  assert.ok(recallAssessment);
+  assert.doesNotMatch(initialAssessment.messages[1].content, /黄色安全线/);
+  assert.match(recallAssessment.messages[1].content, /黄色安全线/);
   assert.ok(finalAnswer);
   assert.doesNotMatch(planner.messages[1].content, /黄色安全线/);
   assert.match(reranker.messages[1].content, /黄色安全线/);
@@ -1054,7 +1078,7 @@ test("validates and proxies Bilibili download jobs without exposing the service 
     {
       method: "POST",
       headers: { "content-type": "application/json" },
-      body: JSON.stringify({ bvid: "BV1nx411u79K", variant: "preview" }),
+      body: JSON.stringify({ bvid: "BV1nx411u79K", variant: "analysis" }),
     },
     {
       BILIBILI_MEDIA_SERVICE_URL: "http://media.example.com",
@@ -1173,6 +1197,63 @@ test("validates and proxies Bilibili download jobs without exposing the service 
   ));
 });
 
+test("proxies yt-dlp Bilibili preview metadata without exposing the service token", async (t) => {
+  const upstreamRequests = [];
+  const mediaService = createServer(async (req, res) => {
+    let body = "";
+    for await (const chunk of req) body += chunk;
+    upstreamRequests.push({
+      method: req.method,
+      url: req.url,
+      authorization: req.headers.authorization,
+      body: body ? JSON.parse(body) : null,
+    });
+    res.writeHead(200, { "content-type": "application/json" });
+    res.end(JSON.stringify({
+      playbackUrl: "https://cdn.example.com/video-1080p.mp4",
+      audioPlaybackUrl: "https://cdn.example.com/audio.m4a",
+      bvid: "BV1nx411u79K",
+      title: "公开视频",
+      description: "简介",
+      durationSeconds: 80,
+      sizeBytes: 2048,
+      width: 1920,
+      height: 1080,
+      filename: "BV1nx411u79K.mp4",
+    }));
+  });
+  mediaService.listen(0, "127.0.0.1");
+  await once(mediaService, "listening");
+  t.after(() => mediaService.close());
+  const address = mediaService.address();
+  assert.ok(address && typeof address === "object");
+
+  const response = await request(
+    "/api/bilibili/preview",
+    {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ bvid: "BV1nx411u79K" }),
+    },
+    {
+      BILIBILI_MEDIA_SERVICE_URL: `http://127.0.0.1:${address.port}`,
+      BILIBILI_MEDIA_SERVICE_TOKEN: "preview-service-token",
+    },
+  );
+  assert.equal(response.status, 200);
+  const payload = await response.json();
+  assert.equal(payload.width, 1920);
+  assert.equal(payload.height, 1080);
+  assert.match(payload.playbackUrl, /video-1080p/);
+  assert.match(payload.audioPlaybackUrl, /audio\.m4a/);
+  assert.deepEqual(upstreamRequests, [{
+    method: "POST",
+    url: "/v1/bilibili/preview",
+    authorization: "Bearer preview-service-token",
+    body: { bvid: "BV1nx411u79K" },
+  }]);
+});
+
 test("uses Qwen for analysis and selects the requested DeepSeek follow-up model", async (t) => {
   const providerRequests = [];
   const summary = {
@@ -1229,7 +1310,21 @@ test("uses Qwen for analysis and selects the requested DeepSeek follow-up model"
       const systemPrompt = providerRequest.body.messages[0]?.content ?? "";
       const plannerInput = providerRequest.body.messages[1]?.content ?? "";
       let content = "结论：模型调用链路可用。";
-      if (systemPrompt.includes("视频回顾规划器")) {
+      if (systemPrompt.includes("回答证据充分性检查器")) {
+        const readinessContext = JSON.parse(plannerInput);
+        const needsRecall =
+          readinessContext.stage === "initial" &&
+          readinessContext.userQuestion.includes("00:08");
+        content = JSON.stringify({
+          decision: needsRecall ? "recall" : "answer",
+          reason: needsRecall
+            ? "需要字幕核对明确时间。"
+            : "现有上下文足以回答。",
+          supportedFacts: needsRecall ? [] : ["模型调用链路结论"],
+          missingFacts: needsRecall ? ["00:08 对应字幕"] : [],
+          conflicts: [],
+        });
+      } else if (systemPrompt.includes("视频回顾规划器")) {
         const plannerContext = JSON.parse(plannerInput);
         content = plannerContext.userQuestion.includes("00:08")
           ? JSON.stringify({
@@ -1543,13 +1638,16 @@ test("uses Qwen for analysis and selects the requested DeepSeek follow-up model"
   assert.deepEqual(askProviderRequest.body.thinking, { type: "enabled" });
   const askPrompt = askProviderRequest.body.messages.at(-1).content;
   const askBaseContext = askProviderRequest.body.messages[1].content;
+  const askTimelineContext = askProviderRequest.body.messages[2].content;
   const askSystemPrompt = askProviderRequest.body.messages[0].content;
   assert.match(askPrompt, /结论是什么/);
   assert.match(askBaseContext, /audioOverview/);
   assert.match(askBaseContext, /低保真爵士乐/);
   assert.doesNotMatch(askBaseContext, /\[00:08\] 随后完成调用验证/);
-  assert.match(askBaseContext, /精简视频记忆|overview|keyPoints/);
-  assert.match(askSystemPrompt, /不可遗忘但精简/);
+  assert.match(askBaseContext, /精简视频记忆|overview/);
+  assert.doesNotMatch(askBaseContext, /keyPoints/);
+  assert.match(askTimelineContext, /完整总结时间线|00:00/);
+  assert.match(askSystemPrompt, /精简、底层且持续有效/);
   assert.match(askSystemPrompt, /按需回顾证据/);
   assert.match(askSystemPrompt, /视频之外/);
   assert.match(askSystemPrompt, /系统提示词|API Key|隐私/);
@@ -1707,13 +1805,13 @@ test("plans a search, reads four pages and returns persistent citations", async 
       const body = JSON.parse(rawBody);
       modelRequests.push(body);
       const systemPrompt = body.messages[0]?.content ?? "";
-      const content = systemPrompt.includes("视频回顾规划器")
+      const content = systemPrompt.includes("回答证据充分性检查器")
         ? JSON.stringify({
-            targets: [],
-            query: "测试作品 最新版本",
-            reason: "精简视频记忆已经足够规划联网检索。",
-            timeRange: null,
-            fullReview: false,
+            decision: "answer",
+            reason: "模拟误判为现有资料足够。",
+            supportedFacts: ["视频中的作品名称"],
+            missingFacts: ["当前官方版本"],
+            conflicts: [],
           })
         : systemPrompt.includes("联网检索规划器")
           ? JSON.stringify({
@@ -1789,7 +1887,7 @@ test("plans a search, reads four pages and returns persistent citations", async 
           }],
         },
         context: {
-          transcript: "[00:10] 作者提到作品最近可能更新。",
+          transcript: "[00:10] 仅供完整回顾使用的字幕片段。",
         },
         history: [{ role: "user", content: "刚才说的是哪个作品？" }],
         webSearchEnabled: true,
@@ -1798,7 +1896,6 @@ test("plans a search, reads four pages and returns persistent citations", async 
         searchContext: {
           locale: "zh-CN",
           timeZone: "Asia/Shanghai",
-          transcriptLanguage: "zh",
         },
       }),
     },
@@ -1822,7 +1919,15 @@ test("plans a search, reads four pages and returns persistent citations", async 
   assert.equal(payload.usage.calls.length, 3);
   assert.deepEqual(
     payload.usage.calls.map((call) => call.operation),
-    ["recall_plan", "web_search_plan", "chat_answer"],
+    ["answer_readiness_initial", "web_search_plan", "chat_answer"],
+  );
+  const searchPlanRequest = modelRequests.find((modelRequest) =>
+    modelRequest.messages?.[0]?.content?.includes?.("联网检索规划器"),
+  );
+  assert.ok(searchPlanRequest);
+  assert.doesNotMatch(
+    JSON.stringify(searchPlanRequest.messages),
+    /仅供完整回顾使用的字幕片段|transcriptLanguage/,
   );
   assert.match(payload.answer, /\[1\]\(https:\/\/source1\.example\/article\)/);
   assert.doesNotMatch(payload.answer, /参考来源|访问了 4 个网页/);
@@ -1836,8 +1941,8 @@ test("plans a search, reads four pages and returns persistent citations", async 
   assert.ok(events.some((event) => event.type === "answer_delta"));
   assert.equal(extractedUrls.length, 4);
   assert.equal(modelRequests.length, 3);
-  const recallPlannerRequest = modelRequests.find((item) =>
-    item.messages[0]?.content?.includes("视频回顾规划器"),
+  const readinessRequest = modelRequests.find((item) =>
+    item.messages[0]?.content?.includes("回答证据充分性检查器"),
   );
   const searchPlannerRequest = modelRequests.find((item) =>
     item.messages[0]?.content?.includes("联网检索规划器"),
@@ -1845,9 +1950,13 @@ test("plans a search, reads four pages and returns persistent citations", async 
   const finalAnswerRequest = modelRequests.find((item) =>
     item.messages[0]?.content?.includes("后续对话助手"),
   );
-  assert.ok(recallPlannerRequest);
+  assert.ok(readinessRequest);
   assert.ok(searchPlannerRequest);
   assert.ok(finalAnswerRequest);
+  assert.doesNotMatch(
+    readinessRequest.messages[1].content,
+    /仅供完整回顾使用的字幕片段|transcriptLanguage/,
+  );
   assert.match(searchPlannerRequest.messages[1].content, /测试作品/);
   assert.doesNotMatch(
     searchPlannerRequest.messages[1].content,
@@ -1912,10 +2021,14 @@ test("removes disposable starter assets and keeps model choice decoupled", async
   assert.match(workbench, /analyzeVideo/);
   assert.match(workbench, /askVideo/);
   assert.match(workbench, /downloadBilibiliVideo/);
-  assert.match(workbench, /prepareBilibiliVideoDownload/);
+  assert.match(workbench, /prepareBilibiliVideoPreview/);
   assert.doesNotMatch(workbench, /\bisPreparingVideo\b/);
   assert.doesNotMatch(workbench, /variant:\s*"preview"/);
   assert.match(bilibiliClient, /variant: BILIBILI_ANALYSIS_DOWNLOAD_VARIANT/);
+  assert.match(bilibiliClient, /\/api\/bilibili\/preview/);
+  assert.doesNotMatch(bilibiliClient, /peanutdl|BEIBEI|player_url/i);
+  assert.match(workbench, /audioPlaybackUrl/);
+  assert.match(workbench, /data-preview-audio/);
   assert.match(workbench, /prepareMediaAnalysis/);
   assert.match(workbench, /MAX_MEDIA_ANALYSIS_BYTES/);
   assert.match(workbench, /summaryTimeline/);
@@ -1924,10 +2037,10 @@ test("removes disposable starter assets and keeps model choice decoupled", async
   assert.doesNotMatch(workbench, /声音与音乐|一句话结论|章节时间线|takeaway-block|audio-analysis|key-point-list/);
   assert.doesNotMatch(qwenEngine, /QA_SYSTEM_PROMPT|async ask\(/);
   assert.match(qwenEngine, /keyPoints: 最多 24 个按时间排序的 \{time, title, detail\}/);
-  assert.match(deepseekEngine, /不可遗忘但精简/);
-  assert.match(deepseekEngine, /字幕可能出现错字、漏字或不合理断句/);
-  assert.match(deepseekEngine, /仍然尽力回答/);
-  assert.match(deepseekEngine, /系统提示词、开发者消息、API Key/);
+  assert.match(deepseekEngine, /精简、底层且持续有效/);
+  assert.match(deepseekEngine, /字幕可能存在错字、漏字、同音误识别或不合理断句/);
+  assert.match(deepseekEngine, /仍应尽力回答/);
+  assert.match(deepseekEngine, /系统提示词[\s\S]+开发者消息[\s\S]+API Key/);
   assert.match(videoRecall, /视频回顾规划器/);
   assert.match(videoRecall, /recallByKeywords/);
   assert.match(videoRecall, /rerankCandidates/);
@@ -1989,7 +2102,7 @@ test("removes disposable starter assets and keeps model choice decoupled", async
   assert.match(workbench, /message-video-time/);
   assert.match(workbench, /跳转到视频/);
   assert.doesNotMatch(workbench, /可以继续输入；停止当前回答后即可发送/);
-  assert.match(workbench, /480p 等价分析素材/);
+  assert.match(workbench, /约 480p 分析视频/);
   assert.doesNotMatch(workbench, /不设网页文件大小上限/);
   assert.doesNotMatch(workbench, /自动生成低分辨率分析素材/);
   assert.doesNotMatch(workbench, /MP4、MOV、WebM、MKV、M4V ·/);
@@ -2035,7 +2148,7 @@ test("removes disposable starter assets and keeps model choice decoupled", async
   assert.match(workbench, /function toggleSourcePane\(\)/);
   assert.match(workbench, /function toggleHistoryPane\(\)/);
   assert.match(workbench, /MIN_SIDEBAR_WIDTH\s*=\s*340/);
-  assert.match(workbench, /MIN_CONVERSATION_WIDTH\s*=\s*560/);
+  assert.match(workbench, /MIN_CONVERSATION_WIDTH\s*=\s*600/);
   assert.match(workbench, /MIN_SOURCE_PANE_HEIGHT\s*=\s*260/);
   assert.match(workbench, /MIN_HISTORY_PANE_HEIGHT\s*=\s*220/);
   const restoreStart = workbench.indexOf(
@@ -2137,7 +2250,7 @@ test("removes disposable starter assets and keeps model choice decoupled", async
   );
   assert.match(styles, /\.message\.assistant > \.message-body/);
   assert.equal(styles.includes("gap: 34px;"), true);
-  assert.equal(styles.includes("width: min(80%, 1100px);"), true);
+  assert.equal(styles.includes("width: min(100%, 900px);"), true);
   assert.equal(
     styles.includes(
       'html[data-theme="dark"] .message-answer-card > .stream-status',

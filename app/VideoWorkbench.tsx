@@ -35,10 +35,9 @@ import {
 import {
   downloadBilibiliVideo,
   extractBilibiliTranscript,
-  prepareBilibiliVideoDownload,
+  prepareBilibiliVideoPreview,
   releaseBilibiliAnalysis,
-  type BilibiliDownloadResult,
-  type BilibiliPreparedDownloadResult,
+  type BilibiliPreviewResult,
 } from "@/lib/client/bilibili-client";
 import {
   extractMediaTranscript,
@@ -92,6 +91,7 @@ interface SelectedVideo {
 interface VideoPreview {
   kind: "bilibili" | "local" | "remote";
   playbackUrl: string;
+  audioPlaybackUrl?: string;
   filename: string;
   title?: string;
   description?: string;
@@ -561,7 +561,7 @@ function WebSourcesPanel({
 }
 
 function bilibiliPreviewResolutionLabel(
-  result: Pick<BilibiliPreparedDownloadResult, "width" | "height">,
+  result: Pick<BilibiliPreviewResult, "width" | "height">,
 ) {
   return result.width && result.height ? `${result.width}x${result.height}` : undefined;
 }
@@ -1428,6 +1428,34 @@ export default function VideoWorkbench() {
     setVideoPreview(null);
   }
 
+  function syncPreviewAudio(
+    video: HTMLVideoElement,
+    options: { forceTime?: boolean; play?: boolean } = {},
+  ) {
+    const audio = video.parentElement?.querySelector<HTMLAudioElement>(
+      "audio[data-preview-audio]",
+    );
+    if (!audio || !videoPreview?.audioPlaybackUrl) return;
+    audio.muted = video.muted;
+    audio.volume = video.volume;
+    audio.playbackRate = video.playbackRate;
+    if (
+      Number.isFinite(video.currentTime) &&
+      (options.forceTime || Math.abs(audio.currentTime - video.currentTime) > 0.25)
+    ) {
+      try {
+        audio.currentTime = video.currentTime;
+      } catch {
+        // The audio metadata may not be ready yet; the next media event resyncs it.
+      }
+    }
+    if (options.play) {
+      void audio.play().catch(() => undefined);
+    } else if (options.play === false) {
+      audio.pause();
+    }
+  }
+
   function showRemoteVideo(url: string) {
     setVideoPreview({
       kind: "remote",
@@ -1456,16 +1484,17 @@ export default function VideoWorkbench() {
   }
 
   function showBilibiliVideo(
-    result: BilibiliPreparedDownloadResult,
+    result: BilibiliPreviewResult,
     fallbackDescription?: string,
   ) {
     setVideoPreview({
       kind: "bilibili",
       playbackUrl: result.playbackUrl,
+      audioPlaybackUrl: result.audioPlaybackUrl,
       filename: result.filename || "bilibili-video.mp4",
       title: result.title,
       description: result.description ?? fallbackDescription,
-      sizeLabel: formatFileSize(result.sizeBytes),
+      sizeLabel: result.sizeBytes > 0 ? formatFileSize(result.sizeBytes) : undefined,
       durationLabel: formatDuration(result.durationSeconds),
       durationSeconds: result.durationSeconds,
       resolutionLabel: bilibiliPreviewResolutionLabel(result),
@@ -1599,7 +1628,7 @@ export default function VideoWorkbench() {
       throw new Error("没有可获取的 BV 号。");
     }
 
-    const prepared = await prepareBilibiliVideoDownload(source.bvid, {
+    const prepared = await prepareBilibiliVideoPreview(source.bvid, {
       signal: controller.signal,
       onProgress: ({ stage, progress }) => {
         if (runTokenRef.current !== runToken) return;
@@ -1628,7 +1657,7 @@ export default function VideoWorkbench() {
     const controller = new AbortController();
     fetchVideoAbortRef.current = controller;
     setIsFetchingVideo(true);
-    setProcessingStages(["校验 B 站视频地址", "准备最高画质浏览器预览"]);
+    setProcessingStages(["校验 B 站视频地址", "解析最高 1080p CDN 预览"]);
     setStageIndex(0);
     setStageProgress(0.15);
     showNotice(
@@ -1757,7 +1786,7 @@ export default function VideoWorkbench() {
       return;
     }
 
-    const stages = ["校验 B 站视频地址", "准备最高画质浏览器预览"];
+    const stages = ["校验 B 站视频地址", "解析最高 1080p CDN 预览"];
     setIsFetchingVideo(true);
     if (!preservesConversation) setPhase("processing");
     setProcessingStages(stages);
@@ -2477,9 +2506,6 @@ export default function VideoWorkbench() {
                   locale: navigator.language,
                   timeZone:
                     Intl.DateTimeFormat().resolvedOptions().timeZone,
-                  ...(transcript?.language
-                    ? { transcriptLanguage: transcript.language }
-                    : {}),
                 },
               }
             : {}),
@@ -2922,6 +2948,33 @@ export default function VideoWorkbench() {
           playsInline
           preload="metadata"
           tabIndex={-1}
+          onPlay={(event) =>
+            syncPreviewAudio(event.currentTarget, { forceTime: true, play: true })
+          }
+          onPlaying={(event) =>
+            syncPreviewAudio(event.currentTarget, { forceTime: true, play: true })
+          }
+          onPause={(event) =>
+            syncPreviewAudio(event.currentTarget, { play: false })
+          }
+          onWaiting={(event) =>
+            syncPreviewAudio(event.currentTarget, { play: false })
+          }
+          onSeeking={(event) =>
+            syncPreviewAudio(event.currentTarget, { forceTime: true, play: false })
+          }
+          onSeeked={(event) =>
+            syncPreviewAudio(event.currentTarget, {
+              forceTime: true,
+              play: !event.currentTarget.paused,
+            })
+          }
+          onRateChange={(event) => syncPreviewAudio(event.currentTarget)}
+          onVolumeChange={(event) => syncPreviewAudio(event.currentTarget)}
+          onTimeUpdate={(event) => syncPreviewAudio(event.currentTarget)}
+          onEnded={(event) =>
+            syncPreviewAudio(event.currentTarget, { play: false })
+          }
           onLoadedMetadata={(event) => {
             const duration = event.currentTarget.duration;
             if (
@@ -2950,10 +3003,19 @@ export default function VideoWorkbench() {
                 void event.currentTarget.play().catch(() => undefined);
               }
             }
+            syncPreviewAudio(event.currentTarget, { forceTime: true });
           }}
         >
           当前浏览器无法播放这个视频。
         </video>
+        {videoPreview.audioPlaybackUrl ? (
+          <audio
+            data-preview-audio
+            src={videoPreview.audioPlaybackUrl}
+            preload="metadata"
+            aria-hidden="true"
+          />
+        ) : null}
       </div>
     );
 

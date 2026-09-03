@@ -12,6 +12,8 @@ type InlineVideoToken =
 const VIDEO_TIME_MARKER =
   /\[\[\s*video\s*:\s*(?:(\d+(?:\.\d+)?)\s*\|\s*)?((?:\d{2}:)?\d{2}:\d{2})\s*\]\]/gi;
 const VIDEO_TIME_HREF = /^framenote-video:(\d+(?:\.\d+)?)$/;
+const VIDEO_TIME_EXTERNAL_LINK =
+  /(\[\[\s*video\s*:[^\]\r\n]+\]\])\s*\(\s*<?https?:\/\/[^)\s>]+>?(?:\s+["'][^"'\r\n]*["'])?\s*\)/gi;
 
 export function prepareMarkdownContent(content: string) {
   const lines = content.trim().replace(/\r\n?/g, "\n").split("\n");
@@ -56,7 +58,8 @@ export function parseVideoTimeHref(href: string | undefined) {
 }
 
 function videoTimesToMarkdown(value: string) {
-  return tokenizeVideoTimes(value)
+  const sanitizedValue = value.replace(VIDEO_TIME_EXTERNAL_LINK, "$1");
+  return tokenizeVideoTimes(sanitizedValue)
     .map((token) => {
       if (token.kind === "text") return token.value;
       if (token.kind === "time") {

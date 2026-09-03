@@ -2,12 +2,11 @@
 
 这是 FrameNote 的独立媒体服务，统一处理本地上传、HTTPS 视频直链分析和 B 站公开 UGC。所有 `analysis` 任务都会先生成最长边不超过 854px 的 H.264/AAC 素材，再按视频时长选择“直接视频”或“最多 64 张关键帧 + 独立音轨”。Qwen 完成后，网页可以按设置异步启动 FunASR；Nano 自动识别或按单一语言约束识别中、日、英文，CT-Punc 为中英文重新恢复整段标点，最终只按句号、问号和感叹号合并为整句字幕。
 
-B 站 `preview` 任务准备默认最高兼容画质，网页通过 HTTP Range 内联播放 URL 边播放边缓存，并可使用附件 URL 手动下载。B 站任务只接收严格的 12 位 BVID，不读取 Cookie，不登录 B 站，也不尝试访问会员、私有、付费或地区受限内容。HTTPS 视频直链仍由网页下载后作为文件上传，本服务不会为视频分析直接抓取该地址。联网搜索另有一个仅供网站服务端调用、需要同一 Token 的正文提取接口。
+B 站预览已与媒体分析任务分离：本服务使用 `yt-dlp` 的仅解析模式取得最高 1080p 的 CDN 视频轨和音频轨，并通过带 Referer、User-Agent 和 Range 的短期内存代理提供给浏览器，但不下载或保存预览媒体；B 站分析任务仍只负责生成约 480p 的 AI 分析素材。接口只接收严格的 12 位 BVID，不读取 Cookie，不登录 B 站，也不尝试访问会员、私有、付费或地区受限内容。HTTPS 视频直链仍由网页下载后作为文件上传，本服务不会为视频分析直接抓取该地址。联网搜索另有一个仅供网站服务端调用、需要同一 Token 的正文提取接口。
 
 ## 固定限制
 
 - 单视频、禁止播放列表；本地与 HTTPS 分析上传最大 500 MB；
-- 手动下载选择默认最高兼容画质，默认最大 1 GB；
 - 分析素材最长边不超过 854px（约 480p），最大 500 MB；
 - 最终媒体固定为 MP4 容器、H.264 视频与 AAC 音频；
 - 最长 60 分钟；
@@ -15,7 +14,8 @@ B 站 `preview` 任务准备默认最高兼容画质，网页通过 HTTP Range �
 - 最多 20 个等待中的任务；
 - 默认任务超时 20 分钟（网页总等待上限为 22 分钟）；
 - 下载文件默认保留 1 小时；
-- `preview` 播放/下载 URL 默认随文件保留 1 小时，`analysis` 签名 URL 默认有效 10 分钟。
+- 分析素材默认保留 1 小时，签名 URL 默认有效 10 分钟。
+- B 站预览代理会话只保存在内存中，默认最长 6 小时；媒体服务重启后立即失效，网页会按保存的 BVID 重新解析。
 - 关键帧固定锚点间隔为 `max(1 秒, 视频时长 / 50)`；每个锚点及 AdaptiveDetector 场景点前后取 5 个候选，按清晰度、曝光、对比度、信息熵与独特性评分，并用 pHash 去重。
 - 网页正文抓取只允许公开 HTTP(S) 地址和 80/443 端口，逐次校验重定向与 DNS 结果；HTML 最大 5 MB，PDF 最大 20 MB。
 
@@ -74,10 +74,9 @@ docker run --rm -p 8788:8788 `
 | `FRAMENOTE_MEDIA_CORS_ORIGINS` | `http://localhost:3000,http://127.0.0.1:3000` | 精确 Origin 的逗号分隔列表；不允许 `*`，生产环境应显式覆盖 |
 | `FRAMENOTE_MEDIA_STATE_DIR` | `media_service/data` | 任务元数据及临时视频目录；容器默认 `/data` |
 | `FRAMENOTE_MEDIA_MAX_BYTES` | `524288000`（500 MB） | AI 分析素材上限，可在 1–500 MB 范围覆盖 |
-| `FRAMENOTE_MEDIA_DOWNLOAD_MAX_BYTES` | `1073741824`（1 GB） | 媒体服务的 preview 临时成品安全上限，可在 1 MB–2 GB 范围覆盖；网页不再设置整文件下载上限 |
 | `FRAMENOTE_MEDIA_JOB_TIMEOUT_SECONDS` | `1200` | 单任务执行超时，范围 60–7200 秒；网页额外预留排队与传输时间 |
 | `FRAMENOTE_MEDIA_ARTIFACT_TTL_SECONDS` | `3600` | 成品保留时间，范围 60–86400 秒 |
-| `FRAMENOTE_MEDIA_SIGNED_URL_TTL_SECONDS` | `600` | AI 分析签名 URL 有效期，范围 30–3600 秒；预览 URL 跟随成品保留期 |
+| `FRAMENOTE_MEDIA_SIGNED_URL_TTL_SECONDS` | `600` | AI 分析签名 URL 有效期，范围 30–3600 秒 |
 | `FRAMENOTE_MEDIA_TERMINAL_RETENTION_SECONDS` | `3600` | 失败、取消及过期记录的保留时间 |
 | `FRAMENOTE_MEDIA_CLEANUP_INTERVAL_SECONDS` | `60` | 过期目录扫描间隔 |
 | `FRAMENOTE_MEDIA_PROXY` | 空 | 可选的 yt-dlp HTTP/HTTPS/SOCKS 代理，例如 `http://127.0.0.1:7890`；不自动继承系统代理 |
@@ -137,6 +136,19 @@ Authorization: Bearer <FRAMENOTE_MEDIA_API_TOKEN>
 
 ### 创建 B 站任务
 
+解析 B 站浏览器预览：
+
+```http
+POST /v1/bilibili/preview
+Content-Type: application/json
+
+{"bvid":"BV1xx411c7mD"}
+```
+
+该接口调用 `yt-dlp` 但不下载媒体，优先解析不超过 1080p 的 AVC 视频轨以及最高可用 M4A 音频轨。B 站通常采用 DASH，因此网页播放器仍负责同步两条轨道；返回的 `playbackUrl` 和 `audioPlaybackUrl` 是媒体服务生成的随机短期代理地址，不会向浏览器暴露原始 CDN URL。代理只转发浏览器的单段 `Range`，并使用 yt-dlp 提供的请求头；缺少 Referer 时自动使用规范 B 站视频页面。没有 1080p 访问权限时自动回退到最高可用画质。CDN 地址和内存会话都会过期，恢复历史对话时应使用保存的 BVID 重新解析。
+
+创建 AI 分析任务：
+
 ```http
 POST /v1/bilibili/jobs
 Content-Type: application/json
@@ -156,7 +168,7 @@ Content-Type: application/json
 }
 ```
 
-请求体允许 `bvid`、`variant` 和 `directSummaryMaxSeconds`；`variant` 为 `preview`（手动下载最高兼容画质）或 `analysis`（AI 总结约 480p 素材），省略时默认为 `preview`。直接总结阈值只适用于 `analysis`，范围为 0–900 秒，0 表示关闭直接视频路径。
+请求体允许 `bvid`、`variant` 和 `directSummaryMaxSeconds`；`variant` 只支持 `analysis`（AI 总结约 480p 素材），省略时同样按 `analysis` 处理。直接总结阈值范围为 0–900 秒，0 表示关闭直接视频路径。
 
 ### 查询 B 站任务
 
@@ -216,9 +228,9 @@ GET /health
 
 ## 实现原理
 
-1. API 对文件体积、来源类型、BVID、鉴权和队列容量做入口校验。B 站只拼接固定的 `https://www.bilibili.com/video/{BVID}`；HTTPS 直链则由浏览器下载后作为普通文件上传，媒体服务不会成为任意 URL 代理。
+1. API 对文件体积、来源类型、BVID、鉴权和队列容量做入口校验。预览接口只将已校验 BVID 拼接为固定 B 站页面 URL，再由 `yt-dlp` 解析最高 1080p 的 CDN 轨道；CDN 地址只进入服务端随机内存会话，播放代理不接受客户端提交的上游 URL 或 Referer，因此不会成为任意 URL 代理。HTTPS 直链仍由浏览器下载后作为普通文件上传。
 2. 两个异步消费者各自以参数数组（不经过 shell）和 `-I -u -X utf8=1` 启动隔离的 `worker.py` 子进程。worker 使用 UTF-8 JSON Lines 输出进度与错误，主进程负责状态机、超时和取消。
-3. B 站 worker 先用 `yt-dlp` 只解析元数据，拒绝直播、未知时长、超过 60 分钟或预计超过对应任务大小上限的内容；`preview` 选择最高兼容画质，B 站 `analysis` 的每个 fallback 都硬性要求最长边不超过 854px。上传文件先用 `ffprobe` 校验，再由 FFmpeg 转码为同样的 H.264/AAC 低分辨率分析素材。
+3. B 站 worker 先用 `yt-dlp` 只解析元数据，拒绝直播、未知时长、超过 60 分钟或预计超过分析任务大小上限的内容；每个格式 fallback 都硬性要求最长边不超过 854px。上传文件先用 `ffprobe` 校验，再由 FFmpeg 转码为同样的 H.264/AAC 低分辨率分析素材。
 4. B 站通常使用 DASH，把画面与声音作为两个流返回。`yt-dlp` 下载后调用 FFmpeg 合并/重封装为 MP4，过程中持续检查累计字节数；重封装不负责把不兼容编码转码为 H.264/AAC。
 5. 下载结束后用 `ffprobe` 再次核对实际时长、文件大小、MP4 容器以及全部音视频轨的 H.264/AAC 白名单，并计算 SHA-256。`analysis` 任务随后根据阈值决定：短视频立即就绪；长视频再运行 AdaptiveDetector、候选帧质量评分、pHash 去重和音轨提取。
 6. Qwen 总结完成后，单独的 transcript 请求才在后台执行 FunASR，并原子更新分析清单；字幕暂不作为 Qwen 总结输入。
