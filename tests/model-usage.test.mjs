@@ -4,7 +4,7 @@ import {
   conversationUsageRecord,
   normalizeModelCallUsage,
   parseConversationUsageRecord,
-} from "../lib/model-usage.ts";
+} from "../src/shared/model-usage.ts";
 
 test("prices Qwen multimodal input from the provider usage breakdown", () => {
   const usage = normalizeModelCallUsage(

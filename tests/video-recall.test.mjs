@@ -3,7 +3,7 @@ import test from "node:test";
 import { createServer as createViteServer } from "vite";
 import {
   applyVerifiedVideoTimeReferences,
-} from "../lib/server/video-recall-policy.ts";
+} from "../src/main/model/video-recall-policy.ts";
 
 const summary = {
   title: "四个方法",
@@ -83,7 +83,7 @@ test("compact memory keeps the complete overview and complete timeline", async (
   });
   t.after(() => vite.close());
   const { buildVideoMemory } = await vite.ssrLoadModule(
-    `/lib/server/video-recall.ts?memory=${Date.now()}`,
+    `/src/main/model/video-recall.ts?memory=${Date.now()}`,
   );
   const overview = "完整内容概览。".repeat(500);
   const memory = buildVideoMemory(

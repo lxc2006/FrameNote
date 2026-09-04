@@ -14,9 +14,7 @@
 # testing
 /coverage
 
-# next.js
-/.next/
-/.vinext/
+# Electron build output
 /out/
 
 # misc
@@ -33,15 +31,17 @@ yarn-error.log*
 .env*
 !.env.example
 
-# vercel
-.vercel
-
 # typescript
-next-env.d.ts
 *.tsbuildinfo
-/dist/
-/.wrangler/
 /outputs/
 /work/
 /.venv/
 /media_service/work/
+/media_service/.venv-core/
+/media_service/.venv-subtitles/
+/media_service/build/
+/media_service/build-subtitles/
+/media_service/dist/
+/release/
+计划.md
+日志.md

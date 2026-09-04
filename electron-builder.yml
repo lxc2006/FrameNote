@@ -1,0 +1,45 @@
+appId: com.framenote.desktop
+productName: FrameNote
+executableName: FrameNote
+asar: true
+compression: store
+electronDist: node_modules/electron/dist
+directories:
+  output: release
+  buildResources: build
+files:
+  - out/**/*
+  - package.json
+  - "!**/.env*"
+extraResources:
+  - from: media_service/dist/framenote-media-core
+    to: media-sidecar/framenote-media-core
+    filter:
+      - "**/*"
+electronLanguages:
+  - zh-CN
+  - en-US
+win:
+  target:
+    - target: nsis
+      arch:
+        - x64
+  verifyUpdateCodeSignature: false
+  requestedExecutionLevel: asInvoker
+  artifactName: FrameNote-Setup-${version}-${arch}.${ext}
+nsis:
+  oneClick: false
+  perMachine: false
+  allowElevation: true
+  allowToChangeInstallationDirectory: true
+  createDesktopShortcut: always
+  createStartMenuShortcut: true
+  shortcutName: FrameNote
+  uninstallDisplayName: FrameNote
+  deleteAppDataOnUninstall: false
+  include: build/installer.nsh
+publish:
+  provider: github
+  owner: lxc2006
+  repo: FrameNote
+  releaseType: release

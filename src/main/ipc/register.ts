@@ -1,0 +1,350 @@
+import { app, ipcMain, type IpcMainInvokeEvent } from "electron";
+import type { AnalyzeVideoResponse, AskVideoResponse } from "../../shared/model-types";
+import { ConversationService } from "../services/conversation-service";
+import {
+  analyzeVideoService,
+  askVideoService,
+} from "../services/model-service";
+import { conversationErrorDetails } from "../database/conversation-repository";
+import {
+  modelErrorDetails,
+  parseAnalyzeVideoRequest,
+  parseAskVideoRequest,
+} from "../model/model-validation";
+import type { UserPreferences } from "../../shared/preference-types";
+import {
+  DESKTOP_CHANNELS,
+  type DesktopIpcError,
+  type DesktopIpcResult,
+  type DesktopModelEvent,
+} from "../../shared/ipc-contract";
+import type { DesktopDatabase } from "../database/database";
+import type { MediaSidecarManager } from "../media/media-sidecar";
+import type { SubtitleExtensionManager } from "../extensions/subtitle-extension";
+import type { CredentialStore } from "../security/credential-store";
+import type { ModelCredentialUpdate } from "../../shared/credential-types";
+
+const REQUEST_ID_PATTERN =
+  /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
+
+const activeModelRequests = new Map<string, AbortController>();
+
+function success<T>(value: T): DesktopIpcResult<T> {
+  return { ok: true, value };
+}
+
+function failure<T>(error: DesktopIpcError): DesktopIpcResult<T> {
+  return { ok: false, error };
+}
+
+function requestKey(event: IpcMainInvokeEvent, requestId: string) {
+  if (!REQUEST_ID_PATTERN.test(requestId)) {
+    throw new TypeError("桌面请求标识无效。");
+  }
+  return `${event.sender.id}:${requestId.toLowerCase()}`;
+}
+
+async function runModelRequest<T>(
+  event: IpcMainInvokeEvent,
+  requestId: string,
+  provider: "qwen" | "deepseek",
+  work: (signal: AbortSignal) => Promise<T>,
+): Promise<DesktopIpcResult<T>> {
+  let key: string;
+  try {
+    key = requestKey(event, requestId);
+  } catch (error) {
+    return failure({
+      code: "INVALID_DESKTOP_REQUEST",
+      message: error instanceof Error ? error.message : "桌面请求无效。",
+      retryable: false,
+    });
+  }
+  if (activeModelRequests.has(key)) {
+    return failure({
+      code: "DUPLICATE_DESKTOP_REQUEST",
+      message: "这个桌面模型请求正在执行。",
+      retryable: false,
+    });
+  }
+
+  const controller = new AbortController();
+  const abortWhenRendererCloses = () => controller.abort();
+  activeModelRequests.set(key, controller);
+  event.sender.once("destroyed", abortWhenRendererCloses);
+  try {
+    return success(await work(controller.signal));
+  } catch (error) {
+    if (controller.signal.aborted) {
+      return failure({
+        code: "MODEL_REQUEST_ABORTED",
+        message: "模型请求已取消。",
+        retryable: true,
+      });
+    }
+    const details = modelErrorDetails(error, provider);
+    return failure({
+      code: details.code,
+      message: details.message,
+      retryable: details.retryable,
+    });
+  } finally {
+    event.sender.removeListener("destroyed", abortWhenRendererCloses);
+    activeModelRequests.delete(key);
+  }
+}
+
+async function runConversationRequest<T>(
+  work: () => Promise<T>,
+): Promise<DesktopIpcResult<T>> {
+  try {
+    return success(await work());
+  } catch (error) {
+    const details = conversationErrorDetails(error);
+    return failure({
+      code: details.code,
+      message: details.message,
+      retryable: details.retryable,
+    });
+  }
+}
+
+function runSettingsRequest<T>(work: () => T): DesktopIpcResult<T> {
+  try {
+    return success(work());
+  } catch (error) {
+    console.error("Unexpected desktop settings error", error);
+    return failure({
+      code: "DESKTOP_SETTINGS_ERROR",
+      message: "无法读写桌面设置。",
+      retryable: true,
+    });
+  }
+}
+
+export function registerDesktopIpc(
+  database: DesktopDatabase,
+  conversations: ConversationService,
+  mediaSidecar: MediaSidecarManager,
+  subtitleExtension: SubtitleExtensionManager,
+  credentialStore: CredentialStore,
+) {
+  ipcMain.handle(DESKTOP_CHANNELS.getRuntimeInfo, () => ({
+    appVersion: app.getVersion(),
+    isPackaged: app.isPackaged,
+    platform: process.platform,
+  }));
+
+  ipcMain.handle(DESKTOP_CHANNELS.mediaGetConnection, () => {
+    try {
+      return success(mediaSidecar.getConnection());
+    } catch (error) {
+      return failure({
+        code: "MEDIA_SIDECAR_UNAVAILABLE",
+        message:
+          error instanceof Error
+            ? error.message
+            : "媒体核心 sidecar 尚未就绪。",
+        retryable: true,
+      });
+    }
+  });
+
+  ipcMain.handle(
+    DESKTOP_CHANNELS.modelAnalyze,
+    (event, requestId: string, value: unknown) =>
+      runModelRequest<AnalyzeVideoResponse>(
+        event,
+        requestId,
+        "qwen",
+        (signal) => analyzeVideoService(parseAnalyzeVideoRequest(value), signal),
+      ),
+  );
+
+  ipcMain.handle(
+    DESKTOP_CHANNELS.modelAsk,
+    (event, requestId: string, value: unknown) =>
+      runModelRequest<AskVideoResponse>(
+        event,
+        requestId,
+        "deepseek",
+        (signal) =>
+          askVideoService(parseAskVideoRequest(value), {
+            signal,
+            getConversation: (conversationId) =>
+              conversations.get(conversationId),
+            locale: app.getLocale() || "zh-CN",
+            region: "CN",
+            timeZone:
+              Intl.DateTimeFormat().resolvedOptions().timeZone ||
+              "Asia/Shanghai",
+            onEvent: (modelEvent) => {
+              if (event.sender.isDestroyed()) return;
+              const message: DesktopModelEvent = {
+                requestId,
+                event: modelEvent,
+              };
+              event.sender.send(DESKTOP_CHANNELS.modelEvent, message);
+            },
+          }),
+      ),
+  );
+
+  ipcMain.on(
+    DESKTOP_CHANNELS.modelCancel,
+    (event, requestId: string) => {
+      try {
+        activeModelRequests.get(requestKey(event, requestId))?.abort();
+      } catch {
+        // Invalid cancellation identifiers cannot affect active requests.
+      }
+    },
+  );
+
+  ipcMain.handle(DESKTOP_CHANNELS.conversationsList, () =>
+    runConversationRequest(() => conversations.list()),
+  );
+  ipcMain.handle(
+    DESKTOP_CHANNELS.conversationsCreate,
+    (_event, value: unknown) =>
+      runConversationRequest(() => conversations.create(value)),
+  );
+  ipcMain.handle(
+    DESKTOP_CHANNELS.conversationsGet,
+    (_event, conversationId: string) =>
+      runConversationRequest(() => conversations.get(conversationId)),
+  );
+  ipcMain.handle(
+    DESKTOP_CHANNELS.conversationsRename,
+    (_event, conversationId: string, title: string) =>
+      runConversationRequest(() => conversations.rename(conversationId, { title })),
+  );
+  ipcMain.handle(
+    DESKTOP_CHANNELS.conversationsUpdateTranscript,
+    (_event, conversationId: string, transcript: unknown) =>
+      runConversationRequest(() =>
+        conversations.updateTranscript(conversationId, { transcript }),
+      ),
+  );
+  ipcMain.handle(
+    DESKTOP_CHANNELS.conversationsDelete,
+    (_event, conversationId: string) =>
+      runConversationRequest(() => conversations.delete(conversationId)),
+  );
+  ipcMain.handle(
+    DESKTOP_CHANNELS.conversationsAppendMessages,
+    (_event, conversationId: string, messages: unknown) =>
+      runConversationRequest(() =>
+        conversations.appendMessages(conversationId, { messages }),
+      ),
+  );
+  ipcMain.handle(
+    DESKTOP_CHANNELS.conversationsTruncateMessages,
+    (_event, conversationId: string, fromMessageId: string) =>
+      runConversationRequest(() =>
+        conversations.truncateMessages(conversationId, { fromMessageId }),
+      ),
+  );
+
+  ipcMain.handle(DESKTOP_CHANNELS.settingsGetUserPreferences, () =>
+    runSettingsRequest(() => database.settings.getUserPreferences()),
+  );
+  ipcMain.handle(
+    DESKTOP_CHANNELS.settingsSetUserPreferences,
+    (_event, preferences: UserPreferences) =>
+    runSettingsRequest(() => database.settings.setUserPreferences(preferences)),
+  );
+  ipcMain.handle(DESKTOP_CHANNELS.credentialsGetStatus, () =>
+    runSettingsRequest(() => credentialStore.getStatus()),
+  );
+  ipcMain.handle(
+    DESKTOP_CHANNELS.credentialsUpdate,
+    async (_event, update: ModelCredentialUpdate) => {
+      try {
+        return success(await credentialStore.update(update));
+      } catch (error) {
+        console.error("Unable to update encrypted API credentials", error);
+        return failure({
+          code: "CREDENTIAL_UPDATE_ERROR",
+          message: error instanceof Error ? error.message : "无法保存 API Key。",
+          retryable: true,
+        });
+      }
+    },
+  );
+
+  const subtitleFailure = (error: unknown) =>
+    failure({
+      code: "SUBTITLE_EXTENSION_ERROR",
+      message:
+        error instanceof Error ? error.message : "字幕扩展操作失败。",
+      retryable: true,
+    });
+  const notifySubtitleStatus = (
+    event: IpcMainInvokeEvent,
+    status: ReturnType<SubtitleExtensionManager["getStatus"]>,
+  ) => {
+    if (!event.sender.isDestroyed()) {
+      event.sender.send(DESKTOP_CHANNELS.subtitlesStatus, status);
+    }
+  };
+
+  ipcMain.handle(DESKTOP_CHANNELS.subtitlesGetStatus, () =>
+    success(subtitleExtension.getStatus()),
+  );
+  ipcMain.handle(
+    DESKTOP_CHANNELS.subtitlesCheckForUpdates,
+    async () => {
+      try {
+        return success(await subtitleExtension.checkForUpdates());
+      } catch (error) {
+        return subtitleFailure(error);
+      }
+    },
+  );
+  ipcMain.handle(DESKTOP_CHANNELS.subtitlesInstall, async (event) => {
+    try {
+      const status = await subtitleExtension.install((nextStatus) =>
+        notifySubtitleStatus(event, nextStatus),
+      );
+      mediaSidecar.setTranscriptionExecutable(
+        subtitleExtension.getExecutable(),
+      );
+      await mediaSidecar.restart();
+      notifySubtitleStatus(event, status);
+      return success(status);
+    } catch (error) {
+      return subtitleFailure(error);
+    }
+  });
+  ipcMain.handle(DESKTOP_CHANNELS.subtitlesUninstall, async (event) => {
+    let stopped = false;
+    try {
+      await mediaSidecar.stop();
+      stopped = true;
+      const status = await subtitleExtension.uninstall((nextStatus) =>
+        notifySubtitleStatus(event, nextStatus),
+      );
+      mediaSidecar.setTranscriptionExecutable(undefined);
+      await mediaSidecar.start();
+      stopped = false;
+      notifySubtitleStatus(event, status);
+      return success(status);
+    } catch (error) {
+      if (stopped) {
+        mediaSidecar.setTranscriptionExecutable(
+          subtitleExtension.getExecutable(),
+        );
+        void mediaSidecar.start().catch((restartError) => {
+          console.error("Unable to restart media core after subtitle error", restartError);
+        });
+      }
+      return subtitleFailure(error);
+    }
+  });
+}
+
+export function abortDesktopModelRequests() {
+  for (const controller of activeModelRequests.values()) controller.abort();
+  activeModelRequests.clear();
+}

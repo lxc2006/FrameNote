@@ -94,9 +94,15 @@ class BilibiliPreviewUpstreamTests(unittest.IsolatedAsyncioTestCase):
             }
         )
         store = BilibiliPreviewSessionStore()
-        with patch(
-            "media_service.main.resolve_bilibili_preview",
-            new=AsyncMock(return_value=preview),
+        with (
+            patch(
+                "media_service.main.resolve_bilibili_preview",
+                new=AsyncMock(return_value=preview),
+            ),
+            patch(
+                "media_service.main.get_public_base_url",
+                return_value="http://127.0.0.1:8788",
+            ),
         ):
             response = await resolve_bilibili_video_preview(
                 BilibiliPreviewRequest(bvid="BV1nx411u79K"),

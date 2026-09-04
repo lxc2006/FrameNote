@@ -40,8 +40,12 @@ class WorkerFailure(RuntimeError):
 
 
 def emit(event: str, **values: Any) -> None:
+    # stdout is a JSON Lines protocol consumed by the parent process. Frozen
+    # Windows executables can retain the active ANSI code page even when the
+    # child environment requests UTF-8, so keep the wire representation ASCII
+    # and let JSON escapes carry every non-ASCII character losslessly.
     payload = {"event": event, **values}
-    sys.stdout.write(json.dumps(payload, ensure_ascii=False, separators=(",", ":")))
+    sys.stdout.write(json.dumps(payload, ensure_ascii=True, separators=(",", ":")))
     sys.stdout.write("\n")
     sys.stdout.flush()
 

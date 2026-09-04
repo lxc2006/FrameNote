@@ -12,7 +12,7 @@ test("normalizes common Qwen audio field variants through one parser", async (t)
   t.after(() => vite.close());
 
   const { parseVideoSummary } = await vite.ssrLoadModule(
-    `/lib/server/qwen-video-engine.ts?audio-empty=${Date.now()}`,
+    `/src/main/model/qwen-video-engine.ts?audio-empty=${Date.now()}`,
   );
   const parsed = parseVideoSummary(
     JSON.stringify({
@@ -58,7 +58,7 @@ test("ignores malformed optional evidence without rejecting a valid summary", as
   t.after(() => vite.close());
 
   const { parseVideoSummary } = await vite.ssrLoadModule(
-    `/lib/server/qwen-video-engine.ts?optional-evidence=${Date.now()}`,
+    `/src/main/model/qwen-video-engine.ts?optional-evidence=${Date.now()}`,
   );
   const parsed = parseVideoSummary(
     JSON.stringify({
@@ -95,7 +95,7 @@ test("keeps at most 24 summary time points", async (t) => {
   t.after(() => vite.close());
 
   const { parseVideoSummary } = await vite.ssrLoadModule(
-    `/lib/server/qwen-video-engine.ts?time-points=${Date.now()}`,
+    `/src/main/model/qwen-video-engine.ts?time-points=${Date.now()}`,
   );
   const parsed = parseVideoSummary(
     JSON.stringify({

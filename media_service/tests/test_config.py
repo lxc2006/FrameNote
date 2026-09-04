@@ -10,10 +10,10 @@ from media_service.service.config import Settings, parse_cors_origins
 class CorsConfigTests(unittest.TestCase):
     def test_origins_are_exact_and_deduplicated(self) -> None:
         origins = parse_cors_origins(
-            "https://example.com/, http://127.0.0.1:3000,https://example.com"
+            "https://example.com/, http://127.0.0.1:3000,https://example.com,null"
         )
         self.assertEqual(
-            origins, ("https://example.com", "http://127.0.0.1:3000")
+            origins, ("https://example.com", "http://127.0.0.1:3000", "null")
         )
 
     def test_wildcard_and_non_origin_values_are_rejected(self) -> None:

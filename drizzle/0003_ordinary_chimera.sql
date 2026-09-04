@@ -1,1 +1,0 @@
-ALTER TABLE `conversation_message_details` ADD `usage_json` text;

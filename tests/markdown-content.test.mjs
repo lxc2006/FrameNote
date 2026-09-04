@@ -3,7 +3,7 @@ import test from "node:test";
 import {
   parseVideoTimeHref,
   prepareMarkdownContent,
-} from "../lib/client/markdown-content.ts";
+} from "../src/renderer/src/clients/markdown-content.ts";
 
 test("prepares standard Markdown while normalizing FrameNote video times", () => {
   assert.equal(

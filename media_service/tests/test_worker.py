@@ -5,6 +5,7 @@ import os
 import subprocess
 import tempfile
 import unittest
+from io import StringIO
 from pathlib import Path
 from unittest.mock import patch
 
@@ -18,6 +19,7 @@ from media_service.worker import (
     classify_download_error,
     download_network_options,
     estimate_download_bytes,
+    emit,
     load_analysis_builder,
     probe_source_media,
     safe_download_filename,
@@ -57,6 +59,29 @@ class WorkerValidationTests(unittest.TestCase):
 
     def test_downloads_four_fragments_concurrently(self) -> None:
         self.assertEqual(DOWNLOAD_FRAGMENT_CONCURRENCY, 4)
+
+    def test_worker_protocol_round_trips_chinese_as_ascii_json(self) -> None:
+        output = StringIO()
+        with patch("sys.stdout", output):
+            emit(
+                "error",
+                code="DOWNLOAD_FAILED",
+                message="视频下载失败，请稍后重试。",
+                retryable=True,
+            )
+
+        wire_value = output.getvalue()
+        self.assertTrue(wire_value.isascii())
+        self.assertEqual(wire_value.count("\n"), 1)
+        self.assertEqual(
+            json.loads(wire_value),
+            {
+                "event": "error",
+                "code": "DOWNLOAD_FAILED",
+                "message": "视频下载失败，请稍后重试。",
+                "retryable": True,
+            },
+        )
 
     def test_download_network_retries_and_supports_explicit_proxy(self) -> None:
         with patch.dict(

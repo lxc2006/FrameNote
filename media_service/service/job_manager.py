@@ -323,10 +323,7 @@ class JobManager:
         self,
         job: JobRecord,
     ) -> list[str]:
-        command = [
-            sys.executable,
-            *WORKER_PYTHON_OPTIONS,
-            str(self._worker_script),
+        worker_arguments = [
             "--state-root",
             str(self.settings.state_root),
             "--job-id",
@@ -344,6 +341,16 @@ class JobManager:
             "--direct-summary-max-seconds",
             str(job.direct_summary_max_seconds),
         ]
+        command = (
+            [sys.executable, "--worker", *worker_arguments]
+            if getattr(sys, "frozen", False)
+            else [
+                sys.executable,
+                *WORKER_PYTHON_OPTIONS,
+                str(self._worker_script),
+                *worker_arguments,
+            ]
+        )
         if job.source_kind == "bilibili":
             command.extend(("--bvid", job.bvid))
         else:
@@ -372,7 +379,11 @@ class JobManager:
                 stdin=asyncio.subprocess.DEVNULL,
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
-                cwd=str(self._worker_script.parent),
+                cwd=(
+                    str(Path(sys.executable).resolve().parent)
+                    if getattr(sys, "frozen", False)
+                    else str(self._worker_script.parent)
+                ),
                 env=environment,
                 **process_options,
             )

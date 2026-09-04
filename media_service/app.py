@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 import sys
 from pathlib import Path
 
@@ -18,7 +19,13 @@ from media_service.main import app  # noqa: E402
 def main() -> None:
     import uvicorn
 
-    uvicorn.run(app, host="127.0.0.1", port=8788, access_log=False)
+    try:
+        port = int(os.getenv("FRAMENOTE_MEDIA_PORT", "8788"))
+    except ValueError as exc:
+        raise RuntimeError("FRAMENOTE_MEDIA_PORT must be an integer") from exc
+    if not 1024 <= port <= 65535:
+        raise RuntimeError("FRAMENOTE_MEDIA_PORT must be between 1024 and 65535")
+    uvicorn.run(app, host="127.0.0.1", port=port, access_log=False)
 
 
 if __name__ == "__main__":

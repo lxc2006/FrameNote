@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 import math
 import os
 from dataclasses import dataclass
@@ -21,6 +22,27 @@ _FORWARDED_HEADER_NAMES = {
     "referer",
     "user-agent",
 }
+LOGGER = logging.getLogger("media_service.bilibili_preview")
+
+
+class _PreviewYtDlpLogger:
+    """Keep retryable yt-dlp failures quiet until extraction finally fails."""
+
+    def __init__(self) -> None:
+        self.last_error: str | None = None
+
+    def debug(self, _message: str) -> None:
+        pass
+
+    def warning(self, message: str) -> None:
+        LOGGER.debug("yt-dlp preview warning: %s", message)
+
+    def error(self, message: str) -> None:
+        self.last_error = message
+
+
+def _preview_retry_delay(attempt: int) -> float:
+    return min(8.0, 2.0 ** max(0, attempt - 1))
 
 
 class BilibiliPreviewError(RuntimeError):
@@ -82,6 +104,7 @@ def _resolve_bilibili_preview_sync(bvid: str) -> ResolvedBilibiliPreview:
             False,
         ) from exc
 
+    preview_logger = _PreviewYtDlpLogger()
     options: dict[str, Any] = {
         "ignoreconfig": True,
         "quiet": True,
@@ -92,6 +115,12 @@ def _resolve_bilibili_preview_sync(bvid: str) -> ResolvedBilibiliPreview:
         "retries": 3,
         "extractor_retries": 3,
         "fragment_retries": 3,
+        "retry_sleep_functions": {
+            "http": _preview_retry_delay,
+            "extractor": _preview_retry_delay,
+            "fragment": _preview_retry_delay,
+        },
+        "logger": preview_logger,
     }
     proxy = os.getenv("FRAMENOTE_MEDIA_PROXY", "").strip()
     if proxy:
@@ -104,9 +133,23 @@ def _resolve_bilibili_preview_sync(bvid: str) -> ResolvedBilibiliPreview:
                 download=False,
             )
     except DownloadError as exc:
+        error_detail = preview_logger.last_error or str(exc)
+        LOGGER.error(
+            "Bilibili preview failed after yt-dlp retries: %s",
+            error_detail,
+        )
+        is_precondition_failure = "HTTP Error 412" in error_detail
         raise BilibiliPreviewError(
-            "BILIBILI_RESOLVE_FAILED",
-            "yt-dlp 无法解析这个 B 站视频，请稍后重试。",
+            (
+                "BILIBILI_RATE_LIMITED"
+                if is_precondition_failure
+                else "BILIBILI_RESOLVE_FAILED"
+            ),
+            (
+                "B站暂时拒绝了视频解析请求，请稍后重试或更换网络。"
+                if is_precondition_failure
+                else "yt-dlp 无法解析这个 B 站视频，请稍后重试。"
+            ),
         ) from exc
     except OSError as exc:
         raise BilibiliPreviewError(

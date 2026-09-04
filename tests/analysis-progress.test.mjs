@@ -16,7 +16,7 @@ test("estimates long-running analysis stages without completing them early", asy
     estimatedStageDurationMs,
     estimatedStageProgress,
   } = await vite.ssrLoadModule(
-    `/lib/client/analysis-progress.ts?progress=${Date.now()}`,
+    `/src/renderer/src/clients/analysis-progress.ts?progress=${Date.now()}`,
   );
 
   assert.ok(

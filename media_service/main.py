@@ -8,6 +8,7 @@ import logging
 import mimetypes
 import re
 import shutil
+import sys
 import tempfile
 import time
 from contextlib import asynccontextmanager
@@ -31,7 +32,6 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 from starlette.background import BackgroundTask
 
-from .analysis_pipeline import complete_analysis_transcript
 from .bilibili_preview import BilibiliPreviewError, resolve_bilibili_preview
 from .bilibili_preview_proxy import (
     BilibiliPreviewProxyError,
@@ -39,6 +39,7 @@ from .bilibili_preview_proxy import (
     open_bilibili_preview_stream,
 )
 from .web_extract import extract_web_document
+from .transcription import complete_analysis_transcript, transcription_available
 from .service.config import Settings
 from .service.job_manager import JobManager, JobRecord, QueueCapacityError
 from .service.models import (
@@ -78,6 +79,43 @@ ANALYSIS_ASSET_RE = re.compile(
 )
 
 
+def _is_windows_proactor_cleanup_reset(context: dict[str, object]) -> bool:
+    exception = context.get("exception")
+    handle = str(context.get("handle", ""))
+    return (
+        isinstance(exception, ConnectionResetError)
+        and getattr(exception, "winerror", None) == 10054
+        and "_ProactorBasePipeTransport._call_connection_lost" in handle
+    )
+
+
+def _install_windows_proactor_cleanup_filter():
+    if sys.platform != "win32":
+        return lambda: None
+
+    loop = asyncio.get_running_loop()
+    previous_handler = loop.get_exception_handler()
+
+    def handle_exception(
+        current_loop: asyncio.AbstractEventLoop,
+        context: dict[str, object],
+    ) -> None:
+        if _is_windows_proactor_cleanup_reset(context):
+            LOGGER.debug("Ignored a closed Windows subprocess pipe")
+            return
+        if previous_handler is not None:
+            previous_handler(current_loop, context)
+        else:
+            current_loop.default_exception_handler(context)
+
+    loop.set_exception_handler(handle_exception)
+
+    def restore() -> None:
+        loop.set_exception_handler(previous_handler)
+
+    return restore
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     if (
@@ -90,6 +128,7 @@ async def lifespan(app: FastAPI):
         raise RuntimeError(
             "FRAMENOTE_MEDIA_API_TOKEN is required outside direct loopback development"
         )
+    restore_exception_handler = _install_windows_proactor_cleanup_filter()
     manager = JobManager(SETTINGS)
     app.state.job_manager = manager
     app.state.bilibili_preview_store = BilibiliPreviewSessionStore()
@@ -109,6 +148,7 @@ async def lifespan(app: FastAPI):
         if transcription_tasks:
             await asyncio.gather(*transcription_tasks, return_exceptions=True)
         await manager.stop()
+        restore_exception_handler()
 
 
 app = FastAPI(
@@ -414,7 +454,6 @@ async def health(request: Request) -> JSONResponse:
         "ffprobe": shutil.which("ffprobe") is not None,
         "sceneDetect": importlib.util.find_spec("scenedetect") is not None,
         "imageHash": importlib.util.find_spec("imagehash") is not None,
-        "funASR": importlib.util.find_spec("funasr") is not None,
         "trafilatura": importlib.util.find_spec("trafilatura") is not None,
         "pypdf": importlib.util.find_spec("pypdf") is not None,
     }
@@ -422,7 +461,12 @@ async def health(request: Request) -> JSONResponse:
     return JSONResponse(
         {
             "status": "ok" if healthy else "degraded",
+            "service": "framenote-media-core",
+            "version": "1.1.0",
             "dependencies": dependencies,
+            "capabilities": {
+                "transcription": transcription_available(),
+            },
             "jobs": queue,
         },
         status_code=status.HTTP_200_OK if healthy else status.HTTP_503_SERVICE_UNAVAILABLE,

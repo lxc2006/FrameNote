@@ -1,0 +1,10 @@
+# 1.4.x currently pins NumPy < 2, for which Windows has no CPython 3.13
+# wheel. 1.3.29 is the version already verified by this project on Python 3.13.
+funasr==1.3.29
+numpy>=2.1.0,<3.0.0
+modelscope>=1.20.0,<2.0.0
+huggingface-hub>=0.25.0,<2.0.0
+tiktoken>=0.7.0,<1.0.0
+torch>=2.3.0,<3.0.0
+torchaudio>=2.3.0,<3.0.0
+transformers>=4.40.0,<6.0.0

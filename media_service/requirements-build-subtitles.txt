@@ -1,0 +1,2 @@
+-r requirements-transcription.txt
+pyinstaller>=6.11.0,<7.0.0

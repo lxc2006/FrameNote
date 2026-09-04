@@ -8,12 +8,14 @@ from unittest.mock import Mock, patch
 from media_service.analysis_pipeline import (
     _filter_transcript_languages,
     _normalize_funasr_result,
-    _prefer_cached_modelscope_model,
     _read_frame,
-    _repunctuate_with_ct_punc,
     build_analysis_manifest,
-    complete_analysis_transcript,
     uniform_frame_targets,
+)
+from media_service.transcription import complete_analysis_transcript
+from media_service.transcription_funasr import (
+    _prefer_cached_modelscope_model,
+    _repunctuate_with_ct_punc,
 )
 
 
@@ -89,7 +91,7 @@ class AnalysisPipelineTests(unittest.TestCase):
             {"text": "这会导致癌症率飙升。"}
         ]
         with patch(
-            "media_service.analysis_pipeline._load_funasr_punctuation_model",
+            "media_service.transcription_funasr._load_funasr_punctuation_model",
             return_value=punctuation_model,
         ):
             restored = _repunctuate_with_ct_punc(
@@ -386,7 +388,7 @@ class AnalysisPipelineTests(unittest.TestCase):
                     side_effect=extract_audio,
                 ) as extract_audio_mock,
                 patch(
-                    "media_service.analysis_pipeline.transcribe_with_funasr",
+                    "media_service.transcription_funasr.transcribe",
                     side_effect=transcribe,
                 ) as transcribe_mock,
                 patch(
@@ -414,11 +416,11 @@ class AnalysisPipelineTests(unittest.TestCase):
 
             with (
                 patch(
-                    "media_service.analysis_pipeline.extract_funasr_audio",
+                    "media_service.transcription.extract_funasr_audio",
                     side_effect=extract_asr,
                 ),
                 patch(
-                    "media_service.analysis_pipeline.transcribe_with_funasr",
+                    "media_service.transcription_funasr.transcribe",
                     side_effect=transcribe,
                 ),
             ):
@@ -477,7 +479,7 @@ class AnalysisPipelineTests(unittest.TestCase):
                     side_effect=extract_frames,
                 ),
                 patch(
-                    "media_service.analysis_pipeline.transcribe_with_funasr",
+                    "media_service.transcription_funasr.transcribe",
                     side_effect=transcribe,
                 ) as transcribe_mock,
             ):

@@ -40,6 +40,10 @@ def parse_cors_origins(raw: str | None) -> tuple[str, ...]:
         origin = item.strip().rstrip("/")
         if not origin:
             continue
+        if origin == "null":
+            if origin not in origins:
+                origins.append(origin)
+            continue
         if origin == "*":
             raise RuntimeError("FRAMENOTE_MEDIA_CORS_ORIGINS cannot contain a wildcard")
         parsed = urlsplit(origin)
