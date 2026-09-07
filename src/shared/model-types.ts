@@ -4,7 +4,10 @@ import type {
   VideoSourceDescriptor,
   VideoSummary,
 } from "./media-types";
-import type { ConversationWebSource } from "./conversation-types";
+import type {
+  ConversationWebSearchMetadata,
+  ConversationWebSource,
+} from "./conversation-types";
 import type { ConversationUsageRecord } from "./model-usage";
 
 export interface AnalyzeVideoRequest {
@@ -48,6 +51,7 @@ export interface AskVideoResponse {
   reasoningContent?: string;
   reasoningDurationSeconds?: number;
   webSources?: ConversationWebSource[];
+  webSearch?: ConversationWebSearchMetadata;
   webSearchUsed?: boolean;
   visitedPageCount?: number;
   usage: ConversationUsageRecord;

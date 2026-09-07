@@ -2,12 +2,11 @@
 
 该目录提供 Windows 桌面应用使用的本机媒体服务。所有分析任务会先生成最长边不超过 854px 的 H.264/AAC 素材，再按视频时长选择直接视频或最多 64 张关键帧加独立音轨。
 
-## 两个交付边界
+## 交付边界
 
-- `framenote-media-core`：B 站预览和下载、本地/HTTPS 上传、探测、转码、关键帧、音轨、签名资源和联网正文提取。
-- `framenote-subtitles`：FunASR Nano、CT-Punc、VAD、PyTorch 与字幕模型，独立安装、更新和卸载。
+- `framenote-media-core`：B 站预览和下载、本地/HTTPS 上传、探测、转码、关键帧、音轨、在线识别音频分片、签名资源和联网正文提取。
 
-基础核心不包含 FunASR、PyTorch、Transformers、ModelScope、Hugging Face 或字幕模型。字幕扩展不存在时 `/health` 仍返回可用，`capabilities.transcription=false`，其余媒体和 Qwen 总结链路不受影响。
+sidecar 不执行语音识别，也不接收模型 API Key；Electron 主进程会读取签名音频分片并调用 Qwen Audio。
 
 ## 本机源码运行
 
@@ -17,19 +16,14 @@ python -m venv .venv
 .\.venv\Scripts\python.exe media_service\app.py
 ```
 
-需要开发字幕后端时再安装：
-
-```powershell
-.\.venv\Scripts\python.exe -m pip install -r media_service\requirements-transcription.txt
-```
-
 Electron 开发模式会自动启动 sidecar、选择可用 loopback 端口、设置随机 Bearer Token 和签名密钥，并在退出时回收进程树，通常无需手动执行上述命令。
+
+B站手动预览和总结下载共用同一套解析策略：一次操作最多完整解析 5 次，失败后按 1、2、4、8 秒退避；任意一次成功即继续，只有第 5 次仍失败才向上报告错误。
 
 ## 冻结构建
 
 ```powershell
 pnpm media:core:build
-pnpm subtitles:build
 ```
 
 核心输出：
@@ -38,14 +32,7 @@ pnpm subtitles:build
 media_service/dist/framenote-media-core/framenote-media-core.exe
 ```
 
-字幕输出：
-
-```text
-media_service/dist/framenote-subtitles/framenote-subtitles.exe
-release/FrameNote-Subtitles-<version>-win-x64.zip
-```
-
-两者均为 PyInstaller onedir，分发时不能只复制 exe。构建脚本会检查核心产物没有字幕依赖或模型文件。
+产物为 PyInstaller onedir，分发时不能只复制 exe。
 
 ## 固定限制
 
@@ -63,12 +50,10 @@ release/FrameNote-Subtitles-<version>-win-x64.zip
 GET    /health
 POST   /v1/media/jobs
 GET    /v1/media/jobs/{jobId}
-POST   /v1/media/jobs/{jobId}/transcript
 DELETE /v1/media/jobs/{jobId}
 POST   /v1/bilibili/preview
 POST   /v1/bilibili/jobs
 GET    /v1/bilibili/jobs/{jobId}
-POST   /v1/bilibili/jobs/{jobId}/transcript
 DELETE /v1/bilibili/jobs/{jobId}
 POST   /v1/web/extract
 ```
@@ -92,7 +77,6 @@ Renderer 通过 IPC 获取当前连接信息后直接流式访问这些 `/v1` �
 | `FRAMENOTE_MEDIA_CORS_ORIGINS` | 精确允许的 Renderer Origin |
 | `FRAMENOTE_MEDIA_STATE_DIR` | 任务和临时媒体目录 |
 | `FRAMENOTE_MEDIA_PROXY` | 可选 yt-dlp 代理 |
-| `FRAMENOTE_TRANSCRIPTION_EXECUTABLE` | 可选字幕扩展进程路径 |
 | `FRAMENOTE_WEB_FETCH_TIMEOUT_SECONDS` | 联网正文提取超时 |
 
 更完整的进程边界见 `docs/architecture.md`。

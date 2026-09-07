@@ -72,7 +72,6 @@ ${JSON.stringify(plannerContext(context))}`,
     provider: "deepseek",
     model: config.flashModel,
     operation: "web_search_plan",
-    deepSeekTier: "flash",
   });
   if (usage) onUsage?.(usage);
   const content = completion.choices[0]?.message.content?.trim();

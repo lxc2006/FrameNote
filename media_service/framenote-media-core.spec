@@ -4,7 +4,15 @@ from pathlib import Path
 import shutil
 import sys
 
-from PyInstaller.utils.hooks import collect_all, collect_submodules
+from PyInstaller.utils.hooks import (
+    collect_all,
+    collect_data_files,
+    collect_submodules,
+)
+
+tld_data = collect_data_files("tld")
+trafilatura_data = collect_data_files("trafilatura")
+justext_data = collect_data_files("justext")
 
 
 project_root = Path(SPECPATH).resolve().parent
@@ -43,13 +51,13 @@ hiddenimports = sorted(
             "cv2",
             "imagehash",
             "media_service.analysis_pipeline",
+            "media_service.bilibili_retry",
             "media_service.bilibili_preview",
             "media_service.bilibili_preview_proxy",
             "media_service.service.config",
             "media_service.service.job_manager",
             "media_service.service.models",
             "media_service.service.security",
-            "media_service.transcription",
             "media_service.web_extract",
             "media_service.worker",
             "multipart",
@@ -62,18 +70,6 @@ hiddenimports = sorted(
     )
 )
 
-excluded_modules = [
-    "funasr",
-    "huggingface_hub",
-    "media_service.transcription_funasr",
-    "modelscope",
-    "tiktoken",
-    "torch",
-    "torchaudio",
-    "torchvision",
-    "transformers",
-]
-
 analysis = Analysis(
     [str(entry_point)],
     pathex=[str(project_root)],
@@ -82,12 +78,12 @@ analysis = Analysis(
         + runtime_binaries
         + [(ffmpeg, "."), (ffprobe, ".")]
     ),
-    datas=yt_dlp_data,
+    datas=yt_dlp_data + tld_data + trafilatura_data + justext_data, 
     hiddenimports=hiddenimports,
     hookspath=[],
     hooksconfig={},
     runtime_hooks=[str(runtime_hook)],
-    excludes=excluded_modules,
+    excludes=[],
     noarchive=False,
     optimize=1,
 )

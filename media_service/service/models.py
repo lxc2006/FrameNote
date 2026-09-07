@@ -16,7 +16,6 @@ JobPhase = Literal[
 ]
 BilibiliDownloadVariant = Literal["analysis"]
 MediaSourceKind = Literal["upload", "bilibili", "url"]
-TranscriptLanguage = Literal["zh", "ja", "en"]
 WebExtractStatus = Literal["ok", "requires_browser", "skipped"]
 WebExtractMethod = Literal["trafilatura", "pypdf"]
 
@@ -111,41 +110,22 @@ class AnalysisAudioResponse(BaseModel):
     sizeBytes: int = Field(gt=0)
 
 
-class TranscriptCueResponse(BaseModel):
+class TranscriptionAudioResponse(BaseModel):
+    url: str
+    mimeType: Literal["audio/mpeg"]
+    sizeBytes: int = Field(gt=0, le=10 * 1024 * 1024)
     startSeconds: float = Field(ge=0)
-    endSeconds: float = Field(ge=0)
-    text: str
-
-
-class TranscriptResponse(BaseModel):
-    status: Literal["pending", "ready", "unavailable"]
-    text: str
-    cues: list[TranscriptCueResponse]
-    language: str | None = None
-    error: str | None = None
-
-
-class TranscriptOptionsRequest(BaseModel):
-    model_config = ConfigDict(extra="forbid")
-
-    languages: list[TranscriptLanguage] = Field(default_factory=list, max_length=3)
-
-    @field_validator("languages")
-    @classmethod
-    def validate_languages(
-        cls,
-        value: list[TranscriptLanguage],
-    ) -> list[TranscriptLanguage]:
-        if len(set(value)) != len(value):
-            raise ValueError("languages must not contain duplicates")
-        return value
+    endSeconds: float = Field(gt=0)
 
 
 class AnalysisResponse(BaseModel):
     mode: Literal["direct", "keyframes"]
     audio: AnalysisAudioResponse | None = None
+    transcriptionAudio: list[TranscriptionAudioResponse] = Field(
+        min_length=1,
+        max_length=32,
+    )
     frames: list[AnalysisFrameResponse] = Field(max_length=64)
-    transcript: TranscriptResponse
 
 
 class JobResponse(BaseModel):

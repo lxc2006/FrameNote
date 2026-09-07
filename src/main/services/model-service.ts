@@ -1,4 +1,7 @@
-import type { ConversationDetail } from "../../shared/conversation-types";
+import type {
+  ConversationDetail,
+  ConversationWebSearchMetadata,
+} from "../../shared/conversation-types";
 import type {
   AnalyzeVideoRequest,
   AnalyzeVideoResponse,
@@ -59,6 +62,7 @@ export async function analyzeVideoService(
   const result = await new QwenVideoEngine(config).analyzeWithUsage(
     payload.source,
     context,
+    signal,
   );
   return {
     provider: "qwen",
@@ -271,7 +275,8 @@ export async function askVideoService(
       ? { reasoningDurationSeconds: result.reasoningDurationSeconds }
       : {}),
     ...(result.webSources?.length ? { webSources: result.webSources } : {}),
-    ...(webSearch?.status === "searched"
+    ...(webSearch ? { webSearch: webSearchMetadata(webSearch) } : {}),
+    ...(webSearch?.requestIssued
       ? {
           webSearchUsed: true,
           visitedPageCount: webSearch.visitedPageCount,
@@ -281,4 +286,19 @@ export async function askVideoService(
   };
   send({ type: "done", ...response });
   return response;
+}
+
+function webSearchMetadata(
+  evidence: WebSearchEvidence,
+): ConversationWebSearchMetadata {
+  return {
+    status: evidence.status,
+    ...(evidence.query ? { query: evidence.query } : {}),
+    ...(evidence.note ? { note: evidence.note } : {}),
+    requestIssued: evidence.requestIssued,
+    candidateCount: evidence.candidateCount,
+    sourceCount: evidence.visitedPageCount,
+    extractionFailureCount: evidence.extractionFailureCount,
+    failures: evidence.failures,
+  };
 }

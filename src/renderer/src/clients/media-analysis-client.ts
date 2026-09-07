@@ -7,9 +7,7 @@ import type {
 } from "@/shared/bilibili-api";
 import type {
   SourceKind,
-  TranscriptLanguage,
   VideoModelContext,
-  VideoTranscript,
 } from "@/shared/media-types";
 import { mediaApiFetch } from "./media-transport";
 
@@ -45,7 +43,6 @@ export interface MediaAnalysisProgress {
 export interface MediaAnalysisResult {
   jobId: string;
   context: VideoModelContext;
-  transcript?: VideoTranscript;
   title: string;
   durationSeconds: number;
   sizeBytes: number;
@@ -147,7 +144,6 @@ export async function prepareMediaAnalysis(
     return {
       jobId: snapshot.jobId,
       context,
-      transcript: transcriptFromAnalysis(snapshot.analysis),
       title: snapshot.source.title?.trim() || file.name,
       durationSeconds,
       sizeBytes: snapshot.artifact.sizeBytes,
@@ -168,47 +164,6 @@ export async function prepareMediaAnalysis(
   } finally {
     if (jobId && !keepJob) void releaseMediaAnalysis(jobId);
   }
-}
-
-export async function extractMediaTranscript(
-  jobId: string,
-  languages: TranscriptLanguage[],
-  signal?: AbortSignal,
-): Promise<VideoTranscript> {
-  throwIfAborted(signal);
-  const deadline = Date.now() + MAX_JOB_WAIT_MS;
-  let snapshot = await requestJob(
-    `/v1/media/jobs/${jobId}/transcript`,
-    {
-      method: "POST",
-      headers: { "content-type": "application/json" },
-      body: JSON.stringify({ languages }),
-      signal,
-    },
-  );
-  while (snapshot.analysis?.transcript.status === "pending") {
-    if (Date.now() >= deadline) {
-      throw new MediaAnalysisClientError(
-        "FunASR 字幕提取超过 22 分钟仍未完成。",
-        "TRANSCRIPT_TIMEOUT",
-        true,
-      );
-    }
-    await abortableDelay(POLL_INTERVAL_MS, signal);
-    snapshot = await requestJob(`/v1/media/jobs/${jobId}`, { signal });
-  }
-  if (snapshot.status !== "succeeded" || !snapshot.analysis) {
-    throw snapshotError(snapshot, "FunASR 字幕提取失败。");
-  }
-  const transcript = transcriptFromAnalysis(snapshot.analysis);
-  if (!transcript) {
-    throw new MediaAnalysisClientError(
-      "媒体服务没有返回完整字幕状态。",
-      "INVALID_TRANSCRIPT_RESPONSE",
-      true,
-    );
-  }
-  return transcript;
 }
 
 export async function releaseMediaAnalysis(jobId: string) {
@@ -396,21 +351,6 @@ function isMediaJobSnapshot(value: unknown): value is MediaJobSnapshot {
       String((source as Record<string, unknown>).kind),
     )
   );
-}
-
-function transcriptFromAnalysis(
-  analysis: BilibiliAnalysis,
-): VideoTranscript | undefined {
-  if (analysis.transcript.status === "pending") return undefined;
-  return {
-    status: analysis.transcript.status,
-    text: analysis.transcript.text,
-    cues: analysis.transcript.cues.map((cue) => ({ ...cue })),
-    ...(analysis.transcript.language
-      ? { language: analysis.transcript.language }
-      : {}),
-    ...(analysis.transcript.error ? { error: analysis.transcript.error } : {}),
-  };
 }
 
 function reportProgress(

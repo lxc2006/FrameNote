@@ -93,6 +93,7 @@ class WorkerValidationTests(unittest.TestCase):
         self.assertEqual(options["proxy"], "http://127.0.0.1:7890")
         self.assertEqual(options["retries"], DOWNLOAD_RETRIES)
         self.assertEqual(options["fragment_retries"], DOWNLOAD_RETRIES)
+        self.assertEqual(options["extractor_retries"], 0)
         self.assertEqual(options["retry_sleep_functions"]["http"](1), 1.0)
         self.assertEqual(options["retry_sleep_functions"]["http"](10), 10.0)
 

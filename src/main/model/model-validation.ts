@@ -268,10 +268,10 @@ function parseContext(value: unknown, required: boolean): VideoModelContext {
   }
   if (
     mediaJobId &&
-    (videoUrl || frameUrls?.length || audioUrl || transcript)
+    (videoUrl || frameUrls?.length || audioUrl)
   ) {
     throw new QwenInputError(
-      "context.mediaJobId 必须作为独立的直接视频输入使用。",
+      "context.mediaJobId 不能与其他视频、关键帧或音频输入同时使用。",
     );
   }
   if (

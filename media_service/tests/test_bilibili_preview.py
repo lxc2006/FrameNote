@@ -6,9 +6,13 @@ from unittest.mock import patch
 from media_service.bilibili_preview import (
     MAX_PREVIEW_QUALITY,
     _PreviewYtDlpLogger,
-    _preview_retry_delay,
     _resolve_bilibili_preview_sync,
     _select_video_format,
+)
+from media_service.bilibili_retry import (
+    BILIBILI_RESOLVE_ATTEMPTS,
+    bilibili_retry_delay_seconds,
+    resolve_bilibili_with_retries,
 )
 
 
@@ -35,13 +39,30 @@ class _FakeYoutubeDL:
 
 
 class BilibiliPreviewTests(unittest.TestCase):
-    def test_buffers_retry_errors_and_uses_bounded_backoff(self) -> None:
+    def test_buffers_errors_and_retries_a_complete_resolution_five_times(self) -> None:
         logger = _PreviewYtDlpLogger()
         logger.error("HTTP Error 412: Precondition Failed")
+        calls = 0
+
+        def fail_four_times() -> str:
+            nonlocal calls
+            calls += 1
+            if calls < BILIBILI_RESOLVE_ATTEMPTS:
+                raise OSError("HTTP Error 412: Precondition Failed")
+            return "ready"
 
         self.assertEqual(logger.last_error, "HTTP Error 412: Precondition Failed")
-        self.assertEqual(_preview_retry_delay(1), 1.0)
-        self.assertEqual(_preview_retry_delay(10), 8.0)
+        self.assertEqual(
+            resolve_bilibili_with_retries(
+                fail_four_times,
+                (OSError,),
+                sleep=lambda _delay: None,
+            ),
+            "ready",
+        )
+        self.assertEqual(calls, 5)
+        self.assertEqual(bilibili_retry_delay_seconds(1), 1.0)
+        self.assertEqual(bilibili_retry_delay_seconds(10), 8.0)
 
     def test_prefers_browser_compatible_1080p_and_separate_m4a_audio(self) -> None:
         _FakeYoutubeDL.info = {
@@ -100,7 +121,7 @@ class BilibiliPreviewTests(unittest.TestCase):
             _FakeYoutubeDL.last_options["logger"],
             _PreviewYtDlpLogger,
         )
-        self.assertEqual(_FakeYoutubeDL.last_options["extractor_retries"], 3)
+        self.assertEqual(_FakeYoutubeDL.last_options["extractor_retries"], 0)
         self.assertEqual(MAX_PREVIEW_QUALITY, 1080)
         self.assertEqual(preview.playback_url, "https://cdn.example/1080-avc.mp4")
         self.assertEqual(preview.audio_playback_url, "https://cdn.example/audio-high.m4a")

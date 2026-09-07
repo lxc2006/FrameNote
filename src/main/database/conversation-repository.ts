@@ -3,6 +3,7 @@ import type {
   ConversationListItem,
   ConversationMessage,
   ConversationMessageInput,
+  ConversationWebSearchMetadata,
   ConversationWebSource,
   CreateConversationInput,
 } from "../../shared/conversation-types";
@@ -44,6 +45,7 @@ const MAX_MESSAGES_PER_WRITE = 20;
 const MAX_MESSAGE_CHARACTERS = 12_000;
 const MAX_REASONING_CHARACTERS = 80_000;
 const MAX_MESSAGE_WEB_SOURCES = 12;
+const MAX_WEB_SEARCH_FAILURES = 24;
 const MAX_SUMMARY_BYTES = 512 * 1024;
 // 读取层保留旧记录兼容余量；新生成的总结已在 Qwen 解析器中限制为 24 个。
 const MAX_KEY_POINTS = 32;
@@ -83,7 +85,8 @@ const CONVERSATION_SCHEMA_STATEMENTS = [
      reasoning_content TEXT,
      reasoning_duration_seconds INTEGER,
      web_sources_json TEXT,
-     usage_json TEXT,
+     web_search_json TEXT,
+     token_usage_json TEXT,
      stopped INTEGER NOT NULL DEFAULT 0,
      FOREIGN KEY (message_id) REFERENCES conversation_messages(id) ON DELETE CASCADE,
      FOREIGN KEY (conversation_id) REFERENCES conversations(id) ON DELETE CASCADE
@@ -107,6 +110,7 @@ const SOURCE_KEYS = [
   "durationLabel",
   "bvid",
   "sourceUrl",
+  "localPath",
   "description",
   // 兼容旧记录：允许读取这些字段，但 parseSource 会主动丢弃。
   "downloadFirst",
@@ -144,7 +148,8 @@ interface MessageDetailRow {
   reasoning_content: string | null;
   reasoning_duration_seconds: number | null;
   web_sources_json: string | null;
-  usage_json: string | null;
+  web_search_json: string | null;
+  token_usage_json: string | null;
   stopped: number;
 }
 
@@ -443,7 +448,7 @@ async function getConversation(
     .all<MessageRow>();
   const messageDetailResult = await databaseBinding.prepare(
     `SELECT message_id, reasoning_content, reasoning_duration_seconds,
-            web_sources_json, usage_json, stopped
+            web_sources_json, web_search_json, token_usage_json, stopped
      FROM conversation_message_details
      WHERE conversation_id = ?`,
   )
@@ -740,19 +745,33 @@ function initializeConversationDatabase(
         ),
       );
       assertBatchSucceeded(results);
-      try {
-        const columns = await binding
-          .prepare("PRAGMA table_info(conversation_message_details)")
-          .all<{ name: string }>();
-        if (!columns.results.some((column) => column.name === "usage_json")) {
-          await binding
-            .prepare(
-              "ALTER TABLE conversation_message_details ADD COLUMN usage_json TEXT",
-            )
-            .run();
-        }
-      } catch {
-        // Older SQLite builds can still use the base schema without this upgrade.
+      const columns = await binding
+        .prepare("PRAGMA table_info(conversation_message_details)")
+        .all<{ name: string }>();
+      const columnNames = new Set(columns.results.map((column) => column.name));
+      if (columnNames.has("usage_json")) {
+        const migrationStatements = [
+          binding.prepare("DELETE FROM conversations"),
+          binding.prepare(
+            columnNames.has("token_usage_json")
+              ? "ALTER TABLE conversation_message_details DROP COLUMN usage_json"
+              : "ALTER TABLE conversation_message_details RENAME COLUMN usage_json TO token_usage_json",
+          ),
+        ];
+        await binding.batch(migrationStatements);
+      } else if (!columnNames.has("token_usage_json")) {
+        await binding
+          .prepare(
+            "ALTER TABLE conversation_message_details ADD COLUMN token_usage_json TEXT",
+          )
+          .run();
+      }
+      if (!columnNames.has("web_search_json")) {
+        await binding
+          .prepare(
+            "ALTER TABLE conversation_message_details ADD COLUMN web_search_json TEXT",
+          )
+          .run();
       }
     })().catch((error: unknown) => {
         initializedConversationDatabases.delete(binding);
@@ -799,10 +818,15 @@ function parseSource(value: unknown): VideoSourceDescriptor {
     if (object.bvid !== undefined || object.sourceUrl !== undefined) {
       throw invalidInput("本地上传来源不能保存 bvid 或 sourceUrl。");
     }
+    const localPath = optionalString(object.localPath, "source.localPath", 32_768);
+    if (localPath && (!/^(?:[a-z]:[\\/]|\\\\)/i.test(localPath) || /[\u0000-\u001f]/.test(localPath))) {
+      throw invalidInput("本地视频路径必须是有效的 Windows 绝对路径。");
+    }
     return {
       kind,
       title,
       subtitle,
+      ...(localPath ? { localPath } : {}),
       ...(durationLabel ? { durationLabel } : {}),
       ...(description ? { description } : {}),
     };
@@ -1109,6 +1133,7 @@ function parseMessageInputs(
         "reasoningContent",
         "reasoningDurationSeconds",
         "webSources",
+        "webSearch",
         "stopped",
         "usage",
       ],
@@ -1139,6 +1164,10 @@ function parseMessageInputs(
       message.webSources === undefined
         ? undefined
         : parseMessageWebSources(message.webSources, `${itemField}.webSources`);
+    const webSearch =
+      message.webSearch === undefined
+        ? undefined
+        : parseMessageWebSearch(message.webSearch, `${itemField}.webSearch`);
     if (message.stopped !== undefined && typeof message.stopped !== "boolean") {
       throw invalidInput(`${itemField}.stopped 必须是布尔值。`);
     }
@@ -1161,10 +1190,93 @@ function parseMessageInputs(
         ? { reasoningDurationSeconds }
         : {}),
       ...(webSources?.length ? { webSources } : {}),
+      ...(webSearch ? { webSearch } : {}),
       ...(message.stopped === true ? { stopped: true } : {}),
       ...(usage ? { usage } : {}),
     };
   });
+}
+
+function parseMessageWebSearch(
+  value: unknown,
+  field: string,
+): ConversationWebSearchMetadata {
+  const item = recordValue(value, field);
+  assertOnlyKeys(
+    item,
+    [
+      "status",
+      "query",
+      "note",
+      "requestIssued",
+      "candidateCount",
+      "sourceCount",
+      "extractionFailureCount",
+      "failures",
+    ],
+    field,
+  );
+  if (
+    item.status !== "searched" &&
+    item.status !== "skipped" &&
+    item.status !== "forbidden" &&
+    item.status !== "unavailable"
+  ) {
+    throw invalidInput(`${field}.status 格式无效。`);
+  }
+  if (typeof item.requestIssued !== "boolean") {
+    throw invalidInput(`${field}.requestIssued 必须是布尔值。`);
+  }
+  const candidateCount = boundedInteger(item.candidateCount, `${field}.candidateCount`, 0, 100);
+  const sourceCount = boundedInteger(item.sourceCount, `${field}.sourceCount`, 0, 100);
+  const extractionFailureCount = boundedInteger(
+    item.extractionFailureCount,
+    `${field}.extractionFailureCount`,
+    0,
+    100,
+  );
+  if (!item.requestIssued && (candidateCount || sourceCount || extractionFailureCount)) {
+    throw invalidInput(`${field} 未发起搜索时不能包含候选或正文统计。`);
+  }
+  if (sourceCount > candidateCount || extractionFailureCount > candidateCount) {
+    throw invalidInput(`${field} 的搜索统计不一致。`);
+  }
+  if (!Array.isArray(item.failures) || item.failures.length > MAX_WEB_SEARCH_FAILURES) {
+    throw invalidInput(`${field}.failures 格式无效。`);
+  }
+  const failures = item.failures.map((entry, index) => {
+    const failureField = `${field}.failures[${index}]`;
+    const failure = recordValue(entry, failureField);
+    assertOnlyKeys(failure, ["stage", "code", "message", "url"], failureField);
+    if (
+      failure.stage !== "search" &&
+      failure.stage !== "extract" &&
+      failure.stage !== "filter"
+    ) {
+      throw invalidInput(`${failureField}.stage 格式无效。`);
+    }
+    const url = optionalString(failure.url, `${failureField}.url`, 2_048);
+    return {
+      stage: failure.stage,
+      code: stringValue(failure.code, `${failureField}.code`, 100),
+      message: stringValue(failure.message, `${failureField}.message`, 1_000),
+      ...(url
+        ? { url: stableWebReferenceUrl(url, `${failureField}.url`) }
+        : {}),
+    };
+  });
+  const query = optionalString(item.query, `${field}.query`, 1_000);
+  const note = optionalString(item.note, `${field}.note`, 2_000);
+  return {
+    status: item.status,
+    ...(query ? { query } : {}),
+    ...(note ? { note } : {}),
+    requestIssued: item.requestIssued,
+    candidateCount,
+    sourceCount,
+    extractionFailureCount,
+    failures,
+  };
 }
 
 function parseMessageWebSources(
@@ -1262,8 +1374,14 @@ function messageFromRow(
           "conversation_message_details.web_sources_json",
         )
       : undefined;
-  const usage = detail?.usage_json
-    ? parsePersistedUsage(detail.usage_json)
+  const webSearch = detail?.web_search_json
+    ? parseMessageWebSearch(
+        JSON.parse(detail.web_search_json),
+        "conversation_message_details.web_search_json",
+      )
+    : undefined;
+  const usage = detail?.token_usage_json
+    ? parsePersistedUsage(detail.token_usage_json)
     : undefined;
   const legacySearchMetadata = extractLegacySearchMetadata(row.content);
   const resolvedWebSources = webSources?.length
@@ -1282,6 +1400,7 @@ function messageFromRow(
       ? { reasoningDurationSeconds }
       : {}),
     ...(resolvedWebSources?.length ? { webSources: resolvedWebSources } : {}),
+    ...(webSearch ? { webSearch } : {}),
     ...(detail?.stopped === 1 ? { stopped: true } : {}),
     ...(usage ? { usage } : {}),
   };
@@ -1332,6 +1451,7 @@ function messageMetadata(message: ConversationMessageInput) {
       ? { reasoningDurationSeconds: message.reasoningDurationSeconds }
       : {}),
     ...(message.webSources?.length ? { webSources: message.webSources } : {}),
+    ...(message.webSearch ? { webSearch: message.webSearch } : {}),
     ...(message.stopped ? { stopped: true } : {}),
     ...(message.usage ? { usage: message.usage } : {}),
   };
@@ -1346,6 +1466,7 @@ function messageDetailsStatement(
     Boolean(message.reasoningContent) ||
     message.reasoningDurationSeconds !== undefined ||
     Boolean(message.webSources?.length) ||
+    Boolean(message.webSearch) ||
     Boolean(message.stopped) ||
     Boolean(message.usage);
   if (!hasDetails) return null;
@@ -1353,8 +1474,9 @@ function messageDetailsStatement(
     .prepare(
       `INSERT INTO conversation_message_details (
          message_id, conversation_id, reasoning_content,
-         reasoning_duration_seconds, web_sources_json, usage_json, stopped
-       ) VALUES (?, ?, ?, ?, ?, ?, ?)`,
+         reasoning_duration_seconds, web_sources_json, web_search_json,
+         token_usage_json, stopped
+       ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
     )
     .bind(
       message.id,
@@ -1362,6 +1484,7 @@ function messageDetailsStatement(
       message.reasoningContent ?? null,
       message.reasoningDurationSeconds ?? null,
       message.webSources?.length ? JSON.stringify(message.webSources) : null,
+      message.webSearch ? JSON.stringify(message.webSearch) : null,
       message.usage ? JSON.stringify(message.usage) : null,
       message.stopped ? 1 : 0,
     );
@@ -1370,7 +1493,7 @@ function messageDetailsStatement(
 function parsePersistedUsage(value: string): ConversationUsageRecord {
   const usage = parseConversationUsageRecord(JSON.parse(value));
   if (!usage) {
-    throw new Error("数据库中的消息 usage_json 格式无效。");
+    throw new Error("数据库中的消息 token_usage_json 格式无效。");
   }
   return usage;
 }
@@ -1448,6 +1571,19 @@ function finiteNumber(value: unknown, field: string): number {
     throw invalidInput(`${field} 必须是有限数字。`);
   }
   return value;
+}
+
+function boundedInteger(
+  value: unknown,
+  field: string,
+  minimum: number,
+  maximum: number,
+) {
+  const number = finiteNumber(value, field);
+  if (!Number.isSafeInteger(number) || number < minimum || number > maximum) {
+    throw invalidInput(`${field} 必须是 ${minimum} 到 ${maximum} 的整数。`);
+  }
+  return number;
 }
 
 function assertBatchSucceeded(results: ConversationQueryResult[]) {

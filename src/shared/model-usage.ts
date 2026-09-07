@@ -26,15 +26,12 @@ export interface ModelCallUsage {
   promptTokens: number;
   completionTokens: number;
   totalTokens: number;
-  estimatedCostCnyMicros: number;
-  pricingVersion: string;
   tokenDetails: ModelTokenDetails;
 }
 
 export interface ConversationUsageRecord {
   kind: "summary" | "answer";
   totalTokens: number;
-  estimatedCostCnyMicros: number;
   searchCount: number;
   createdAt: number;
   calls: ModelCallUsage[];
@@ -42,24 +39,10 @@ export interface ConversationUsageRecord {
 
 export type ModelUsageSink = (usage: ModelCallUsage) => void;
 
-const QWEN_PRICING_VERSION = "qwen3.5-omni-plus-cn-beijing-2026-07-30";
-const DEEPSEEK_PRICING_VERSION = "deepseek-v4-2026-07-30-usd-cny-7.2";
-const USD_TO_CNY = 7.2;
-
-const QWEN_INPUT_NON_AUDIO_CNY_PER_MILLION = 7;
-const QWEN_INPUT_AUDIO_CNY_PER_MILLION = 53;
-const QWEN_OUTPUT_TEXT_CNY_PER_MILLION = 40;
-
-const DEEPSEEK_PRICES_USD_PER_MILLION = {
-  flash: { cacheHit: 0.0028, cacheMiss: 0.14, output: 0.28 },
-  pro: { cacheHit: 0.003625, cacheMiss: 0.435, output: 0.87 },
-} as const;
-
 interface NormalizeUsageOptions {
   provider: ModelUsageProvider;
   model: string;
   operation: ModelUsageOperation;
-  deepSeekTier?: "flash" | "pro";
 }
 
 export function normalizeModelCallUsage(
@@ -105,16 +88,6 @@ export function normalizeModelCallUsage(
       nonNegativeInteger(completionDetails?.reasoning_tokens) ?? 0,
   };
 
-  const estimatedCostCnyMicros =
-    options.provider === "qwen"
-      ? qwenCostCnyMicros(promptTokens, completionTokens, audioTokens)
-      : deepSeekCostCnyMicros(
-          completionTokens,
-          cacheHitTokens,
-          cacheMissTokens,
-          options.deepSeekTier ?? "flash",
-        );
-
   return {
     provider: options.provider,
     model: options.model,
@@ -122,11 +95,6 @@ export function normalizeModelCallUsage(
     promptTokens,
     completionTokens,
     totalTokens,
-    estimatedCostCnyMicros,
-    pricingVersion:
-      options.provider === "qwen"
-        ? QWEN_PRICING_VERSION
-        : DEEPSEEK_PRICING_VERSION,
     tokenDetails,
   };
 }
@@ -140,10 +108,6 @@ export function conversationUsageRecord(
   return {
     kind,
     totalTokens: calls.reduce((total, call) => total + call.totalTokens, 0),
-    estimatedCostCnyMicros: calls.reduce(
-      (total, call) => total + call.estimatedCostCnyMicros,
-      0,
-    ),
     searchCount: Math.max(0, Math.trunc(searchCount)),
     createdAt,
     calls,
@@ -158,11 +122,6 @@ export function parseConversationUsageRecord(
     return null;
   }
   const totalTokens = boundedInteger(record.totalTokens, 0, 1_000_000_000);
-  const estimatedCostCnyMicros = boundedInteger(
-    record.estimatedCostCnyMicros,
-    0,
-    1_000_000_000_000,
-  );
   const searchCount = boundedInteger(record.searchCount, 0, 100);
   const createdAt = boundedInteger(
     record.createdAt,
@@ -171,7 +130,6 @@ export function parseConversationUsageRecord(
   );
   if (
     totalTokens === null ||
-    estimatedCostCnyMicros === null ||
     searchCount === null ||
     createdAt === null ||
     !Array.isArray(record.calls) ||
@@ -185,12 +143,7 @@ export function parseConversationUsageRecord(
   const normalizedCalls = calls as ModelCallUsage[];
   if (
     totalTokens !==
-      normalizedCalls.reduce((total, call) => total + call.totalTokens, 0) ||
-    estimatedCostCnyMicros !==
-      normalizedCalls.reduce(
-        (total, call) => total + call.estimatedCostCnyMicros,
-        0,
-      )
+    normalizedCalls.reduce((total, call) => total + call.totalTokens, 0)
   ) {
     return null;
   }
@@ -198,7 +151,6 @@ export function parseConversationUsageRecord(
   return {
     kind: record.kind,
     totalTokens,
-    estimatedCostCnyMicros,
     searchCount,
     createdAt,
     calls: normalizedCalls,
@@ -232,16 +184,6 @@ function parseModelCallUsage(value: unknown): ModelCallUsage | null {
     1_000_000_000,
   );
   const totalTokens = boundedInteger(record?.totalTokens, 0, 1_000_000_000);
-  const estimatedCostCnyMicros = boundedInteger(
-    record?.estimatedCostCnyMicros,
-    0,
-    1_000_000_000_000,
-  );
-  const pricingVersion =
-    typeof record?.pricingVersion === "string" &&
-    record.pricingVersion.trim().length <= 200
-      ? record.pricingVersion.trim()
-      : "";
   const details = recordOrNull(record?.tokenDetails);
   const tokenDetails = details
     ? {
@@ -274,8 +216,6 @@ function parseModelCallUsage(value: unknown): ModelCallUsage | null {
     completionTokens === null ||
     totalTokens === null ||
     totalTokens !== promptTokens + completionTokens ||
-    estimatedCostCnyMicros === null ||
-    !pricingVersion ||
     !tokenDetails ||
     Object.values(tokenDetails).some((entry) => entry === null)
   ) {
@@ -289,38 +229,8 @@ function parseModelCallUsage(value: unknown): ModelCallUsage | null {
     promptTokens,
     completionTokens,
     totalTokens,
-    estimatedCostCnyMicros,
-    pricingVersion,
     tokenDetails: tokenDetails as ModelTokenDetails,
   };
-}
-
-function qwenCostCnyMicros(
-  promptTokens: number,
-  completionTokens: number,
-  audioTokens: number,
-) {
-  const nonAudioTokens = Math.max(0, promptTokens - audioTokens);
-  return Math.round(
-    nonAudioTokens * QWEN_INPUT_NON_AUDIO_CNY_PER_MILLION +
-      audioTokens * QWEN_INPUT_AUDIO_CNY_PER_MILLION +
-      completionTokens * QWEN_OUTPUT_TEXT_CNY_PER_MILLION,
-  );
-}
-
-function deepSeekCostCnyMicros(
-  completionTokens: number,
-  cacheHitTokens: number,
-  cacheMissTokens: number,
-  tier: "flash" | "pro",
-) {
-  const prices = DEEPSEEK_PRICES_USD_PER_MILLION[tier];
-  return Math.round(
-    (cacheHitTokens * prices.cacheHit +
-      cacheMissTokens * prices.cacheMiss +
-      completionTokens * prices.output) *
-      USD_TO_CNY,
-  );
 }
 
 function recordOrNull(value: unknown): Record<string, unknown> | null {

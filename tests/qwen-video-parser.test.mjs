@@ -29,7 +29,7 @@ test("normalizes common Qwen audio field variants through one parser", async (t)
         status: "analyzed",
         summary: "能够辨认背景音乐，没有可辨讲话。",
         // Qwen occasionally invents this legacy field in a malformed shape.
-        // New summaries ignore it because subtitles belong to FunASR.
+        // New summaries keep subtitle evidence outside the audio-analysis object.
         speech: ["", { content: "不应进入结构化总结。" }],
         music: ["持续的背景音乐。", { description: "节奏平稳。" }],
         soundscape: { text: "轻微的环境声。" },

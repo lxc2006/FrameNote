@@ -1,5 +1,6 @@
 import { app, ipcMain } from "electron";
 import { existsSync } from "node:fs";
+import { rm } from "node:fs/promises";
 import { join } from "node:path";
 import { ConversationService } from "./services/conversation-service";
 import { ConversationRepository } from "./database/conversation-repository";
@@ -8,14 +9,15 @@ import { DesktopDatabase } from "./database/database";
 import { MediaSidecarManager } from "./media/media-sidecar";
 import { DESKTOP_CHANNELS } from "../shared/ipc-contract";
 import { startAutomaticUpdates } from "./updates/auto-update";
-import { SubtitleExtensionManager } from "./extensions/subtitle-extension";
 import { createMainWindow, hasMainWindow, openExternalUrl } from "./window";
 import { CredentialStore } from "./security/credential-store";
+import { abortVideoDownloads, registerVideoFiles, registerVideoFileScheme } from "./media/video-files";
+
+registerVideoFileScheme();
 
 const DESKTOP_OWNER_ID = "desktop-local-user";
 let desktopDatabase: DesktopDatabase | undefined;
 let mediaSidecar: MediaSidecarManager | undefined;
-let subtitleExtension: SubtitleExtensionManager | undefined;
 let credentialStore: CredentialStore | undefined;
 let shutdownStarted = false;
 
@@ -27,6 +29,29 @@ function loadDesktopEnvironment() {
   if (environmentFile) process.loadEnvFile(environmentFile);
 }
 
+async function removeLegacyOfflineSubtitleFiles() {
+  const roots = new Set<string>();
+  const localAppData = process.env.LOCALAPPDATA?.trim();
+  if (localAppData) {
+    roots.add(
+      join(localAppData, "FrameNote", "extensions", "framenote-subtitles"),
+    );
+  }
+  roots.add(
+    join(app.getPath("userData"), "extensions", "framenote-subtitles"),
+  );
+  await Promise.all(
+    [...roots].map((root) =>
+      rm(root, { recursive: true, force: true }).catch((error) => {
+        console.warn(
+          "Unable to remove a legacy offline subtitle directory.",
+          error,
+        );
+      }),
+    ),
+  );
+}
+
 app.setAppUserModelId("com.framenote.desktop");
 
 app.whenReady().then(async () => {
@@ -35,22 +60,11 @@ app.whenReady().then(async () => {
     join(app.getPath("userData"), "credentials.json"),
   );
   await credentialStore.initialize();
-  const localAppData = process.env.LOCALAPPDATA?.trim();
-  subtitleExtension = new SubtitleExtensionManager({
-    root: localAppData
-      ? join(localAppData, "FrameNote", "extensions", "framenote-subtitles")
-      : join(app.getPath("userData"), "extensions", "framenote-subtitles"),
-    appVersion: app.getVersion(),
-  });
-  await subtitleExtension.initialize();
   mediaSidecar = new MediaSidecarManager({
     isPackaged: app.isPackaged,
     resourcesPath: process.resourcesPath,
     userDataPath: app.getPath("userData"),
   });
-  mediaSidecar.setTranscriptionExecutable(
-    subtitleExtension.getExecutable(),
-  );
   try {
     await mediaSidecar.start();
   } catch (error) {
@@ -65,7 +79,6 @@ app.whenReady().then(async () => {
       new ConversationRepository(desktopDatabase, DESKTOP_OWNER_ID),
     ),
     mediaSidecar,
-    subtitleExtension,
     credentialStore,
   );
 
@@ -79,13 +92,10 @@ app.whenReady().then(async () => {
     },
   );
 
+  registerVideoFiles(mediaSidecar);
   createMainWindow();
+  void removeLegacyOfflineSubtitleFiles();
   startAutomaticUpdates();
-  setTimeout(() => {
-    void subtitleExtension?.checkForUpdates().catch((error) => {
-      console.info("Subtitle extension update check skipped.", error);
-    });
-  }, 20_000).unref();
 
   app.on("activate", () => {
     if (!hasMainWindow()) createMainWindow();
@@ -97,7 +107,10 @@ app.on("before-quit", (event) => {
   event.preventDefault();
   shutdownStarted = true;
   abortDesktopModelRequests();
-  void (mediaSidecar?.stop() ?? Promise.resolve()).finally(() => {
+  void Promise.allSettled([
+    abortVideoDownloads(),
+    mediaSidecar?.stop() ?? Promise.resolve(),
+  ]).finally(() => {
     mediaSidecar = undefined;
     desktopDatabase?.close();
     desktopDatabase = undefined;

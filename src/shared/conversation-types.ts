@@ -14,6 +14,7 @@ export interface ConversationMessage {
   reasoningContent?: string;
   reasoningDurationSeconds?: number;
   webSources?: ConversationWebSource[];
+  webSearch?: ConversationWebSearchMetadata;
   stopped?: boolean;
   usage?: ConversationUsageRecord;
 }
@@ -22,6 +23,30 @@ export interface ConversationWebSource {
   index: number;
   title: string;
   url: string;
+}
+
+export type ConversationWebSearchStatus =
+  | "searched"
+  | "skipped"
+  | "forbidden"
+  | "unavailable";
+
+export interface ConversationWebSearchFailure {
+  stage: "search" | "extract" | "filter";
+  code: string;
+  message: string;
+  url?: string;
+}
+
+export interface ConversationWebSearchMetadata {
+  status: ConversationWebSearchStatus;
+  query?: string;
+  note?: string;
+  requestIssued: boolean;
+  candidateCount: number;
+  sourceCount: number;
+  extractionFailureCount: number;
+  failures: ConversationWebSearchFailure[];
 }
 
 export interface ConversationListItem {
@@ -55,6 +80,7 @@ export type ConversationMessageInput = Pick<
   | "reasoningContent"
   | "reasoningDurationSeconds"
   | "webSources"
+  | "webSearch"
   | "stopped"
   | "usage"
 >;

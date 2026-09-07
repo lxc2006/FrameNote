@@ -24,7 +24,7 @@ $forbidden = Get-ChildItem -LiteralPath $unpackedRoot -Recurse -Force | Where-Ob
   $_.FullName -match $forbiddenNames -or $_.Extension -in ".onnx", ".pt", ".pth", ".safetensors"
 }
 if ($forbidden) {
-  throw "Base installer contains subtitle extension packages or model files."
+  throw "Base installer contains forbidden local speech-model packages or files."
 }
 $environmentFiles = Get-ChildItem -LiteralPath $unpackedRoot -Recurse -Force -File | Where-Object {
   $_.Name -like ".env*"
@@ -39,6 +39,6 @@ if (-not (Test-Path -LiteralPath $updateMetadata -PathType Leaf)) {
   Installer = $installer.FullName
   InstallerMB = [math]::Round($installerSizeMb, 1)
   MediaCore = $coreExecutable
-  SubtitleFilesInBase = 0
+  LocalSpeechModelFilesInBase = 0
   UpdateMetadata = $updateMetadata
 } | Format-List

@@ -27,7 +27,7 @@ const SUMMARY_SYSTEM_PROMPT = `你是“帧记”的视频分析引擎。请只�
 - chapters: 2 至 8 个按时间排序的粗章节 {time, title, description}，用于兼容旧结构；description 可以比 keyPoints 更概括。
 - audioAnalysis: {status, summary, music, soundscape, temporalChanges, uncertainty?}
   - status 只能是 analyzed、silent 或 unavailable：analyzed 表示已听取到可辨声音，silent 表示已检查音轨但没有可辨声音，unavailable 表示没有可靠音频证据或无法读取
-  - audioAnalysis 是内部声音证据索引，不是字幕结果；不要输出 speech、subtitle、transcript 或逐字稿字段。讲话内容只需准确融入 overview、keyPoints、chapters 和 summary，逐句字幕由独立的 FunASR 流程生成
+  - audioAnalysis 是内部声音证据索引，不是字幕结果；不要输出 speech、subtitle、transcript 或逐字稿字段。讲话内容只需准确融入 overview、keyPoints、chapters 和 summary，逐句字幕由独立的在线 ASR 流程生成
   - music、soundscape 的 JSON 类型只能是非空字符串或 null：有内容用字符串，没有对应声音用 null，绝不能使用空字符串、数组或对象
   - temporalChanges 是按时间排序的 {time, description} 数组，只记录可靠且有助于理解内容的声音变化；没有明显变化时返回 [] 并在 summary 中说明整体稳定
   - silent 或 unavailable 时 music、soundscape 必须为 null，temporalChanges 必须为 []；uncertainty 只用于说明真实的不确定性
@@ -108,6 +108,7 @@ export class QwenVideoEngine implements VideoEngine {
   async analyzeWithUsage(
     source: VideoSourceDescriptor,
     context?: VideoModelContext,
+    signal?: AbortSignal,
   ): Promise<{ summary: VideoSummary; usage: ModelCallUsage | null }> {
     const safeContext = requireModelContext(context);
     const audioEvidence = audioEvidenceMode(safeContext);
@@ -128,6 +129,7 @@ export class QwenVideoEngine implements VideoEngine {
         } as unknown as ChatCompletionMessageParam,
       ],
       true,
+      signal,
     );
 
     const summary = parseVideoSummary(completion.output, source.title, {
@@ -147,6 +149,7 @@ export class QwenVideoEngine implements VideoEngine {
   private async complete(
     messages: ChatCompletionMessageParam[],
     jsonMode: boolean,
+    signal?: AbortSignal,
   ) {
     const request = {
       model: this.config.model,
@@ -158,7 +161,7 @@ export class QwenVideoEngine implements VideoEngine {
       ...(jsonMode ? { response_format: { type: "json_object" } } : {}),
     } as unknown as ChatCompletionCreateParamsStreaming;
 
-    const stream = await this.client.chat.completions.create(request);
+    const stream = await this.client.chat.completions.create(request, { signal });
     let output = "";
     let usage: unknown;
 

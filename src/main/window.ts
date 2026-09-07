@@ -1,4 +1,4 @@
-import { BrowserWindow, shell } from "electron";
+import { BrowserWindow, Menu, shell } from "electron";
 import { join } from "node:path";
 
 function parseExternalUrl(value: string) {
@@ -34,6 +34,7 @@ export function hasMainWindow() {
 }
 
 export function createMainWindow() {
+  Menu.setApplicationMenu(null);
   const mainWindow = new BrowserWindow({
     width: 1440,
     height: 900,
@@ -42,6 +43,7 @@ export function createMainWindow() {
     show: false,
     backgroundColor: "#f5f5f4",
     title: "帧记 FrameNote",
+    autoHideMenuBar: true,
     webPreferences: {
       contextIsolation: true,
       nodeIntegration: false,
@@ -62,6 +64,9 @@ export function createMainWindow() {
   });
   mainWindow.webContents.session.setPermissionRequestHandler(
     (_webContents, _permission, callback) => callback(false),
+  );
+  mainWindow.webContents.session.setPermissionCheckHandler(
+    () => false,
   );
 
   const rendererUrl = process.env.ELECTRON_RENDERER_URL;

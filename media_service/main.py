@@ -16,7 +16,6 @@ from pathlib import Path
 from urllib.parse import urlencode
 
 from fastapi import (
-    Body,
     Depends,
     FastAPI,
     File,
@@ -39,13 +38,13 @@ from .bilibili_preview_proxy import (
     open_bilibili_preview_stream,
 )
 from .web_extract import extract_web_document
-from .transcription import complete_analysis_transcript, transcription_available
 from .service.config import Settings
 from .service.job_manager import JobManager, JobRecord, QueueCapacityError
 from .service.models import (
     AnalysisAudioResponse,
     AnalysisFrameResponse,
     AnalysisResponse,
+    TranscriptionAudioResponse,
     ArtifactResponse,
     BilibiliPreviewRequest,
     BilibiliPreviewResponse,
@@ -54,9 +53,6 @@ from .service.models import (
     JobListResponse,
     JobResponse,
     SourceResponse,
-    TranscriptCueResponse,
-    TranscriptOptionsRequest,
-    TranscriptResponse,
     WebExtractRequest,
     WebExtractResponse,
     utc_iso,
@@ -74,7 +70,7 @@ from .service.security import (
 LOGGER = logging.getLogger("media_service")
 SETTINGS = Settings.from_env()
 ANALYSIS_ASSET_RE = re.compile(
-    r"^analysis-(?:audio\.mp3|frame-[0-9]{3}\.jpg)$",
+    r"^analysis-(?:audio\.mp3|asr-[0-9]{3}\.mp3|frame-[0-9]{3}\.jpg)$",
     re.ASCII,
 )
 
@@ -132,7 +128,6 @@ async def lifespan(app: FastAPI):
     manager = JobManager(SETTINGS)
     app.state.job_manager = manager
     app.state.bilibili_preview_store = BilibiliPreviewSessionStore()
-    app.state.transcription_tasks = {}
     if SETTINGS.signing_secret_is_ephemeral:
         LOGGER.warning(
             "FRAMENOTE_MEDIA_SIGNING_SECRET is unset; signed URLs will stop working "
@@ -142,11 +137,6 @@ async def lifespan(app: FastAPI):
     try:
         yield
     finally:
-        transcription_tasks = list(app.state.transcription_tasks.values())
-        for task in transcription_tasks:
-            task.cancel()
-        if transcription_tasks:
-            await asyncio.gather(*transcription_tasks, return_exceptions=True)
         await manager.stop()
         restore_exception_handler()
 
@@ -308,21 +298,16 @@ def _analysis_response(
             )
             for frame in manifest["frames"][:64]
         ]
-        raw_transcript = manifest["transcript"]
-        transcript = TranscriptResponse(
-            status=raw_transcript["status"],
-            text=str(raw_transcript.get("text") or ""),
-            cues=[
-                TranscriptCueResponse(
-                    startSeconds=cue["startSeconds"],
-                    endSeconds=cue["endSeconds"],
-                    text=cue["text"],
-                )
-                for cue in raw_transcript.get("cues", [])
-            ],
-            language=raw_transcript.get("language"),
-            error=raw_transcript.get("error"),
-        )
+        transcription_audio = [
+            TranscriptionAudioResponse(
+                url=asset_url(chunk["filename"]),
+                mimeType=chunk["mimeType"],
+                sizeBytes=chunk["sizeBytes"],
+                startSeconds=chunk["startSeconds"],
+                endSeconds=chunk["endSeconds"],
+            )
+            for chunk in manifest["transcriptionAudio"][:32]
+        ]
         if mode == "direct" and frames:
             raise ValueError("direct analysis must not contain keyframes")
         if mode == "keyframes" and (len(frames) < 3 or audio is None):
@@ -332,8 +317,8 @@ def _analysis_response(
         return AnalysisResponse(
             mode=mode,
             audio=audio,
+            transcriptionAudio=transcription_audio,
             frames=frames,
-            transcript=transcript,
         )
     except (KeyError, TypeError, ValueError, OSError, json.JSONDecodeError):
         LOGGER.exception("invalid analysis manifest for job %s", job.job_id)
@@ -464,9 +449,6 @@ async def health(request: Request) -> JSONResponse:
             "service": "framenote-media-core",
             "version": "1.1.0",
             "dependencies": dependencies,
-            "capabilities": {
-                "transcription": transcription_available(),
-            },
             "jobs": queue,
         },
         status_code=status.HTTP_200_OK if healthy else status.HTTP_503_SERVICE_UNAVAILABLE,
@@ -754,107 +736,6 @@ async def get_job(job_id: str, request: Request, response: Response) -> JobRespo
     return job_response(request, job)
 
 
-async def _complete_deferred_transcript(
-    job: JobRecord,
-    languages: tuple[str, ...],
-) -> None:
-    if not job.duration_seconds:
-        raise RuntimeError("视频时长不可用。")
-    job_dir = safe_job_dir(SETTINGS.state_root, job.job_id)
-    if not job.artifact_file:
-        raise RuntimeError("分析视频不可用。")
-    artifact = safe_artifact_path(job_dir, job.artifact_file)
-    ffmpeg = shutil.which("ffmpeg")
-    if not ffmpeg:
-        raise RuntimeError("FFmpeg 不可用。")
-    await asyncio.to_thread(
-        complete_analysis_transcript,
-        job_dir,
-        job.duration_seconds,
-        artifact,
-        ffmpeg,
-        languages,
-    )
-
-
-@app.post(
-    "/v1/media/jobs/{job_id}/transcript",
-    response_model=JobResponse,
-    response_model_exclude_none=True,
-    status_code=status.HTTP_202_ACCEPTED,
-    dependencies=[Depends(require_api_access)],
-)
-@app.post(
-    "/v1/bilibili/jobs/{job_id}/transcript",
-    response_model=JobResponse,
-    response_model_exclude_none=True,
-    status_code=status.HTTP_202_ACCEPTED,
-    dependencies=[Depends(require_api_access)],
-)
-async def start_transcript(
-    job_id: str,
-    request: Request,
-    response: Response,
-    options: TranscriptOptionsRequest | None = Body(default=None),
-) -> JobResponse:
-    if not is_valid_job_id(job_id):
-        raise api_error(status.HTTP_404_NOT_FOUND, "JOB_NOT_FOUND", "任务不存在。")
-    manager = manager_from_request(request)
-    job = await refreshed_job(manager, job_id)
-    if not job:
-        raise api_error(status.HTTP_404_NOT_FOUND, "JOB_NOT_FOUND", "任务不存在。")
-    if (
-        job.status != "succeeded"
-        or job.variant != "analysis"
-        or not job.analysis_manifest_file
-        or not job.artifact_file
-        or not job.duration_seconds
-    ):
-        raise api_error(
-            status.HTTP_409_CONFLICT,
-            "TRANSCRIPT_NOT_READY",
-            "分析视频尚未准备好，无法提取字幕。",
-        )
-    try:
-        manifest = _read_analysis_manifest(job)
-        transcript = manifest["transcript"]
-        transcript_status = transcript["status"]
-        if transcript_status not in {"pending", "ready", "unavailable"}:
-            raise ValueError("invalid transcript status")
-    except (KeyError, TypeError, ValueError, OSError, json.JSONDecodeError) as exc:
-        raise api_error(
-            status.HTTP_409_CONFLICT,
-            "TRANSCRIPT_NOT_READY",
-            "字幕分析清单无效，请重新生成总结。",
-        ) from exc
-
-    if transcript_status == "pending":
-        tasks: dict[str, asyncio.Task[None]] = request.app.state.transcription_tasks
-        existing = tasks.get(job_id)
-        if not existing or existing.done():
-            task = asyncio.create_task(
-                _complete_deferred_transcript(
-                    job,
-                    tuple((options or TranscriptOptionsRequest()).languages),
-                ),
-                name=f"funasr-{job_id}",
-            )
-            tasks[job_id] = task
-
-            def remove_finished(completed: asyncio.Task[None]) -> None:
-                if tasks.get(job_id) is completed:
-                    tasks.pop(job_id, None)
-                if not completed.cancelled() and completed.exception():
-                    LOGGER.error(
-                        "deferred FunASR failed for job %s",
-                        job_id,
-                        exc_info=completed.exception(),
-                    )
-
-            task.add_done_callback(remove_finished)
-
-    response.headers["Cache-Control"] = "no-store"
-    return job_response(request, job)
 
 
 @app.delete(
@@ -995,6 +876,8 @@ async def download_analysis_asset(
             if isinstance(raw_audio, dict)
             else set()
         ) | {
+            chunk["filename"] for chunk in manifest["transcriptionAudio"]
+        } | {
             frame["filename"] for frame in manifest["frames"]
         }
         if asset_name not in allowed:

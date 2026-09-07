@@ -2,9 +2,7 @@ from __future__ import annotations
 
 import json
 import math
-import re
 import subprocess
-import unicodedata
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable
@@ -13,11 +11,8 @@ from typing import Any, Callable
 MAX_KEYFRAMES = 64
 MAX_SCENE_TARGETS = 80
 PHASH_DUPLICATE_DISTANCE = 8
-SENTENCE_ENDINGS = ("。", "！", "？", "!", "?")
-CONTROL_TOKEN_PATTERN = re.compile(r"<\|[^|]+\|>")
-TOKEN_UNIT_PATTERN = re.compile(
-    r"[A-Za-z0-9]+(?:['’.-][A-Za-z0-9]+)*|[\u3400-\u9fff]|[^\w\s]",
-)
+
+
 @dataclass(slots=True)
 class FrameCandidate:
     timestamp: float
@@ -286,10 +281,29 @@ def extract_keyframes(
     return manifest_frames
 
 
-def extract_analysis_audio(ffmpeg: str, video_path: Path, output_dir: Path) -> tuple[Path, Path]:
+def _run_ffmpeg(command: list[str], error_message: str) -> None:
+    result = subprocess.run(
+        command,
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        timeout=600,
+        check=False,
+        shell=False,
+    )
+    if result.returncode != 0:
+        raise RuntimeError(error_message)
+
+
+def extract_analysis_audio(
+    ffmpeg: str,
+    video_path: Path,
+    output_dir: Path,
+    duration_seconds: float,
+) -> tuple[Path, list[dict[str, Any]]]:
+    """Create the summary audio plus API-sized chunks; no speech model runs locally."""
     mp3_path = output_dir / "analysis-audio.mp3"
-    wav_path = output_dir / "analysis-asr.wav"
-    commands = (
+    _run_ffmpeg(
         [
             ffmpeg,
             "-v",
@@ -308,458 +322,89 @@ def extract_analysis_audio(ffmpeg: str, video_path: Path, output_dir: Path) -> t
             "-y",
             str(mp3_path),
         ],
-        [
-            ffmpeg,
-            "-v",
-            "error",
-            "-i",
-            str(video_path),
-            "-map",
-            "0:a:0",
-            "-vn",
-            "-ac",
-            "1",
-            "-ar",
-            "16000",
-            "-c:a",
-            "pcm_s16le",
-            "-y",
-            str(wav_path),
-        ],
-    )
-    for command in commands:
-        result = subprocess.run(
-            command,
-            stdin=subprocess.DEVNULL,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            timeout=600,
-            check=False,
-            shell=False,
-        )
-        if result.returncode != 0:
-            raise RuntimeError("FFmpeg 无法提取分析音轨。")
-    return mp3_path, wav_path
-
-
-def extract_funasr_audio(
-    ffmpeg: str,
-    video_path: Path,
-    output_dir: Path,
-) -> Path:
-    wav_path = output_dir / "analysis-asr.wav"
-    result = subprocess.run(
-        [
-            ffmpeg,
-            "-v",
-            "error",
-            "-i",
-            str(video_path),
-            "-map",
-            "0:a:0",
-            "-vn",
-            "-ac",
-            "1",
-            "-ar",
-            "16000",
-            "-c:a",
-            "pcm_s16le",
-            "-y",
-            str(wav_path),
-        ],
-        stdin=subprocess.DEVNULL,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        timeout=600,
-        check=False,
-        shell=False,
-    )
-    if result.returncode != 0:
-        raise RuntimeError("FFmpeg 无法提取 FunASR 音轨。")
-    return wav_path
-
-
-@dataclass(frozen=True, slots=True)
-class TimedSubtitleToken:
-    text: str
-    start_seconds: float
-    end_seconds: float
-
-
-def _normalized_token_text(value: Any) -> str:
-    token = str(value or "").replace("▁", " ").replace("Ġ", " ")
-    return CONTROL_TOKEN_PATTERN.sub("", token)
-
-
-def _join_subtitle_tokens(tokens: list[TimedSubtitleToken]) -> str:
-    output = ""
-    for timed_token in tokens:
-        raw_token = timed_token.text
-        token = raw_token.strip()
-        if not token:
-            continue
-        previous = output[-1] if output else ""
-        first = token[0]
-        needs_space = bool(output) and (
-            raw_token[:1].isspace()
-            or (
-                previous.isascii()
-                and previous.isalnum()
-                and first.isascii()
-                and first.isalnum()
-            )
-        )
-        if needs_space:
-            output += " "
-        output += token
-    return output.strip()
-
-
-def _seconds_value(value: Any, *, milliseconds: bool) -> float | None:
-    if not isinstance(value, (int, float)) or not math.isfinite(float(value)):
-        return None
-    normalized = float(value) / 1000 if milliseconds else float(value)
-    return max(0.0, normalized)
-
-
-def _nano_timed_tokens(
-    item: dict[str, Any],
-    duration_seconds: float,
-) -> list[TimedSubtitleToken]:
-    raw_timestamps = item.get("timestamps")
-    if not isinstance(raw_timestamps, list):
-        return []
-    tokens: list[TimedSubtitleToken] = []
-    for raw_timestamp in raw_timestamps:
-        if not isinstance(raw_timestamp, dict):
-            continue
-        token = _normalized_token_text(
-            raw_timestamp.get("token")
-            or raw_timestamp.get("word")
-            or raw_timestamp.get("text")
-        )
-        start = _seconds_value(
-            raw_timestamp.get("start_time", raw_timestamp.get("start")),
-            milliseconds=False,
-        )
-        end = _seconds_value(
-            raw_timestamp.get("end_time", raw_timestamp.get("end")),
-            milliseconds=False,
-        )
-        if not token or start is None or end is None:
-            continue
-        start = min(duration_seconds, start)
-        end = min(duration_seconds, max(start + 0.01, end))
-        tokens.append(TimedSubtitleToken(token, start, end))
-    return sorted(tokens, key=lambda token: (token.start_seconds, token.end_seconds))
-
-
-def _standard_timestamp_text_units(text: str, count: int) -> list[str]:
-    lexical_units = TOKEN_UNIT_PATTERN.findall(text)
-    if len(lexical_units) == count:
-        return lexical_units
-    character_units = [character for character in text if not character.isspace()]
-    return character_units if len(character_units) == count else []
-
-
-def _standard_timed_tokens(
-    item: dict[str, Any],
-    text: str,
-    duration_seconds: float,
-) -> list[TimedSubtitleToken]:
-    raw_timestamps = item.get("timestamp")
-    if not isinstance(raw_timestamps, list):
-        return []
-    text_units = _standard_timestamp_text_units(text, len(raw_timestamps))
-    if not text_units:
-        return []
-    tokens: list[TimedSubtitleToken] = []
-    for text_unit, raw_timestamp in zip(text_units, raw_timestamps, strict=True):
-        if (
-            not isinstance(raw_timestamp, (list, tuple))
-            or len(raw_timestamp) != 2
-        ):
-            return []
-        start = _seconds_value(raw_timestamp[0], milliseconds=True)
-        end = _seconds_value(raw_timestamp[1], milliseconds=True)
-        if start is None or end is None:
-            return []
-        start = min(duration_seconds, start)
-        end = min(duration_seconds, max(start + 0.01, end))
-        tokens.append(TimedSubtitleToken(text_unit, start, end))
-    return tokens
-
-
-def _subtitle_cues_from_tokens(
-    tokens: list[TimedSubtitleToken],
-    duration_seconds: float,
-) -> list[dict[str, Any]]:
-    cues: list[dict[str, Any]] = []
-    current: list[TimedSubtitleToken] = []
-
-    def flush() -> None:
-        if not current:
-            return
-        cue_text = _join_subtitle_tokens(current)
-        if cue_text:
-            start_seconds = min(duration_seconds, current[0].start_seconds)
-            end_seconds = min(
-                duration_seconds,
-                max(start_seconds + 0.01, current[-1].end_seconds),
-            )
-            cues.append(
-                {
-                    "startSeconds": round(start_seconds, 3),
-                    "endSeconds": round(end_seconds, 3),
-                    "text": cue_text,
-                }
-            )
-        current.clear()
-
-    for token in tokens:
-        current.append(token)
-        if token.text.strip().endswith(SENTENCE_ENDINGS):
-            flush()
-    flush()
-    return cues
-
-
-def _is_punctuation_character(character: str) -> bool:
-    return bool(character) and unicodedata.category(character).startswith("P")
-
-
-def _text_without_punctuation(value: str) -> str:
-    restorable_punctuation = frozenset("，。！？；：、,.!?;:")
-    return "".join(
-        character
-        for character in value
-        if character not in restorable_punctuation
-    ).strip()
-
-
-def _canonical_lexical_text(value: str) -> str:
-    return "".join(
-        character.casefold()
-        for character in value
-        if not character.isspace() and not _is_punctuation_character(character)
+        "FFmpeg 无法提取分析音轨。",
     )
 
-
-def _timed_lexical_characters(
-    tokens: list[TimedSubtitleToken],
-) -> list[TimedSubtitleToken]:
-    characters: list[TimedSubtitleToken] = []
-    for token in tokens:
-        lexical_characters = [
-            character
-            for character in token.text
-            if not character.isspace()
-            and not _is_punctuation_character(character)
-        ]
-        if not lexical_characters:
-            continue
-        duration = max(0.01, token.end_seconds - token.start_seconds)
-        for index, character in enumerate(lexical_characters):
-            start_seconds = (
-                token.start_seconds + duration * index / len(lexical_characters)
-            )
-            end_seconds = (
-                token.start_seconds
-                + duration * (index + 1) / len(lexical_characters)
-            )
-            characters.append(
-                TimedSubtitleToken(character, start_seconds, end_seconds)
-            )
-    return characters
-
-
-def _subtitle_cues_from_repunctuated_text(
-    tokens: list[TimedSubtitleToken],
-    repunctuated_text: str,
-    duration_seconds: float,
-) -> list[dict[str, Any]]:
-    timed_characters = _timed_lexical_characters(tokens)
-    if (
-        not timed_characters
-        or _canonical_lexical_text(repunctuated_text)
-        != "".join(character.text.casefold() for character in timed_characters)
-    ):
-        return []
-
-    cues: list[dict[str, Any]] = []
-    sentence_characters: list[str] = []
-    sentence_start_index = 0
-    lexical_cursor = 0
-
-    def flush() -> None:
-        nonlocal sentence_start_index
-        sentence_text = "".join(sentence_characters).strip()
-        if sentence_text and lexical_cursor > sentence_start_index:
-            start_token = timed_characters[sentence_start_index]
-            end_token = timed_characters[lexical_cursor - 1]
-            cues.append(
-                {
-                    "startSeconds": round(
-                        min(duration_seconds, start_token.start_seconds),
-                        3,
-                    ),
-                    "endSeconds": round(
-                        min(
-                            duration_seconds,
-                            max(start_token.start_seconds + 0.01, end_token.end_seconds),
-                        ),
-                        3,
-                    ),
-                    "text": sentence_text,
-                }
-            )
-            sentence_start_index = lexical_cursor
-        sentence_characters.clear()
-
-    for character in repunctuated_text:
-        sentence_characters.append(character)
-        if (
-            not character.isspace()
-            and not _is_punctuation_character(character)
-        ):
-            lexical_cursor += 1
-        if character in SENTENCE_ENDINGS:
-            flush()
-    flush()
-    return cues
-
-
-def _sentence_info_cues(
-    item: dict[str, Any],
-    duration_seconds: float,
-) -> list[dict[str, Any]]:
-    raw_sentences = item.get("sentence_info")
-    cues: list[dict[str, Any]] = []
-    if not isinstance(raw_sentences, list):
-        return cues
-    for sentence in raw_sentences:
-        if not isinstance(sentence, dict):
-            continue
-        sentence_text = str(sentence.get("text") or "").strip()
-        start = sentence.get("start")
-        end = sentence.get("end")
-        if (
-            sentence_text
-            and isinstance(start, (int, float))
-            and isinstance(end, (int, float))
-        ):
-            cues.append(
-                {
-                    "startSeconds": round(max(0.0, float(start) / 1000), 3),
-                    "endSeconds": round(
-                        min(duration_seconds, max(float(start), float(end)) / 1000),
-                        3,
-                    ),
-                    "text": sentence_text,
-                }
-            )
-    return cues
-
-
-def _normalize_funasr_result(
-    result: Any,
-    duration_seconds: float,
-    repunctuated_text: str | None = None,
-    language: str = "auto",
-) -> dict[str, Any]:
-    item = result[0] if isinstance(result, list) and result else result
-    if not isinstance(item, dict):
-        raise RuntimeError("FunASR 返回了无效结果。")
-    text = str(item.get("text") or "").strip()
-    timed_tokens = _nano_timed_tokens(item, duration_seconds)
-    if not timed_tokens:
-        timed_tokens = _standard_timed_tokens(item, text, duration_seconds)
-    repunctuated_cues = (
-        _subtitle_cues_from_repunctuated_text(
-            timed_tokens,
-            repunctuated_text,
-            duration_seconds,
-        )
-        if timed_tokens and repunctuated_text
-        else []
-    )
-    if repunctuated_cues:
-        text = repunctuated_text.strip()
-        cues = repunctuated_cues
-    else:
-        cues = (
-            _subtitle_cues_from_tokens(timed_tokens, duration_seconds)
-            if timed_tokens
-            else _sentence_info_cues(item, duration_seconds)
-        )
-    if not cues and text:
-        cues.append(
+    chunk_seconds = 285.0
+    if duration_seconds <= chunk_seconds:
+        return mp3_path, [
             {
+                "filename": mp3_path.name,
+                "mimeType": "audio/mpeg",
+                "sizeBytes": mp3_path.stat().st_size,
                 "startSeconds": 0.0,
                 "endSeconds": round(duration_seconds, 3),
-                "text": text,
             }
-        )
-    return {
-        "status": "ready" if text else "unavailable",
-        "language": language,
-        "text": text,
-        "cues": cues,
-        **({} if text else {"error": "没有识别到可辨语音。"}),
-    }
+        ]
 
-
-def _dominant_transcript_language(text: str) -> str | None:
-    hiragana_or_katakana = sum(
-        1
-        for character in text
-        if "\u3040" <= character <= "\u30ff"
-        or "\u31f0" <= character <= "\u31ff"
+    segment_list = output_dir / "analysis-asr-chunks.csv"
+    segment_template = output_dir / "analysis-asr-%03d.mp3"
+    _run_ffmpeg(
+        [
+            ffmpeg,
+            "-v",
+            "error",
+            "-i",
+            str(mp3_path),
+            "-map",
+            "0:a:0",
+            "-c",
+            "copy",
+            "-f",
+            "segment",
+            "-segment_time",
+            str(chunk_seconds),
+            "-segment_list_type",
+            "csv",
+            "-segment_list",
+            str(segment_list),
+            "-reset_timestamps",
+            "1",
+            "-y",
+            str(segment_template),
+        ],
+        "FFmpeg 无法切分在线字幕音轨。",
     )
-    han = sum(1 for character in text if "\u3400" <= character <= "\u9fff")
-    latin = sum(
-        1
-        for character in text
-        if ("a" <= character.lower() <= "z")
-    )
-    if hiragana_or_katakana:
-        return "ja"
-    if han:
-        return "zh"
-    if latin:
-        return "en"
-    return None
 
+    chunks: list[dict[str, Any]] = []
+    try:
+        import csv
 
-def _filter_transcript_languages(
-    transcript: dict[str, Any],
-    languages: tuple[str, ...],
-) -> dict[str, Any]:
-    selected = tuple(dict.fromkeys(languages))
-    if not selected or len(selected) == 3:
-        transcript["language"] = "auto"
-        return transcript
-    transcript["language"] = ",".join(selected)
-    # A single selected language is already supplied to Nano as a decoding
-    # constraint. Filtering it again would incorrectly discard Japanese
-    # sentences made only from Kanji.
-    if len(selected) == 1:
-        return transcript
+        with segment_list.open("r", encoding="utf-8", newline="") as handle:
+            rows = list(csv.reader(handle))
+        for row in rows:
+            if len(row) < 3:
+                raise RuntimeError("在线字幕音轨清单无效。")
+            candidate = Path(row[0])
+            if not candidate.is_absolute():
+                candidate = output_dir / candidate
+            chunk_path = candidate.resolve()
+            if chunk_path.parent != output_dir.resolve():
+                raise RuntimeError("在线字幕音轨路径无效。")
+            start_seconds = max(0.0, float(row[1]))
+            end_seconds = min(duration_seconds, float(row[2]))
+            if (
+                not chunk_path.is_file()
+                or chunk_path.is_symlink()
+                or end_seconds <= start_seconds
+                or end_seconds - start_seconds > 300.5
+            ):
+                raise RuntimeError("在线字幕音轨分片无效。")
+            chunks.append(
+                {
+                    "filename": chunk_path.name,
+                    "mimeType": "audio/mpeg",
+                    "sizeBytes": chunk_path.stat().st_size,
+                    "startSeconds": round(start_seconds, 3),
+                    "endSeconds": round(end_seconds, 3),
+                }
+            )
+    finally:
+        segment_list.unlink(missing_ok=True)
 
-    cues = [
-        cue
-        for cue in transcript.get("cues", [])
-        if _dominant_transcript_language(str(cue.get("text") or ""))
-        in selected
-    ]
-    transcript["cues"] = cues
-    transcript["text"] = "".join(
-        str(cue.get("text") or "").strip() for cue in cues
-    ).strip()
-    if not transcript["text"]:
-        transcript["status"] = "unavailable"
-        transcript["error"] = "没有识别到所选语言的字幕。"
-    return transcript
+    if not chunks:
+        raise RuntimeError("没有生成在线字幕音轨。")
+    return mp3_path, chunks
 
 
 def build_analysis_manifest(
@@ -772,21 +417,22 @@ def build_analysis_manifest(
     on_progress: Callable[[str, float], None] | None = None,
 ) -> tuple[Path, dict[str, Any]]:
     report = on_progress or (lambda _stage, _progress: None)
-    audio: dict[str, Any] | None = None
+    report("extracting-audio", 0.05)
+    audio_path, transcription_audio = extract_analysis_audio(
+        ffmpeg,
+        video_path,
+        output_dir,
+        duration_seconds,
+    )
+    audio = {
+        "filename": audio_path.name,
+        "mimeType": "audio/mpeg",
+        "sizeBytes": audio_path.stat().st_size,
+    }
+    report("extracting-audio", 0.25)
+
     frames = []
     if include_keyframes:
-        report("extracting-audio", 0.05)
-        audio_path, _wav_path = extract_analysis_audio(
-            ffmpeg,
-            video_path,
-            output_dir,
-        )
-        audio = {
-            "filename": audio_path.name,
-            "mimeType": "audio/mpeg",
-            "sizeBytes": audio_path.stat().st_size,
-        }
-        report("extracting-audio", 0.25)
         report("extracting-keyframes", 0.30)
         frames = extract_keyframes(video_path, output_dir, duration_seconds)
         report("extracting-keyframes", 0.92)
@@ -797,15 +443,8 @@ def build_analysis_manifest(
         "version": 1,
         "mode": "keyframes" if include_keyframes else "direct",
         "audio": audio,
+        "transcriptionAudio": transcription_audio,
         "frames": frames,
-        # Qwen can start immediately. An independently installed transcription
-        # backend may replace this pending state after the summary is ready.
-        "transcript": {
-            "status": "pending",
-            "language": "zh",
-            "text": "",
-            "cues": [],
-        },
     }
     manifest_path = output_dir / "analysis-manifest.json"
     manifest_path.write_text(

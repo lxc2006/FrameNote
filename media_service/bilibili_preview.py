@@ -8,6 +8,11 @@ from dataclasses import dataclass
 from typing import Any, Mapping
 from urllib.parse import urlsplit
 
+from .bilibili_retry import (
+    BILIBILI_RESOLVE_ATTEMPTS,
+    resolve_bilibili_with_retries,
+)
+
 
 MAX_PREVIEW_QUALITY = 1080
 DEFAULT_BROWSER_USER_AGENT = (
@@ -39,10 +44,6 @@ class _PreviewYtDlpLogger:
 
     def error(self, message: str) -> None:
         self.last_error = message
-
-
-def _preview_retry_delay(attempt: int) -> float:
-    return min(8.0, 2.0 ** max(0, attempt - 1))
 
 
 class BilibiliPreviewError(RuntimeError):
@@ -112,14 +113,11 @@ def _resolve_bilibili_preview_sync(bvid: str) -> ResolvedBilibiliPreview:
         "skip_download": True,
         "noplaylist": True,
         "socket_timeout": 20,
-        "retries": 3,
-        "extractor_retries": 3,
-        "fragment_retries": 3,
-        "retry_sleep_functions": {
-            "http": _preview_retry_delay,
-            "extractor": _preview_retry_delay,
-            "fragment": _preview_retry_delay,
-        },
+        # Complete extraction retries below replace the old yt-dlp knobs, which
+        # did not retry Bilibili webpage/API HTTP 412 failures.
+        "retries": 0,
+        "extractor_retries": 0,
+        "fragment_retries": 0,
         "logger": preview_logger,
     }
     proxy = os.getenv("FRAMENOTE_MEDIA_PROXY", "").strip()
@@ -128,14 +126,24 @@ def _resolve_bilibili_preview_sync(bvid: str) -> ResolvedBilibiliPreview:
 
     try:
         with yt_dlp.YoutubeDL(options) as downloader:
-            raw_info = downloader.extract_info(
-                f"https://www.bilibili.com/video/{bvid}",
-                download=False,
+            raw_info = resolve_bilibili_with_retries(
+                lambda: downloader.extract_info(
+                    f"https://www.bilibili.com/video/{bvid}",
+                    download=False,
+                ),
+                (DownloadError, OSError),
+                on_retry=lambda attempt, total, delay, _error: LOGGER.debug(
+                    "Bilibili preview attempt %s/%s failed; retrying in %.1fs",
+                    attempt,
+                    total,
+                    delay,
+                ),
             )
     except DownloadError as exc:
         error_detail = preview_logger.last_error or str(exc)
         LOGGER.error(
-            "Bilibili preview failed after yt-dlp retries: %s",
+            "Bilibili preview failed after %s attempts: %s",
+            BILIBILI_RESOLVE_ATTEMPTS,
             error_detail,
         )
         is_precondition_failure = "HTTP Error 412" in error_detail
@@ -146,15 +154,20 @@ def _resolve_bilibili_preview_sync(bvid: str) -> ResolvedBilibiliPreview:
                 else "BILIBILI_RESOLVE_FAILED"
             ),
             (
-                "B站暂时拒绝了视频解析请求，请稍后重试或更换网络。"
+                f"B站连续 {BILIBILI_RESOLVE_ATTEMPTS} 次拒绝了视频解析请求，请稍后重试或更换网络。"
                 if is_precondition_failure
-                else "yt-dlp 无法解析这个 B 站视频，请稍后重试。"
+                else f"连续 {BILIBILI_RESOLVE_ATTEMPTS} 次无法解析这个 B站视频，请稍后重试。"
             ),
         ) from exc
     except OSError as exc:
+        LOGGER.error(
+            "Bilibili preview failed after %s attempts: %s",
+            BILIBILI_RESOLVE_ATTEMPTS,
+            exc,
+        )
         raise BilibiliPreviewError(
             "BILIBILI_NETWORK_ERROR",
-            "yt-dlp 连接 B 站失败，请检查媒体服务网络。",
+            f"连续 {BILIBILI_RESOLVE_ATTEMPTS} 次连接 B站失败，请检查媒体服务网络。",
         ) from exc
 
     info = _first_video_info(raw_info)

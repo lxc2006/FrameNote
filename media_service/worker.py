@@ -15,6 +15,13 @@ import unicodedata
 from pathlib import Path
 from typing import Any
 
+_PACKAGE_ROOT = str(Path(__file__).resolve().parent.parent)
+if _PACKAGE_ROOT not in sys.path:
+    # The isolated source worker omits the repository root from sys.path.
+    sys.path.insert(0, _PACKAGE_ROOT)
+
+from media_service.bilibili_retry import resolve_bilibili_with_retries
+
 
 BVID_RE = re.compile(r"^BV[0-9A-Za-z]{10}$", re.ASCII)
 JOB_ID_RE = re.compile(
@@ -218,14 +225,17 @@ class ProgressReporter:
 
 
 class QuietLogger:
+    def __init__(self) -> None:
+        self.last_error: str | None = None
+
     def debug(self, message: str) -> None:
         del message
 
     def warning(self, message: str) -> None:
-        sys.stderr.write(f"yt-dlp warning: {message[:1000]}\n")
+        del message
 
     def error(self, message: str) -> None:
-        sys.stderr.write(f"yt-dlp error: {message[:1000]}\n")
+        self.last_error = message[:1000]
 
 
 def download_retry_delay(attempt: int) -> float:
@@ -239,7 +249,8 @@ def download_network_options() -> dict[str, Any]:
         "retries": DOWNLOAD_RETRIES,
         "fragment_retries": DOWNLOAD_RETRIES,
         "file_access_retries": 3,
-        "extractor_retries": 5,
+        # Metadata resolution uses the complete five-attempt loop below.
+        "extractor_retries": 0,
         "retry_sleep_functions": {
             "http": download_retry_delay,
             "fragment": download_retry_delay,
@@ -577,7 +588,7 @@ def build_and_emit_analysis(
         manifestFile=manifest_path.name,
         mode=manifest["mode"],
         frameCount=len(manifest["frames"]),
-        transcriptStatus=manifest["transcript"]["status"],
+        transcriptionChunkCount=len(manifest["transcriptionAudio"]),
     )
 
 
@@ -665,7 +676,11 @@ def classify_download_error(message: str, resolving: bool) -> WorkerFailure:
             False,
         )
     if resolving:
-        return WorkerFailure("METADATA_FAILED", "无法获取 B 站视频信息，请稍后重试。", True)
+        return WorkerFailure(
+            "METADATA_FAILED",
+            "连续 5 次无法获取 B站视频信息，请稍后重试。",
+            True,
+        )
     return WorkerFailure("DOWNLOAD_FAILED", "B 站视频下载失败，请稍后重试。", True)
 
 
@@ -716,6 +731,7 @@ def run(args: argparse.Namespace) -> None:
             "DEPENDENCY_MISSING", "服务器未安装 yt-dlp。", False
         ) from exc
 
+    quiet_logger = QuietLogger()
     options: dict[str, Any] = {
         "ignoreconfig": True,
         "noplaylist": True,
@@ -735,7 +751,7 @@ def run(args: argparse.Namespace) -> None:
         "quiet": True,
         "no_warnings": True,
         "noprogress": True,
-        "logger": QuietLogger(),
+        "logger": quiet_logger,
         "progress_hooks": [reporter.download_hook],
         "postprocessor_hooks": [reporter.postprocessor_hook],
         "postprocessors": [
@@ -757,7 +773,15 @@ def run(args: argparse.Namespace) -> None:
     resolving = True
     try:
         with yt_dlp.YoutubeDL(options) as downloader:
-            info = downloader.extract_info(url, download=False)
+            info = resolve_bilibili_with_retries(
+                lambda: downloader.extract_info(url, download=False),
+                (DownloadError, OSError),
+                on_retry=lambda attempt, total, _delay, _error: emit(
+                    "progress",
+                    phase="resolving",
+                    progress=round(0.02 + 0.01 * attempt / total, 4),
+                ),
+            )
             if not isinstance(info, dict):
                 raise WorkerFailure("METADATA_FAILED", "B 站视频信息无效。", True)
             title, duration, description = validate_video_info(
@@ -779,7 +803,9 @@ def run(args: argparse.Namespace) -> None:
             raise WorkerFailure(
                 "VIDEO_TOO_LARGE", "下载内容超过媒体服务大小限制。", False
             ) from exc
-        raise classify_download_error(str(exc), resolving) from exc
+        raise classify_download_error(
+            quiet_logger.last_error or str(exc), resolving
+        ) from exc
     except Exception as exc:
         if reporter.limit_exceeded:
             raise WorkerFailure(

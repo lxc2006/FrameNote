@@ -106,7 +106,6 @@ export async function assessAnswerReadiness(
         context.stage === "initial"
           ? "answer_readiness_initial"
           : "answer_readiness_after_recall",
-      deepSeekTier: "flash",
     });
     if (usage) onUsage?.(usage);
     const content = completion.choices[0]?.message.content?.trim();

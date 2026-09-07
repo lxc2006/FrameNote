@@ -28,7 +28,6 @@
     "desktop:preview": "electron-vite preview",
     "desktop:smoke-ipc": "node scripts/desktop-ipc-smoke.mjs",
     "media:core:build": "powershell -NoProfile -ExecutionPolicy Bypass -File scripts/build-media-core.ps1",
-    "subtitles:build": "powershell -NoProfile -ExecutionPolicy Bypass -File scripts/build-subtitle-extension.ps1",
     "test": "node --test tests/analysis-progress.test.mjs tests/markdown-content.test.mjs tests/model-usage.test.mjs tests/qwen-video-parser.test.mjs tests/video-recall.test.mjs",
     "lint": "eslint src electron.vite.config.ts"
   },

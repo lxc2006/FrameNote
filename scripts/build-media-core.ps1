@@ -40,7 +40,7 @@ $forbiddenFiles = Get-ChildItem -LiteralPath $distribution -Recurse -Force | Whe
 }
 if ($forbiddenFiles) {
   $paths = ($forbiddenFiles | Select-Object -ExpandProperty FullName) -join [Environment]::NewLine
-  throw "The core package contains forbidden subtitle or model files:$([Environment]::NewLine)$paths"
+  throw "The core package contains forbidden local speech-model files:$([Environment]::NewLine)$paths"
 }
 
 $archiveViewer = Join-Path $buildEnvironment "Scripts\pyi-archive_viewer.exe"
@@ -50,10 +50,10 @@ if ($LASTEXITCODE -ne 0) {
 }
 $forbiddenArchiveModules = "(?im)^\s*(funasr|huggingface_hub|media_service\.transcription_funasr|modelscope|tiktoken|torch|torchaudio|torchvision|transformers)(?:[.\\/]|$)"
 if (($archiveListing -join [Environment]::NewLine) -match $forbiddenArchiveModules) {
-  throw "The core executable contains a forbidden subtitle or model module."
+  throw "The core executable contains a forbidden local speech-model module."
 }
 
 $size = (Get-ChildItem -LiteralPath $distribution -Recurse -File | Measure-Object -Property Length -Sum).Sum
 Write-Output "Built: $executable"
 Write-Output ("Core onedir size: {0:N1} MB" -f ($size / 1MB))
-Write-Output "Verified: no FunASR, CT-Punc, PyTorch, Transformers, ModelScope, subtitle modules, or subtitle model files."
+Write-Output "Verified: the media core contains no local speech-recognition runtime or model files."

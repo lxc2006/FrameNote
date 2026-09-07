@@ -297,7 +297,6 @@ async function planRecall(
       provider: "deepseek",
       model: config.flashModel,
       operation: "recall_plan",
-      deepSeekTier: "flash",
     });
     if (usage) onUsage?.(usage);
     const content = completion.choices[0]?.message.content?.trim();
@@ -762,7 +761,6 @@ async function rerankCandidates(
       provider: "deepseek",
       model: config.flashModel,
       operation: "recall_rerank",
-      deepSeekTier: "flash",
     });
     if (usage) onUsage?.(usage);
     const content = completion.choices[0]?.message.content?.trim();

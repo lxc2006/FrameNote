@@ -8,6 +8,8 @@ export interface VideoSourceDescriptor {
   durationLabel?: string;
   bvid?: string;
   sourceUrl?: string;
+  /** 用户选择的原视频绝对路径，仅用于桌面本地恢复，不发送给模型。 */
+  localPath?: string;
   /** B站视频页公开简介。 */
   description?: string;
 }

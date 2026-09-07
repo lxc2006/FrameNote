@@ -3,6 +3,10 @@ import type {
   VideoSourceDescriptor,
   VideoSummary,
 } from "../../../shared/media-types";
+import type {
+  ConversationWebSearchFailure,
+  ConversationWebSearchStatus,
+} from "../../../shared/conversation-types";
 
 export type WebSearchDecision = "search" | "skip" | "forbidden";
 
@@ -41,10 +45,14 @@ export interface WebSearchSource {
 }
 
 export interface WebSearchEvidence {
-  status: "searched" | "skipped" | "forbidden" | "unavailable";
+  status: ConversationWebSearchStatus;
   plan: WebSearchPlan;
   query?: string;
   sources: WebSearchSource[];
   visitedPageCount: number;
+  requestIssued: boolean;
+  candidateCount: number;
+  extractionFailureCount: number;
+  failures: ConversationWebSearchFailure[];
   note?: string;
 }

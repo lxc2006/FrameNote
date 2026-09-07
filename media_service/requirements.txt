@@ -1,2 +1,2 @@
 -r requirements-core.txt
--r requirements-transcription.txt
+-r requirements-core.txt

@@ -43,5 +43,7 @@ yarn-error.log*
 /media_service/build-subtitles/
 /media_service/dist/
 /release/
-计划.md
-日志.md
+plan.md
+logs.md
+
+release_notes.md

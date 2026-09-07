@@ -1,19 +1,15 @@
-import { contextBridge, ipcRenderer } from "electron";
+import { contextBridge, ipcRenderer, webUtils } from "electron";
 import {
   DESKTOP_CHANNELS,
   type DesktopModelEvent,
+  type DesktopTranscriptionProgress,
   type FrameNoteDesktopApi,
-  type SubtitleExtensionStatus,
 } from "../shared/ipc-contract";
 
 const modelSubscriptions = new Map<
   string,
   (event: DesktopModelEvent["event"]) => void
 >();
-const subtitleSubscriptions = new Set<
-  (status: SubtitleExtensionStatus) => void
->();
-
 ipcRenderer.on(
   DESKTOP_CHANNELS.modelEvent,
   (_event, message: DesktopModelEvent) => {
@@ -21,10 +17,17 @@ ipcRenderer.on(
   },
 );
 
+const transcriptionSubscriptions = new Map<
+  string,
+  (progress: Omit<DesktopTranscriptionProgress, "requestId">) => void
+>();
 ipcRenderer.on(
-  DESKTOP_CHANNELS.subtitlesStatus,
-  (_event, status: SubtitleExtensionStatus) => {
-    for (const listener of subtitleSubscriptions) listener(status);
+  DESKTOP_CHANNELS.transcriptionProgress,
+  (_event, message: DesktopTranscriptionProgress) => {
+    transcriptionSubscriptions.get(message.requestId)?.({
+      completedChunks: message.completedChunks,
+      totalChunks: message.totalChunks,
+    });
   },
 );
 
@@ -97,17 +100,20 @@ const mediaApi: FrameNoteDesktopApi["media"] = Object.freeze({
   getConnection: () => ipcRenderer.invoke(DESKTOP_CHANNELS.mediaGetConnection),
 });
 
-const subtitleApi: FrameNoteDesktopApi["subtitles"] = Object.freeze({
-  getStatus: () => ipcRenderer.invoke(DESKTOP_CHANNELS.subtitlesGetStatus),
-  checkForUpdates: () =>
-    ipcRenderer.invoke(DESKTOP_CHANNELS.subtitlesCheckForUpdates),
-  install: () => ipcRenderer.invoke(DESKTOP_CHANNELS.subtitlesInstall),
-  uninstall: () => ipcRenderer.invoke(DESKTOP_CHANNELS.subtitlesUninstall),
-  subscribe: (listener) => {
-    subtitleSubscriptions.add(listener);
+const transcriptionApi: FrameNoteDesktopApi["transcription"] = Object.freeze({
+  extract: (requestId, input) =>
+    ipcRenderer.invoke(
+      DESKTOP_CHANNELS.transcriptionExtract,
+      requestId,
+      input,
+    ),
+  cancelRequest: (requestId) =>
+    ipcRenderer.send(DESKTOP_CHANNELS.modelCancel, requestId),
+  subscribe: (requestId, listener) => {
+    transcriptionSubscriptions.set(requestId, listener);
   },
-  unsubscribe: (listener) => {
-    subtitleSubscriptions.delete(listener);
+  unsubscribe: (requestId) => {
+    transcriptionSubscriptions.delete(requestId);
   },
 });
 
@@ -115,8 +121,20 @@ const desktopApi: FrameNoteDesktopApi = Object.freeze({
   getRuntimeInfo: () => ipcRenderer.invoke(DESKTOP_CHANNELS.getRuntimeInfo),
   openExternal: (url: string) =>
     ipcRenderer.invoke(DESKTOP_CHANNELS.openExternal, url),
+  clipboard: Object.freeze({
+    writeText: (text: string) =>
+      ipcRenderer.invoke(DESKTOP_CHANNELS.clipboardWriteText, text),
+  }),
   media: mediaApi,
-  subtitles: subtitleApi,
+  videoFiles: Object.freeze({
+    pathForFile: (file: File) => webUtils.getPathForFile(file),
+    openLocal: (path: string) => ipcRenderer.invoke(DESKTOP_CHANNELS.videoOpenLocal, path),
+    releaseLocal: (url: string) => ipcRenderer.send(DESKTOP_CHANNELS.videoReleaseLocal, url),
+    download: (requestId: string, input: Parameters<FrameNoteDesktopApi["videoFiles"]["download"]>[1]) =>
+      ipcRenderer.invoke(DESKTOP_CHANNELS.videoDownload, requestId, input),
+    cancelDownload: (requestId: string) => ipcRenderer.send(DESKTOP_CHANNELS.videoCancelDownload, requestId),
+  }),
+  transcription: transcriptionApi,
   model: modelApi,
   conversations: conversationApi,
   settings: settingsApi,

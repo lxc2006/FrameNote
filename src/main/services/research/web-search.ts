@@ -7,6 +7,7 @@ import type {
   WebSearchSource,
 } from "./web-search-types";
 import type { ModelUsageSink } from "../../../shared/model-usage";
+import type { ConversationWebSearchFailure } from "../../../shared/conversation-types";
 
 export type {
   WebSearchEvidence,
@@ -39,6 +40,11 @@ interface SerpApiResult {
   };
 }
 
+interface SearchCandidateResult {
+  candidates: SearchCandidate[];
+  failure?: ConversationWebSearchFailure;
+}
+
 interface WebSearchUsageHooks {
   onModelUsage?: ModelUsageSink;
   onSearchRequest?: () => void;
@@ -67,6 +73,16 @@ export async function prepareWebSearch(
       },
       sources: [],
       visitedPageCount: 0,
+      requestIssued: false,
+      candidateCount: 0,
+      extractionFailureCount: 0,
+      failures: [
+        {
+          stage: "search",
+          code: "SEARCH_PLANNING_FAILED",
+          message: safeErrorMessage(error, "搜索规划模型暂时不可用。"),
+        },
+      ],
       note: "未能完成联网意图判断与关键词提取，本轮没有执行搜索。",
     };
   }
@@ -78,6 +94,10 @@ export async function prepareWebSearch(
       plan,
       sources: [],
       visitedPageCount: 0,
+      requestIssued: false,
+      candidateCount: 0,
+      extractionFailureCount: 0,
+      failures: [],
       note:
         status === "forbidden"
           ? "搜索规划判断本轮不应访问公开网页。"
@@ -93,39 +113,77 @@ export async function prepareWebSearch(
       query: plan.query,
       sources: [],
       visitedPageCount: 0,
+      requestIssued: false,
+      candidateCount: 0,
+      extractionFailureCount: 0,
+      failures: [
+        {
+          stage: "search",
+          code: "SERPAPI_NOT_CONFIGURED",
+          message: "尚未配置 SerpAPI Key。",
+        },
+      ],
       note: "尚未配置 SERPAPI_API_KEY，无法执行联网检索。",
     };
   }
 
   usageHooks.onSearchRequest?.();
-  const candidates = await searchSerpApi(
+  const searchResult = await searchSerpApi(
     plan.query,
     plan.searchLanguage ?? context.locale,
     plan.countryCode ?? countryCodeFromRegion(context.region),
     apiKey,
     signal,
   );
+  const candidates = searchResult.candidates;
   if (!candidates.length) {
+    const note = searchResult.failure?.message
+      ? `搜索已执行，但未取得可读网页：${searchResult.failure.message}`
+      : "搜索已执行，但 SerpAPI 没有返回网页候选结果。";
     return {
       status: "unavailable",
       plan,
       query: plan.query,
       sources: [],
       visitedPageCount: 0,
-      note: "SerpAPI 没有返回可读取的网页结果。",
+      requestIssued: true,
+      candidateCount: 0,
+      extractionFailureCount: 0,
+      failures: searchResult.failure ? [searchResult.failure] : [],
+      note,
     };
   }
 
   const sources: WebSearchSource[] = [];
+  const failures: ConversationWebSearchFailure[] = [];
+  let extractionFailureCount = 0;
   for (const candidate of candidates) {
     if (sources.length >= TARGET_READABLE_PAGES) break;
-    const document = await extractWebDocument(candidate.url, signal);
-    if (!document) continue;
+    const extraction = await extractWebDocument(candidate.url, signal);
+    if (!extraction.ok) {
+      extractionFailureCount += 1;
+      failures.push({
+        stage: "extract",
+        code: extraction.code,
+        message: extraction.message,
+        url: candidate.url,
+      });
+      continue;
+    }
+    const document = extraction.document;
     const passages = selectRelevantPassages(
       document.text,
       `${plan.query} ${context.question}`,
     );
-    if (!passages.length) continue;
+    if (!passages.length) {
+      failures.push({
+        stage: "filter",
+        code: "NO_RELEVANT_PASSAGES",
+        message: "网页正文已读取，但没有筛选出与问题相关的段落。",
+        url: candidate.url,
+      });
+      continue;
+    }
     const finalUrl = document.finalUrl;
     sources.push({
       index: sources.length + 1,
@@ -152,11 +210,16 @@ export async function prepareWebSearch(
     query: plan.query,
     sources,
     visitedPageCount: sources.length,
+    requestIssued: true,
+    candidateCount: candidates.length,
+    extractionFailureCount,
+    failures,
     ...(sources.length
       ? {}
       : {
-          note:
-            "搜索结果均无法读取：可能需要登录、触发了反爬验证，或没有可提取正文。",
+          note: `搜索已执行并取得 ${candidates.length} 个候选结果，但未取得可读网页正文。${
+            failures[0]?.message ? ` 首个失败原因：${failures[0].message}` : ""
+          }`,
         }),
   };
 }
@@ -167,7 +230,7 @@ async function searchSerpApi(
   countryCode: string | undefined,
   apiKey: string,
   signal?: AbortSignal,
-) {
+): Promise<SearchCandidateResult> {
   const endpoint = serpApiEndpoint();
   endpoint.searchParams.set("engine", "google");
   endpoint.searchParams.set("q", query);
@@ -195,13 +258,59 @@ async function searchSerpApi(
     const body = (await response.json().catch(() => null)) as
       | SerpApiResult
       | null;
-    if (!response.ok || !body || typeof body !== "object") return [];
-    if (typeof body.error === "string" && body.error.trim()) return [];
-    return collectCandidates(body).slice(0, MAX_SEARCH_CANDIDATES);
+    if (!response.ok) {
+      return {
+        candidates: [],
+        failure: {
+          stage: "search",
+          code: `SERPAPI_HTTP_${response.status}`,
+          message:
+            typeof body?.error === "string" && body.error.trim()
+              ? body.error.trim().slice(0, 500)
+              : `SerpAPI 请求失败（HTTP ${response.status}）。`,
+        },
+      };
+    }
+    if (!body || typeof body !== "object") {
+      return {
+        candidates: [],
+        failure: {
+          stage: "search",
+          code: "SERPAPI_INVALID_RESPONSE",
+          message: "SerpAPI 返回了无法解析的响应。",
+        },
+      };
+    }
+    if (typeof body.error === "string" && body.error.trim()) {
+      return {
+        candidates: [],
+        failure: {
+          stage: "search",
+          code: "SERPAPI_ERROR",
+          message: body.error.trim().slice(0, 500),
+        },
+      };
+    }
+    return {
+      candidates: collectCandidates(body).slice(0, MAX_SEARCH_CANDIDATES),
+    };
   } catch (error) {
     if (signal?.aborted) throw error;
-    return [];
+    return {
+      candidates: [],
+      failure: {
+        stage: "search",
+        code: "SERPAPI_REQUEST_FAILED",
+        message: safeErrorMessage(error, "SerpAPI 请求失败。"),
+      },
+    };
   }
+}
+
+function safeErrorMessage(error: unknown, fallback: string) {
+  return error instanceof Error && error.message.trim()
+    ? error.message.trim().slice(0, 500)
+    : fallback;
 }
 
 function serpApiEndpoint() {

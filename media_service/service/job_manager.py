@@ -914,13 +914,6 @@ class JobManager:
             "HOMEPATH",
             "LOCALAPPDATA",
             "APPDATA",
-            "MODELSCOPE_CACHE",
-            "HF_HOME",
-            "TORCH_HOME",
-            "FRAMENOTE_FUNASR_MODEL",
-            "FRAMENOTE_FUNASR_VAD_MODEL",
-            "FRAMENOTE_FUNASR_PUNC_MODEL",
-            "FRAMENOTE_FUNASR_DEVICE",
             "FRAMENOTE_MEDIA_PROXY",
         }
         environment = {

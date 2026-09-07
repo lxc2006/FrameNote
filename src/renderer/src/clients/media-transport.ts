@@ -35,8 +35,3 @@ export async function mediaApiFetch(path: string, init?: RequestInit) {
     credentials: "omit",
   });
 }
-
-export async function getMediaCapabilities() {
-  const connection = await getDesktopConnection();
-  return connection?.capabilities;
-}

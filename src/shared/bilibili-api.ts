@@ -57,18 +57,12 @@ export interface BilibiliAnalysisFrame {
   sizeBytes: number;
 }
 
-export interface BilibiliTranscriptCue {
+export interface TranscriptionAudioChunk {
+  url: string;
+  mimeType: "audio/mpeg";
+  sizeBytes: number;
   startSeconds: number;
   endSeconds: number;
-  text: string;
-}
-
-export interface BilibiliTranscript {
-  status: "pending" | "ready" | "unavailable";
-  text: string;
-  cues: BilibiliTranscriptCue[];
-  language?: string;
-  error?: string;
 }
 
 export interface BilibiliAnalysis {
@@ -78,8 +72,8 @@ export interface BilibiliAnalysis {
     mimeType: string;
     sizeBytes: number;
   };
+  transcriptionAudio: TranscriptionAudioChunk[];
   frames: BilibiliAnalysisFrame[];
-  transcript: BilibiliTranscript;
 }
 
 export interface BilibiliJobError {

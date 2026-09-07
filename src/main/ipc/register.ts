@@ -1,4 +1,4 @@
-import { app, ipcMain, type IpcMainInvokeEvent } from "electron";
+import { app, clipboard, ipcMain, type IpcMainInvokeEvent } from "electron";
 import type { AnalyzeVideoResponse, AskVideoResponse } from "../../shared/model-types";
 import { ConversationService } from "../services/conversation-service";
 import {
@@ -17,12 +17,20 @@ import {
   type DesktopIpcError,
   type DesktopIpcResult,
   type DesktopModelEvent,
+  type DesktopTranscriptionProgress,
 } from "../../shared/ipc-contract";
 import type { DesktopDatabase } from "../database/database";
 import type { MediaSidecarManager } from "../media/media-sidecar";
-import type { SubtitleExtensionManager } from "../extensions/subtitle-extension";
 import type { CredentialStore } from "../security/credential-store";
 import type { ModelCredentialUpdate } from "../../shared/credential-types";
+import {
+  QwenAsrError,
+  transcribeMediaJob,
+} from "../model/qwen-asr-service";
+import type {
+  TranscriptLanguage,
+  VideoTranscript,
+} from "../../shared/media-types";
 
 const REQUEST_ID_PATTERN =
   /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
@@ -82,6 +90,13 @@ async function runModelRequest<T>(
         retryable: true,
       });
     }
+    if (error instanceof QwenAsrError) {
+      return failure({
+        code: error.code,
+        message: error.message,
+        retryable: error.retryable,
+      });
+    }
     const details = modelErrorDetails(error, provider);
     return failure({
       code: details.code,
@@ -126,7 +141,6 @@ export function registerDesktopIpc(
   database: DesktopDatabase,
   conversations: ConversationService,
   mediaSidecar: MediaSidecarManager,
-  subtitleExtension: SubtitleExtensionManager,
   credentialStore: CredentialStore,
 ) {
   ipcMain.handle(DESKTOP_CHANNELS.getRuntimeInfo, () => ({
@@ -134,6 +148,30 @@ export function registerDesktopIpc(
     isPackaged: app.isPackaged,
     platform: process.platform,
   }));
+
+  ipcMain.handle(
+    DESKTOP_CHANNELS.clipboardWriteText,
+    (_event, value: unknown): DesktopIpcResult<void> => {
+      if (typeof value !== "string" || value.length > 1_000_000) {
+        return failure({
+          code: "INVALID_CLIPBOARD_TEXT",
+          message: "要复制的文本无效或过长。",
+          retryable: false,
+        });
+      }
+      try {
+        clipboard.writeText(value);
+        return success(undefined);
+      } catch (error) {
+        console.error("Unable to write desktop clipboard", error);
+        return failure({
+          code: "CLIPBOARD_WRITE_FAILED",
+          message: "无法写入系统剪贴板。",
+          retryable: true,
+        });
+      }
+    },
+  );
 
   ipcMain.handle(DESKTOP_CHANNELS.mediaGetConnection, () => {
     try {
@@ -186,6 +224,33 @@ export function registerDesktopIpc(
               };
               event.sender.send(DESKTOP_CHANNELS.modelEvent, message);
             },
+          }),
+      ),
+  );
+
+  ipcMain.handle(
+    DESKTOP_CHANNELS.transcriptionExtract,
+    (
+      event,
+      requestId: string,
+      input: {
+        jobId: string;
+        jobKind: "media" | "bilibili";
+        languages: TranscriptLanguage[];
+      },
+    ) =>
+      runModelRequest<VideoTranscript>(
+        event,
+        requestId,
+        "qwen",
+        (signal) =>
+          transcribeMediaJob(input, signal, (progress) => {
+            if (event.sender.isDestroyed()) return;
+            const message: DesktopTranscriptionProgress = {
+              requestId,
+              ...progress,
+            };
+            event.sender.send(DESKTOP_CHANNELS.transcriptionProgress, message);
           }),
       ),
   );
@@ -273,75 +338,6 @@ export function registerDesktopIpc(
     },
   );
 
-  const subtitleFailure = (error: unknown) =>
-    failure({
-      code: "SUBTITLE_EXTENSION_ERROR",
-      message:
-        error instanceof Error ? error.message : "字幕扩展操作失败。",
-      retryable: true,
-    });
-  const notifySubtitleStatus = (
-    event: IpcMainInvokeEvent,
-    status: ReturnType<SubtitleExtensionManager["getStatus"]>,
-  ) => {
-    if (!event.sender.isDestroyed()) {
-      event.sender.send(DESKTOP_CHANNELS.subtitlesStatus, status);
-    }
-  };
-
-  ipcMain.handle(DESKTOP_CHANNELS.subtitlesGetStatus, () =>
-    success(subtitleExtension.getStatus()),
-  );
-  ipcMain.handle(
-    DESKTOP_CHANNELS.subtitlesCheckForUpdates,
-    async () => {
-      try {
-        return success(await subtitleExtension.checkForUpdates());
-      } catch (error) {
-        return subtitleFailure(error);
-      }
-    },
-  );
-  ipcMain.handle(DESKTOP_CHANNELS.subtitlesInstall, async (event) => {
-    try {
-      const status = await subtitleExtension.install((nextStatus) =>
-        notifySubtitleStatus(event, nextStatus),
-      );
-      mediaSidecar.setTranscriptionExecutable(
-        subtitleExtension.getExecutable(),
-      );
-      await mediaSidecar.restart();
-      notifySubtitleStatus(event, status);
-      return success(status);
-    } catch (error) {
-      return subtitleFailure(error);
-    }
-  });
-  ipcMain.handle(DESKTOP_CHANNELS.subtitlesUninstall, async (event) => {
-    let stopped = false;
-    try {
-      await mediaSidecar.stop();
-      stopped = true;
-      const status = await subtitleExtension.uninstall((nextStatus) =>
-        notifySubtitleStatus(event, nextStatus),
-      );
-      mediaSidecar.setTranscriptionExecutable(undefined);
-      await mediaSidecar.start();
-      stopped = false;
-      notifySubtitleStatus(event, status);
-      return success(status);
-    } catch (error) {
-      if (stopped) {
-        mediaSidecar.setTranscriptionExecutable(
-          subtitleExtension.getExecutable(),
-        );
-        void mediaSidecar.start().catch((restartError) => {
-          console.error("Unable to restart media core after subtitle error", restartError);
-        });
-      }
-      return subtitleFailure(error);
-    }
-  });
 }
 
 export function abortDesktopModelRequests() {

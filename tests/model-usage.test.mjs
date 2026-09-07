@@ -6,7 +6,7 @@ import {
   parseConversationUsageRecord,
 } from "../src/shared/model-usage.ts";
 
-test("prices Qwen multimodal input from the provider usage breakdown", () => {
+test("normalizes Qwen multimodal token usage with token fields only", () => {
   const usage = normalizeModelCallUsage(
     {
       prompt_tokens: 1_000,
@@ -28,11 +28,21 @@ test("prices Qwen multimodal input from the provider usage breakdown", () => {
 
   assert.ok(usage);
   assert.equal(usage.totalTokens, 1_100);
-  assert.equal(usage.estimatedCostCnyMicros, 24_800);
+  assert.equal(usage.promptTokens, 1_000);
+  assert.equal(usage.completionTokens, 100);
   assert.equal(usage.tokenDetails.audioTokens, 300);
+  assert.deepEqual(Object.keys(usage).sort(), [
+    "completionTokens",
+    "model",
+    "operation",
+    "promptTokens",
+    "provider",
+    "tokenDetails",
+    "totalTokens",
+  ]);
 });
 
-test("prices DeepSeek cache hit, cache miss, and output tokens separately", () => {
+test("normalizes DeepSeek cache and reasoning token details", () => {
   const raw = {
     prompt_tokens: 1_000,
     completion_tokens: 200,
@@ -41,24 +51,16 @@ test("prices DeepSeek cache hit, cache miss, and output tokens separately", () =
     prompt_cache_miss_tokens: 600,
     completion_tokens_details: { reasoning_tokens: 120 },
   };
-  const flash = normalizeModelCallUsage(raw, {
+  const usage = normalizeModelCallUsage(raw, {
     provider: "deepseek",
     model: "deepseek-v4-flash",
     operation: "recall_plan",
-    deepSeekTier: "flash",
-  });
-  const pro = normalizeModelCallUsage(raw, {
-    provider: "deepseek",
-    model: "deepseek-v4-pro",
-    operation: "chat_answer",
-    deepSeekTier: "pro",
   });
 
-  assert.ok(flash);
-  assert.ok(pro);
-  assert.equal(flash.estimatedCostCnyMicros, 1_016);
-  assert.equal(pro.estimatedCostCnyMicros, 3_142);
-  assert.equal(pro.tokenDetails.reasoningTokens, 120);
+  assert.ok(usage);
+  assert.equal(usage.tokenDetails.cacheHitTokens, 400);
+  assert.equal(usage.tokenDetails.cacheMissTokens, 600);
+  assert.equal(usage.tokenDetails.reasoningTokens, 120);
 });
 
 test("aggregates and validates a persisted conversation usage record", () => {
@@ -72,7 +74,6 @@ test("aggregates and validates a persisted conversation usage record", () => {
       provider: "deepseek",
       model: "deepseek-v4-flash",
       operation: "web_search_plan",
-      deepSeekTier: "flash",
     },
   );
   assert.ok(call);

@@ -5,11 +5,7 @@ import type {
   BilibiliPreviewResponse,
 } from "@/shared/bilibili-api";
 import { BILIBILI_ANALYSIS_DOWNLOAD_VARIANT } from "@/shared/bilibili-api";
-import type {
-  TranscriptLanguage,
-  VideoModelContext,
-  VideoTranscript,
-} from "@/shared/media-types";
+import type { VideoModelContext } from "@/shared/media-types";
 import { mediaApiFetch } from "./media-transport";
 
 const POLL_INTERVAL_MS = 1_000;
@@ -29,7 +25,6 @@ interface BilibiliDownloadProgress {
 
 export interface BilibiliDownloadResult {
   context: VideoModelContext;
-  transcript?: VideoTranscript;
   analysisMode?: "direct" | "keyframes";
   jobId: string;
   bvid: string;
@@ -197,7 +192,6 @@ export async function downloadBilibiliVideo(
 
     return {
       context: evidence.context,
-      ...(evidence.transcript ? { transcript: evidence.transcript } : {}),
       analysisMode: snapshot.analysis.mode,
       jobId: snapshot.jobId,
       bvid: snapshot.source.bvid,
@@ -217,46 +211,6 @@ export async function downloadBilibiliVideo(
 
 export function releaseBilibiliAnalysis(jobId: string) {
   return cleanupJob(jobId);
-}
-
-export async function extractBilibiliTranscript(
-  jobId: string,
-  languages: TranscriptLanguage[],
-  signal?: AbortSignal,
-): Promise<VideoTranscript> {
-  throwIfAborted(signal);
-  const deadline = Date.now() + MAX_JOB_WAIT_MS;
-  let snapshot = await requestJob(`/v1/bilibili/jobs/${jobId}/transcript`, {
-    method: "POST",
-    headers: { "content-type": "application/json" },
-    body: JSON.stringify({ languages }),
-    signal,
-  });
-
-  while (snapshot.analysis?.transcript.status === "pending") {
-    if (Date.now() >= deadline) {
-      throw new BilibiliClientError(
-        "FunASR 字幕提取超过 22 分钟仍未完成。",
-        "TRANSCRIPT_TIMEOUT",
-        true,
-      );
-    }
-    await abortableDelay(POLL_INTERVAL_MS, signal);
-    snapshot = await requestJob(`/v1/bilibili/jobs/${jobId}`, { signal });
-  }
-
-  if (snapshot.status !== "succeeded" || !snapshot.analysis) {
-    throw snapshotError(snapshot, "FunASR 字幕提取失败。");
-  }
-  const transcript = transcriptFromAnalysis(snapshot.analysis);
-  if (!transcript) {
-    throw new BilibiliClientError(
-      "媒体服务没有返回完整的 FunASR 字幕状态。",
-      "INVALID_TRANSCRIPT_RESPONSE",
-      true,
-    );
-  }
-  return transcript;
 }
 
 async function downloadAnalysisEvidence(
@@ -279,7 +233,6 @@ async function downloadAnalysisEvidence(
         fps: 1,
         durationSeconds,
       },
-      transcript: transcriptFromAnalysis(analysis),
     };
   }
 
@@ -337,26 +290,6 @@ async function downloadAnalysisEvidence(
       audioFormat: "mp3" as const,
       durationSeconds,
     },
-    transcript: transcriptFromAnalysis(analysis),
-  };
-}
-
-function transcriptFromAnalysis(
-  analysis: NonNullable<BilibiliJobSnapshot["analysis"]>,
-): VideoTranscript | undefined {
-  if (analysis.transcript.status === "pending") return undefined;
-  return {
-    status: analysis.transcript.status,
-    text: analysis.transcript.text,
-    cues: analysis.transcript.cues.map((cue) => ({
-      startSeconds: cue.startSeconds,
-      endSeconds: cue.endSeconds,
-      text: cue.text,
-    })),
-    ...(analysis.transcript.language
-      ? { language: analysis.transcript.language }
-      : {}),
-    ...(analysis.transcript.error ? { error: analysis.transcript.error } : {}),
   };
 }
 

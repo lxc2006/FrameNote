@@ -14,17 +14,11 @@ const MAX_RESTARTS = 3;
 export interface MediaSidecarConnection {
   baseUrl: string;
   authorizationToken: string;
-  capabilities: {
-    transcription: boolean;
-  };
 }
 
 interface MediaSidecarHealth {
   status: "ok" | "degraded";
   service: string;
-  capabilities?: {
-    transcription?: boolean;
-  };
 }
 
 interface SidecarLaunch {
@@ -47,7 +41,6 @@ export class MediaSidecarManager {
   private readonly options: MediaSidecarOptions;
   private child: ChildProcess | undefined;
   private launch: SidecarLaunch | undefined;
-  private capabilities = { transcription: false };
   private ready = false;
   private stopping = false;
   private restartAttempts = 0;
@@ -55,7 +48,6 @@ export class MediaSidecarManager {
   private healthTimer: NodeJS.Timeout | undefined;
   private consecutiveHealthFailures = 0;
   private port = DEFAULT_PORT;
-  private transcriptionExecutable: string | undefined;
 
   constructor(options: MediaSidecarOptions) {
     this.options = options;
@@ -91,7 +83,6 @@ export class MediaSidecarManager {
     return {
       baseUrl: this.baseUrl,
       authorizationToken: this.authorizationToken,
-      capabilities: { ...this.capabilities },
     };
   }
 
@@ -107,13 +98,15 @@ export class MediaSidecarManager {
     if (child?.pid) await terminateProcessTree(child);
   }
 
-  setTranscriptionExecutable(executable: string | undefined) {
-    this.transcriptionExecutable = executable;
-  }
-
-  async restart() {
-    await this.stop();
-    await this.start();
+  getFfmpegPath() {
+    const executableRoot = this.launch?.command.endsWith(".exe")
+      ? dirname(this.launch.command)
+      : "";
+    for (const path of [join(executableRoot, "ffmpeg.exe"), join(executableRoot, "_internal", "ffmpeg.exe")]) {
+      if (executableRoot && existsSync(path)) return path;
+    }
+    if (this.options.isPackaged) throw new Error("安装目录中缺少 FFmpeg。");
+    return "ffmpeg";
   }
 
   private resolveLaunch(): SidecarLaunch {
@@ -197,9 +190,6 @@ export class MediaSidecarManager {
         this.options.userDataPath,
         "media-sidecar",
       ),
-      FRAMENOTE_TRANSCRIPTION_BACKEND: "",
-      FRAMENOTE_TRANSCRIPTION_EXECUTABLE:
-        this.transcriptionExecutable ?? "",
     };
     const child = spawn(this.launch.command, this.launch.args, {
       cwd: this.launch.cwd,
@@ -272,9 +262,6 @@ export class MediaSidecarManager {
 
   private acceptHealth(health: MediaSidecarHealth) {
     this.ready = health.status === "ok";
-    this.capabilities = {
-      transcription: health.capabilities?.transcription === true,
-    };
   }
 
   private async waitForHealth(child: ChildProcess) {

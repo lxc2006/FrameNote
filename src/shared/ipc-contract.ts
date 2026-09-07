@@ -13,7 +13,8 @@ import type {
   AskVideoStreamEvent,
 } from "./model-types";
 import type { UserPreferences } from "./preference-types";
-import type { VideoTranscript } from "./media-types";
+import type { TranscriptLanguage, VideoTranscript } from "./media-types";
+import type { LocalVideoFile, VideoDownloadInput, VideoDownloadResult } from "./video-files";
 import type {
   ModelCredentialStatus,
   ModelCredentialUpdate,
@@ -22,11 +23,17 @@ import type {
 export const DESKTOP_CHANNELS = {
   getRuntimeInfo: "desktop:get-runtime-info",
   openExternal: "desktop:open-external",
+  clipboardWriteText: "desktop:clipboard-write-text",
   mediaGetConnection: "desktop:media-get-connection",
+  videoOpenLocal: "desktop:video-open-local",
+  videoReleaseLocal: "desktop:video-release-local",
+  videoDownload: "desktop:video-download",
+  videoCancelDownload: "desktop:video-cancel-download",
   modelAnalyze: "desktop:model-analyze",
   modelAsk: "desktop:model-ask",
   modelCancel: "desktop:model-cancel",
   modelEvent: "desktop:model-event",
+  transcriptionProgress: "desktop:transcription-progress",
   conversationsList: "desktop:conversations-list",
   conversationsCreate: "desktop:conversations-create",
   conversationsGet: "desktop:conversations-get",
@@ -39,11 +46,7 @@ export const DESKTOP_CHANNELS = {
   settingsSetUserPreferences: "desktop:settings-set-user-preferences",
   credentialsGetStatus: "desktop:credentials-get-status",
   credentialsUpdate: "desktop:credentials-update",
-  subtitlesGetStatus: "desktop:subtitles-get-status",
-  subtitlesCheckForUpdates: "desktop:subtitles-check-for-updates",
-  subtitlesInstall: "desktop:subtitles-install",
-  subtitlesUninstall: "desktop:subtitles-uninstall",
-  subtitlesStatus: "desktop:subtitles-status",
+  transcriptionExtract: "desktop:transcription-extract",
 } as const;
 
 export interface DesktopRuntimeInfo {
@@ -55,9 +58,6 @@ export interface DesktopRuntimeInfo {
 export interface DesktopMediaConnection {
   baseUrl: string;
   authorizationToken: string;
-  capabilities: {
-    transcription: boolean;
-  };
 }
 
 export interface DesktopIpcError {
@@ -70,40 +70,48 @@ export type DesktopIpcResult<T> =
   | { ok: true; value: T }
   | { ok: false; error: DesktopIpcError };
 
-export interface SubtitleExtensionStatus {
-  state:
-    | "not-installed"
-    | "installed"
-    | "update-available"
-    | "installing"
-    | "uninstalling"
-    | "error";
-  installedVersion?: string;
-  availableVersion?: string;
-  progress?: number;
-  downloadedBytes?: number;
-  expectedDownloadBytes?: number;
-  message?: string;
-}
-
 export interface DesktopModelEvent {
   requestId: string;
   event: AskVideoStreamEvent;
 }
 
+export interface DesktopTranscriptionProgress {
+  requestId: string;
+  completedChunks: number;
+  totalChunks: number;
+}
+
 export interface FrameNoteDesktopApi {
   getRuntimeInfo(): Promise<DesktopRuntimeInfo>;
   openExternal(url: string): Promise<void>;
+  clipboard: {
+    writeText(text: string): Promise<DesktopIpcResult<void>>;
+  };
   media: {
     getConnection(): Promise<DesktopIpcResult<DesktopMediaConnection>>;
   };
-  subtitles: {
-    getStatus(): Promise<DesktopIpcResult<SubtitleExtensionStatus>>;
-    checkForUpdates(): Promise<DesktopIpcResult<SubtitleExtensionStatus>>;
-    install(): Promise<DesktopIpcResult<SubtitleExtensionStatus>>;
-    uninstall(): Promise<DesktopIpcResult<SubtitleExtensionStatus>>;
-    subscribe(listener: (status: SubtitleExtensionStatus) => void): void;
-    unsubscribe(listener: (status: SubtitleExtensionStatus) => void): void;
+  videoFiles: {
+    pathForFile(file: File): string;
+    openLocal(path: string): Promise<DesktopIpcResult<LocalVideoFile>>;
+    releaseLocal(playbackUrl: string): void;
+    download(requestId: string, input: VideoDownloadInput): Promise<DesktopIpcResult<VideoDownloadResult>>;
+    cancelDownload(requestId: string): void;
+  };
+  transcription: {
+    extract(
+      requestId: string,
+      input: {
+        jobId: string;
+        jobKind: "media" | "bilibili";
+        languages: TranscriptLanguage[];
+      },
+    ): Promise<DesktopIpcResult<VideoTranscript>>;
+    cancelRequest(requestId: string): void;
+    subscribe(
+      requestId: string,
+      listener: (progress: Omit<DesktopTranscriptionProgress, "requestId">) => void,
+    ): void;
+    unsubscribe(requestId: string): void;
   };
   model: {
     analyzeVideo(

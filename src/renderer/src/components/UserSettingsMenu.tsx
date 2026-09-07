@@ -23,7 +23,6 @@ import {
   desktopBridge,
   unwrapDesktopResult,
 } from "../clients/desktop-bridge";
-import type { SubtitleExtensionStatus } from "@/shared/ipc-contract";
 import type {
   ModelCredentialStatus,
   ModelCredentialUpdate,
@@ -196,16 +195,12 @@ function TypographyFields({
           <b aria-hidden="true">px</b>
         </span>
       </label>
-      <span className="settings-size-range">可输入 {MIN_FONT_SIZE}–{MAX_FONT_SIZE}px</span>
     </fieldset>
   );
 }
 
 export default function UserSettingsMenu() {
   const [isOpen, setIsOpen] = useState(false);
-  const [subtitleStatus, setSubtitleStatus] =
-    useState<SubtitleExtensionStatus | null>(null);
-  const [subtitleBusy, setSubtitleBusy] = useState(false);
   const [credentialStatus, setCredentialStatus] =
     useState<ModelCredentialStatus | null>(null);
   const [credentialValues, setCredentialValues] = useState({
@@ -260,27 +255,6 @@ export default function UserSettingsMenu() {
 
     return () => {
       cancelled = true;
-    };
-  }, []);
-
-  useEffect(() => {
-    const subtitles = desktopBridge()?.subtitles;
-    if (!subtitles) return;
-    let cancelled = false;
-    const receiveStatus = (status: SubtitleExtensionStatus) => {
-      if (!cancelled) setSubtitleStatus(status);
-    };
-    subtitles.subscribe(receiveStatus);
-    void subtitles
-      .getStatus()
-      .then(unwrapDesktopResult)
-      .then(receiveStatus)
-      .catch((error: unknown) => {
-        console.error("Unable to read subtitle extension status", error);
-      });
-    return () => {
-      cancelled = true;
-      subtitles.unsubscribe(receiveStatus);
     };
   }, []);
 
@@ -353,33 +327,6 @@ export default function UserSettingsMenu() {
     const next = { ...preferences, [key]: value };
     applyPreferences(next);
     savePreferences(next);
-  };
-
-  const runSubtitleAction = async (
-    action: "check" | "install" | "uninstall",
-  ) => {
-    const subtitles = desktopBridge()?.subtitles;
-    if (!subtitles || subtitleBusy) return;
-    setSubtitleBusy(true);
-    try {
-      const result =
-        action === "check"
-          ? await subtitles.checkForUpdates()
-          : action === "install"
-            ? await subtitles.install()
-            : await subtitles.uninstall();
-      const status = unwrapDesktopResult(result);
-      setSubtitleStatus(status);
-      if (action !== "check") window.location.reload();
-    } catch (error) {
-      setSubtitleStatus({
-        state: "error",
-        installedVersion: subtitleStatus?.installedVersion,
-        message: error instanceof Error ? error.message : "字幕扩展操作失败。",
-      });
-    } finally {
-      setSubtitleBusy(false);
-    }
   };
 
   const updateCredentials = async (update?: ModelCredentialUpdate) => {
@@ -474,7 +421,7 @@ export default function UserSettingsMenu() {
 
           <TypographyFields
             legend="UI 字体"
-            description="用于导航、按钮、输入框和对话列表。"
+            description=""
             font={preferences.uiFont}
             fontSize={preferences.uiFontSize}
             onFontChange={(value) => updatePreference("uiFont", value)}
@@ -483,7 +430,7 @@ export default function UserSettingsMenu() {
 
           <TypographyFields
             legend="文本字体"
-            description="用于视频总结、章节内容和后续对话。"
+            description=""
             font={preferences.textFont}
             fontSize={preferences.textFontSize}
             onFontChange={(value) => updatePreference("textFont", value)}
@@ -493,8 +440,7 @@ export default function UserSettingsMenu() {
           <fieldset className="settings-group">
             <legend>视频分析</legend>
             <p>
-              视频不超过此时长时，优先让 Qwen 直接读取视频；设为 0
-              可关闭直接总结。
+              视频不超过此时长时，优先让 Qwen 直接读取视频
             </p>
             <label className="settings-field">
               <span>直接总结上限</span>
@@ -528,29 +474,64 @@ export default function UserSettingsMenu() {
                 <b aria-hidden="true">秒</b>
               </span>
             </label>
-            <span className="settings-size-range">
-              可输入 0–{MAX_QWEN_DIRECT_SUMMARY_MAX_SECONDS} 秒
-            </span>
           </fieldset>
 
           {isDesktop ? (
             <fieldset className="settings-group settings-credential-group">
               <legend>模型 API Key</legend>
               <p>
-                Key 由 Electron 主进程使用 Windows 加密存储，不会传给界面或写入 SQLite。
+                Qwen Key 同时用于视频总结和在线字幕。所有 Key 均由 Electron
+                主进程使用 Windows 加密存储，不会写入 SQLite。
               </p>
               {(
                 [
-                  ["dashscopeApiKey", "Qwen / DashScope", credentialStatus?.dashscopeConfigured],
-                  ["deepseekApiKey", "DeepSeek", credentialStatus?.deepseekConfigured],
-                  ["serpApiKey", "SerpAPI（可选）", credentialStatus?.serpApiConfigured],
+                  [
+                    "dashscopeApiKey",
+                    "Qwen / DashScope",
+                    credentialStatus?.dashscopeConfigured,
+                    "https://bailian.console.aliyun.com/?apiKey=1&tab=model",
+                  ],
+                  [
+                    "deepseekApiKey",
+                    "DeepSeek",
+                    credentialStatus?.deepseekConfigured,
+                    "https://platform.deepseek.com/api_keys",
+                  ],
+                  [
+                    "serpApiKey",
+                    "SerpAPI",
+                    credentialStatus?.serpApiConfigured,
+                    "https://serpapi.com/manage-api-key",
+                  ],
                 ] as const
-              ).map(([key, label, configured]) => (
+              ).map(([key, label, configured, consoleUrl]) => (
                 <div className="settings-credential-row" key={key}>
-                  <label>
-                    <span>{label}</span>
+                  <div className="settings-credential-field">
+                    <div className="settings-credential-label">
+                      <span>{label}</span>
+                      <button
+                        type="button"
+                        className="settings-api-link"
+                        aria-label={`打开 ${label} API Key 工作台`}
+                        title="打开 API Key 工作台"
+                        onClick={() => {
+                          void desktopBridge()
+                            ?.openExternal(consoleUrl)
+                            .catch((error: unknown) => {
+                              setCredentialMessage(
+                                error instanceof Error
+                                  ? error.message
+                                  : "无法打开 API Key 工作台。",
+                              );
+                            });
+                        }}
+                      >
+                        获取↗
+                      </button>
+                    </div>
                     <input
                       type="password"
+                      aria-label={`${label} API Key`}
                       autoComplete="off"
                       value={credentialValues[key]}
                       placeholder={configured ? "已配置；输入新值可替换" : "尚未配置"}
@@ -561,7 +542,7 @@ export default function UserSettingsMenu() {
                         }))
                       }
                     />
-                  </label>
+                  </div>
                   {configured ? (
                     <button
                       type="button"
@@ -573,7 +554,7 @@ export default function UserSettingsMenu() {
                   ) : null}
                 </div>
               ))}
-              <div className="settings-extension-actions">
+              <div className="settings-credential-actions">
                 <button
                   type="button"
                   disabled={credentialBusy}
@@ -590,72 +571,6 @@ export default function UserSettingsMenu() {
             </fieldset>
           ) : null}
 
-          {isDesktop ? (
-            <fieldset className="settings-group settings-extension-group">
-              <legend>字幕扩展</legend>
-              <p>
-                独立下载约 3.5～3.9 GB，包含 FunASR Nano、CT-Punc、VAD
-                和 PyTorch；基础应用不携带这些内容。
-              </p>
-              <div className="settings-extension-status" aria-live="polite">
-                <strong>{subtitleStatusLabel(subtitleStatus)}</strong>
-                {subtitleStatus?.installedVersion ? (
-                  <span>当前版本 {subtitleStatus.installedVersion}</span>
-                ) : null}
-                {subtitleStatus?.state === "installing" ? (
-                  <progress
-                    max={1}
-                    value={subtitleStatus.progress ?? 0}
-                    aria-label="字幕扩展下载和安装进度"
-                  />
-                ) : null}
-                {subtitleStatus?.message ? (
-                  <span className="settings-extension-error">
-                    {subtitleStatus.message}
-                  </span>
-                ) : null}
-              </div>
-              <div className="settings-extension-actions">
-                {subtitleStatus?.state === "installed" ||
-                subtitleStatus?.state === "update-available" ? (
-                  <>
-                    <button
-                      type="button"
-                      disabled={subtitleBusy}
-                      onClick={() => void runSubtitleAction("check")}
-                    >
-                      检查更新
-                    </button>
-                    {subtitleStatus.state === "update-available" ? (
-                      <button
-                        type="button"
-                        disabled={subtitleBusy}
-                        onClick={() => void runSubtitleAction("install")}
-                      >
-                        更新扩展
-                      </button>
-                    ) : null}
-                    <button
-                      type="button"
-                      disabled={subtitleBusy}
-                      onClick={() => void runSubtitleAction("uninstall")}
-                    >
-                      卸载扩展
-                    </button>
-                  </>
-                ) : (
-                  <button
-                    type="button"
-                    disabled={subtitleBusy || subtitleStatus?.state === "installing"}
-                    onClick={() => void runSubtitleAction("install")}
-                  >
-                    {subtitleBusy ? "正在处理…" : "安装字幕扩展"}
-                  </button>
-                )}
-              </div>
-            </fieldset>
-          ) : null}
-
           <p className="settings-hint">
             {isDesktop
               ? "这些偏好会保存在本机桌面数据中。"
@@ -665,21 +580,4 @@ export default function UserSettingsMenu() {
       ) : null}
     </div>
   );
-}
-
-function subtitleStatusLabel(status: SubtitleExtensionStatus | null) {
-  switch (status?.state) {
-    case "installed":
-      return "已安装";
-    case "update-available":
-      return `可更新到 ${status.availableVersion ?? "新版本"}`;
-    case "installing":
-      return `正在安装 ${Math.round((status.progress ?? 0) * 100)}%`;
-    case "uninstalling":
-      return "正在卸载";
-    case "error":
-      return "操作失败";
-    default:
-      return "未安装";
-  }
 }
