@@ -17,8 +17,6 @@ JobPhase = Literal[
 ]
 BilibiliDownloadVariant = Literal["analysis"]
 MediaSourceKind = Literal["upload", "bilibili", "douyin", "url"]
-WebExtractStatus = Literal["ok", "requires_browser", "skipped"]
-WebExtractMethod = Literal["trafilatura", "pypdf"]
 
 
 def utc_iso(timestamp: float) -> str:
@@ -175,22 +173,3 @@ class JobResponse(BaseModel):
 
 class JobListResponse(BaseModel):
     jobs: list[JobResponse]
-
-
-class WebExtractRequest(BaseModel):
-    model_config = ConfigDict(extra="forbid")
-
-    url: str = Field(min_length=8, max_length=4_096)
-
-
-class WebExtractResponse(BaseModel):
-    status: WebExtractStatus
-    url: str
-    finalUrl: str | None = None
-    title: str | None = None
-    publishedAt: str | None = None
-    contentType: str | None = None
-    text: str | None = None
-    method: WebExtractMethod | None = None
-    errorCode: str | None = None
-    errorMessage: str | None = None

@@ -53,15 +53,23 @@ export function normalizeModelCallUsage(
   const usage = recordOrNull(rawUsage);
   if (!usage) return null;
 
-  const promptTokens = nonNegativeInteger(usage.prompt_tokens) ?? 0;
-  const completionTokens = nonNegativeInteger(usage.completion_tokens) ?? 0;
+  const promptTokens =
+    nonNegativeInteger(usage.prompt_tokens) ??
+    nonNegativeInteger(usage.input_tokens) ??
+    0;
+  const completionTokens =
+    nonNegativeInteger(usage.completion_tokens) ??
+    nonNegativeInteger(usage.output_tokens) ??
+    0;
   const totalTokens =
     nonNegativeInteger(usage.total_tokens) ??
     promptTokens + completionTokens;
   const promptDetails =
     recordOrNull(usage.prompt_tokens_details) ??
     recordOrNull(usage.input_tokens_details);
-  const completionDetails = recordOrNull(usage.completion_tokens_details);
+  const completionDetails =
+    recordOrNull(usage.completion_tokens_details) ??
+    recordOrNull(usage.output_tokens_details);
   const audioTokens = Math.min(
     promptTokens,
     nonNegativeInteger(promptDetails?.audio_tokens) ?? 0,

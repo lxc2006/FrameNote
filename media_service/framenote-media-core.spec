@@ -4,15 +4,7 @@ from pathlib import Path
 import shutil
 import sys
 
-from PyInstaller.utils.hooks import (
-    collect_all,
-    collect_data_files,
-    collect_submodules,
-)
-
-tld_data = collect_data_files("tld")
-trafilatura_data = collect_data_files("trafilatura")
-justext_data = collect_data_files("justext")
+from PyInstaller.utils.hooks import collect_all, collect_submodules
 
 
 project_root = Path(SPECPATH).resolve().parent
@@ -59,14 +51,11 @@ hiddenimports = sorted(
             "media_service.service.job_manager",
             "media_service.service.models",
             "media_service.service.security",
-            "media_service.web_extract",
             "media_service.worker",
             "multipart",
             "numpy",
             "PIL",
             "pydantic",
-            "pypdf",
-            "trafilatura",
         ]
     )
 )
@@ -79,7 +68,7 @@ analysis = Analysis(
         + runtime_binaries
         + [(ffmpeg, "."), (ffprobe, ".")]
     ),
-    datas=yt_dlp_data + tld_data + trafilatura_data + justext_data, 
+    datas=yt_dlp_data,
     hiddenimports=hiddenimports,
     hookspath=[],
     hooksconfig={},

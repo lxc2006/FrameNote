@@ -271,35 +271,31 @@ async function planRecall(
     maxRetries: 1,
   });
   try {
-    const completion = await client.chat.completions.create(
+    const response = await client.responses.create(
       {
         model: config.flashModel,
-        messages: [
-          { role: "system", content: RECALL_PLANNER_PROMPT },
-          {
-            role: "user",
-            content: JSON.stringify({
-              userQuestion: context.question.slice(0, 4_000),
-              compactVideoMemory: buildCompactVideoMemory(
-                context.source,
-                context.summary,
-              ),
-            }),
-          },
-        ],
-        response_format: { type: "json_object" },
+        instructions: RECALL_PLANNER_PROMPT,
+        input: JSON.stringify({
+          userQuestion: context.question.slice(0, 4_000),
+          compactVideoMemory: buildCompactVideoMemory(
+            context.source,
+            context.summary,
+          ),
+        }),
+        text: { format: { type: "json_object" } },
+        reasoning: { effort: "none" },
         stream: false,
-        max_tokens: 700,
+        max_output_tokens: 700,
       },
       { signal },
     );
-    const usage = normalizeModelCallUsage(completion.usage, {
+    const usage = normalizeModelCallUsage(response.usage, {
       provider: "deepseek",
       model: config.flashModel,
       operation: "recall_plan",
     });
     if (usage) onUsage?.(usage);
-    const content = completion.choices[0]?.message.content?.trim();
+    const content = response.output_text.trim();
     if (!content) return forced;
     const planned = normalizePlan(
       JSON.parse(stripCodeFence(content)) as PlannerPayload,
@@ -730,40 +726,36 @@ async function rerankCandidates(
     maxRetries: 1,
   });
   try {
-    const completion = await client.chat.completions.create(
+    const response = await client.responses.create(
       {
         model: config.flashModel,
-        messages: [
-          { role: "system", content: RECALL_RERANK_PROMPT },
-          {
-            role: "user",
-            content: JSON.stringify({
-              question,
-              recallPlan: plan,
-              maximumResults: maximum,
-              candidates: candidates.map((item) => ({
-                id: item.key,
-                source: item.source,
-                startSeconds: item.startSeconds ?? null,
-                endSeconds: item.endSeconds ?? null,
-                text: item.text.slice(0, MAX_CANDIDATE_TEXT_CHARACTERS),
-              })),
-            }),
-          },
-        ],
-        response_format: { type: "json_object" },
+        instructions: RECALL_RERANK_PROMPT,
+        input: JSON.stringify({
+          question,
+          recallPlan: plan,
+          maximumResults: maximum,
+          candidates: candidates.map((item) => ({
+            id: item.key,
+            source: item.source,
+            startSeconds: item.startSeconds ?? null,
+            endSeconds: item.endSeconds ?? null,
+            text: item.text.slice(0, MAX_CANDIDATE_TEXT_CHARACTERS),
+          })),
+        }),
+        text: { format: { type: "json_object" } },
+        reasoning: { effort: "none" },
         stream: false,
-        max_tokens: 900,
+        max_output_tokens: 900,
       },
       { signal },
     );
-    const usage = normalizeModelCallUsage(completion.usage, {
+    const usage = normalizeModelCallUsage(response.usage, {
       provider: "deepseek",
       model: config.flashModel,
       operation: "recall_rerank",
     });
     if (usage) onUsage?.(usage);
-    const content = completion.choices[0]?.message.content?.trim();
+    const content = response.output_text.trim();
     if (!content) return fallback;
     const payload = JSON.parse(stripCodeFence(content)) as RerankPayload;
     if (!Array.isArray(payload.selected)) return fallback;

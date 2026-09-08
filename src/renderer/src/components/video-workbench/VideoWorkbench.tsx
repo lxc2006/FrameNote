@@ -612,7 +612,7 @@ function WebSearchStatusPanel({
   search: NonNullable<ChatMessage["webSearch"]>;
 }) {
   const title = search.requestIssued
-    ? "已发起搜索，但未取得可读网页"
+    ? "DeepSeek 已联网，但未返回可展示来源"
     : "联网搜索未发起";
   return (
     <details className="message-web-sources message-web-search-status">
@@ -622,9 +622,7 @@ function WebSearchStatusPanel({
       </summary>
       <div className="message-web-search-details">
         {search.query ? <p>关键词：{search.query}</p> : null}
-        <p>
-          候选结果 {search.candidateCount} 个，正文提取失败 {search.extractionFailureCount} 个
-        </p>
+        <p>DeepSeek 内置搜索来源 {search.sourceCount} 个</p>
         {search.note ? <p>说明：{search.note}</p> : null}
         {search.failures.length ? (
           <p>失败原因：{search.failures.map((failure) => failure.message).slice(0, 3).join("；")}</p>
@@ -2743,15 +2741,6 @@ export default function VideoWorkbench() {
           reasoningMode: deepThinkingEnabled ? "pro" : "flash",
           webSearchEnabled,
           fullRecallEnabled,
-          ...(webSearchEnabled
-            ? {
-                searchContext: {
-                  locale: navigator.language,
-                  timeZone:
-                    Intl.DateTimeFormat().resolvedOptions().timeZone,
-                },
-              }
-            : {}),
         },
         {
           onEvent: (event) => {
@@ -4051,7 +4040,7 @@ export default function VideoWorkbench() {
                     <path d="M4 5.5A2.5 2.5 0 0 1 6.5 3H11v16H6.5A2.5 2.5 0 0 0 4 21.5z" />
                     <path d="M20 5.5A2.5 2.5 0 0 0 17.5 3H13v16h4.5a2.5 2.5 0 0 1 2.5 2.5z" />
                   </svg>
-                  完整回顾
+                  字幕回顾
                 </button>
               </div>
             ) : null}

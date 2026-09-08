@@ -42,7 +42,6 @@ from .douyin_preview import (
     is_douyin_url,
     resolve_douyin_preview,
 )
-from .web_extract import extract_web_document
 from .service.config import Settings
 from .service.job_manager import JobManager, JobRecord, QueueCapacityError
 from .service.models import (
@@ -60,8 +59,6 @@ from .service.models import (
     JobListResponse,
     JobResponse,
     SourceResponse,
-    WebExtractRequest,
-    WebExtractResponse,
     utc_iso,
 )
 from .service.security import (
@@ -446,8 +443,6 @@ async def health(request: Request) -> JSONResponse:
         "ffprobe": shutil.which("ffprobe") is not None,
         "sceneDetect": importlib.util.find_spec("scenedetect") is not None,
         "imageHash": importlib.util.find_spec("imagehash") is not None,
-        "trafilatura": importlib.util.find_spec("trafilatura") is not None,
-        "pypdf": importlib.util.find_spec("pypdf") is not None,
     }
     healthy = all(dependencies.values())
     return JSONResponse(
@@ -460,16 +455,6 @@ async def health(request: Request) -> JSONResponse:
         },
         status_code=status.HTTP_200_OK if healthy else status.HTTP_503_SERVICE_UNAVAILABLE,
     )
-
-
-@app.post(
-    "/v1/web/extract",
-    response_model=WebExtractResponse,
-    response_model_exclude_none=True,
-    dependencies=[Depends(require_api_access)],
-)
-async def extract_web_page(body: WebExtractRequest) -> WebExtractResponse:
-    return await extract_web_document(body.url)
 
 
 @app.post(

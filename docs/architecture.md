@@ -5,7 +5,7 @@
 ```text
 React Renderer
   ├─ contextBridge / 类型化 IPC ──> Electron Main
-  │                                  ├─ 模型 Service ──> Qwen / DeepSeek / SerpAPI
+  │                                  ├─ 模型 Service ──> Qwen / DeepSeek Responses
   │                                  ├─ SQLite Repository
   │                                  ├─ Windows safeStorage
   │                                  ├─ 更新与在线字幕识别
@@ -23,6 +23,8 @@ Renderer 没有 Node.js、数据库、文件系统、通用 `ipcRenderer` 或 AP
 ## 凭据
 
 设置页只能提交新 Key、清除 Key 或读取“是否已配置”。`CredentialStore` 使用 Electron `safeStorage` 加密后写入用户数据目录，并把解密值只注入主进程环境。开发机器仍可使用未纳入安装包的 `.env.local` 作为回退。
+
+应用只使用 DashScope 和 DeepSeek 两类 Key。DeepSeek Responses API 同时负责连续问答、深度思考和服务端内置联网搜索；应用不再保存第三方搜索 Key，也不在本机抓取或缓存网页正文。
 
 ## 媒体和字幕
 

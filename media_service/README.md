@@ -45,7 +45,6 @@ media_service/dist/framenote-media-core/framenote-media-core.exe
 - B 站只支持无需登录即可访问且用户有权处理的公开 UGC；
 - 抖音只支持无需登录或验证即可访问且用户有权处理的公开视频；
 - 不读取 Cookie，不处理会员、付费、私有、直播或地区受限内容；
-- 网页正文提取只允许公开 HTTP(S) 地址和 80/443 端口，并逐次校验重定向和 DNS 结果。
 
 ## 主要接口
 
@@ -60,7 +59,6 @@ GET    /v1/bilibili/jobs/{jobId}
 DELETE /v1/bilibili/jobs/{jobId}
 POST   /v1/douyin/preview
 GET    /v1/douyin/preview/{sessionId}/video
-POST   /v1/web/extract
 ```
 
 除 `/health` 和已签名资源外，Electron 启动的服务要求：

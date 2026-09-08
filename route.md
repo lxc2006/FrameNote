@@ -1,6 +1,6 @@
 # FrameNote 当前工作链路与参数
 
-> 本文记录当前桌面版代码的真实运行方式，不是后续规划。更新日期：2026-09-07。
+> 本文记录当前桌面版代码的真实运行方式，不是后续规划。更新日期：2026-09-08。
 
 ## 1. 运行边界
 
@@ -9,13 +9,13 @@ FrameNote 当前是桌面独占应用，分成四层：
 ```text
 React Renderer
   ├─ 类型安全 IPC ──> Electron preload ──> Electron main
-  │                                      ├─ Qwen / DeepSeek / SerpAPI
+  │                                      ├─ Qwen / DeepSeek Responses
   │                                      ├─ SQLite 与加密 API Key
   │                                      └─ 本地文件打开、下载与外部链接
   └─ 带令牌的 loopback HTTP ─────────────> Python media core
                                          ├─ FFmpeg / ffprobe
                                          ├─ yt-dlp（B站/抖音公开内容）
-                                         ├─ 关键帧、音轨与网页正文提取
+                                         ├─ 关键帧与音轨
                                          └─ 临时分析任务与签名资源
 ```
 
@@ -252,16 +252,14 @@ Renderer 发起问答时最多提交最近 10 条消息。若有 `conversationId
 
 ### 4.4 联网搜索（web）
 
-只有启用联网搜索，并配置当前搜索供应商 Key、千问 Key 时才会实际搜索：
+联网只依赖 DeepSeek Key，并由最终回答请求中的 Responses API 内置 `web_search` 完成：
 
-1. flash 模型生成最长 240 字的搜索词，规划最多 600 tokens；明确联网请求即使规划器想跳过，也会生成后备关键词强制搜索。
-2. SerpAPI 或智谱搜索默认最多取 12 个候选，请求超时 15 秒。
-3. 依次读取候选，目标为最多 4 个真正可读页面。
-4. HTML/PDF 优先交给 media core，用 Trafilatura 或 pypdf 提取；需要浏览器时只有配置 Cloudflare Browser Rendering 后才会使用该后备能力。
-5. 完整提取正文按块分片后交给 `qwen3.7-text-rerank`；默认保留相关度不低于 `0.2` 的全部分片，再按原文顺序恢复，每个网页最终最多向 DeepSeek 提供约 20000 tokens。
-6. SQLite 保存最近访问的 12 个网页正文，单篇最多 100000 字；命中历史来源 URL、序号或标题时直接读取缓存并重新精排，缓存未命中时按保存的 URL 重新提取。
-7. 搜索证据、回顾证据、现有总结和最近对话一起进入最终 DeepSeek 回答；即使没有成功提取正文，也会把 `status / query / note` 和资料充分性原因交给最终模型，明确区分“没有发起搜索”和“搜索已执行但没有可读证据”。
-8. 每轮保存搜索状态、关键词、是否已发出请求、候选数量、可读证据数量、正文提取失败数量和失败原因；页面分别显示“已发起搜索，但未取得可读网页”或“已取得 N 个网页证据”。
+1. 联网开关关闭时不向模型提供搜索工具；开启时提供 `web_search`，普通问题使用 `tool_choice=auto`。
+2. 用户明确要求联网，或充分性判断认为问题依赖最新、官方或外部资料时，使用 `tool_choice={type: "web_search"}` 强制至少执行一次搜索。
+3. 搜索、打开网页和页内查找均由 DeepSeek 服务端自动完成，最多自动继续 10 轮；应用不再生成搜索词，也不调用第三方搜索 API。
+4. Responses 流中的 `web_search_call` 用于显示搜索阶段和统计调用次数；最终输出中的 URL citation 与搜索动作来源用于生成“网页证据”列表。
+5. SQLite 只保存回答附带的来源标题、URL 和搜索状态，不保存网页正文；后续指代旧来源时把最近的来源索引重新提供给 DeepSeek，正文仍由内置搜索按需重新打开。
+6. 已删除 SerpAPI、智谱搜索、Qwen Rerank、本机 Trafilatura/pypdf 提取、Cloudflare Browser Rendering 和网页正文缓存链路。
 
 ### 4.5 流式事件、停止和重发
 
@@ -276,7 +274,7 @@ Electron 使用 `app.getPath("userData")` 作为数据根目录。Windows 正式
 
 ```text
 %APPDATA%\FrameNote\
-  framenote.sqlite3       # 对话、字幕、设置、token 统计、最近 12 篇网页正文
+  framenote.sqlite3       # 对话、字幕、设置、token 统计和来源 URL
   framenote.sqlite3-wal   # SQLite WAL（运行时可能存在）
   framenote.sqlite3-shm   # SQLite 共享内存（运行时可能存在）
   credentials.json       # Windows safeStorage 加密后的 API Key
@@ -285,7 +283,7 @@ Electron 使用 `app.getPath("userData")` 作为数据根目录。Windows 正式
 
 - SQLite 开启外键、WAL，锁等待为 5000 ms。
 - API Key 不写入 SQLite，也不把明文返回 Renderer；`credentials.json` 只存 Windows `safeStorage` 加密后的 Base64 密文。
-- 支持 DashScope、DeepSeek、SerpAPI 三类 Key。主进程解密后只注入自身进程环境。
+- 只支持 DashScope 和 DeepSeek 两类 Key。主进程解密后只注入自身进程环境。
 - 对话删除使用外键级联清除消息、消息详情和字幕。
 - media core 的分析产物默认 TTL 为 1 小时，签名 URL 默认 10 分钟；正常分析结束会主动删除任务，异常遗留由定时清理回收。
 
@@ -324,7 +322,6 @@ Electron 使用 `app.getPath("userData")` 作为数据根目录。Windows 正式
 | `DELETE /v1/bilibili/jobs/{id}` | 取消/释放 B站任务 |
 | `GET /v1/{kind}/jobs/{id}/artifact` | 用限时签名读取完整分析 MP4 |
 | `GET /v1/{kind}/jobs/{id}/analysis/{asset}` | 用限时签名读取关键帧或音频分片 |
-| `POST /v1/web/extract` | 提取公开 HTML/PDF 正文 |
 
 桌面 sidecar 默认从 8788 端口开始寻找可用 loopback 端口；启动等待 45 秒，每 5 秒健康检查一次，异常最多自动重启 3 次。队列默认 2 个并行 worker、最多 20 个排队任务。
 
@@ -342,6 +339,6 @@ Electron 使用 `app.getPath("userData")` 作为数据根目录。Windows 正式
 - 问答路由：`src/main/services/model-service.ts`
 - 充分性判断：`src/main/model/answer-readiness.ts`
 - 回顾参数：`src/main/model/video-recall.ts`
-- 联网参数：`src/main/services/research/`
+- DeepSeek 回答与联网：`src/main/model/deepseek-conversation-engine.ts`
 - SQLite 字段与上限：`src/main/database/conversation-repository.ts`
 - IPC 表面：`src/shared/ipc-contract.ts` 与 `src/main/ipc/register.ts`

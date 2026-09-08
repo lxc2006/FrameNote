@@ -202,8 +202,6 @@ export default function UserSettingsMenu() {
   const [credentialValues, setCredentialValues] = useState({
     dashscopeApiKey: "",
     deepseekApiKey: "",
-    serpApiKey: "",
-    zhipuSearchApiKey: "",
   });
   const [credentialBusy, setCredentialBusy] = useState(false);
   const [credentialMessage, setCredentialMessage] = useState("");
@@ -346,8 +344,6 @@ export default function UserSettingsMenu() {
       setCredentialValues({
         dashscopeApiKey: "",
         deepseekApiKey: "",
-        serpApiKey: "",
-        zhipuSearchApiKey: "",
       });
       setCredentialMessage("API Key 已使用 Windows 加密保存。");
     } catch (error) {
@@ -358,21 +354,6 @@ export default function UserSettingsMenu() {
       setCredentialBusy(false);
     }
   };
-
-  const searchCredential =
-    preferences.webSearchProvider === "zhipu"
-      ? {
-          key: "zhipuSearchApiKey" as const,
-          label: "智谱搜索 API",
-          configured: credentialStatus?.zhipuSearchConfigured,
-          consoleUrl: "https://open.bigmodel.cn/apikey/platform",
-        }
-      : {
-          key: "serpApiKey" as const,
-          label: "SerpAPI",
-          configured: credentialStatus?.serpApiConfigured,
-          consoleUrl: "https://serpapi.com/manage-api-key",
-        };
 
   return (
     <div className="user-settings" ref={containerRef}>
@@ -513,8 +494,9 @@ export default function UserSettingsMenu() {
             <fieldset className="settings-group settings-credential-group">
               <legend>模型 API Key</legend>
               <p>
-                Qwen Key 同时用于视频总结和在线字幕。所有 Key 均由 Electron
-                主进程使用 Windows 加密存储，不会写入 SQLite。
+                Qwen Key 用于视频总结和在线字幕；DeepSeek Key 用于后续对话、
+                深度思考和内置联网搜索。Key 均由 Electron 主进程使用 Windows
+                加密存储，不会写入 SQLite。
               </p>
               {(
                 [
@@ -583,95 +565,6 @@ export default function UserSettingsMenu() {
                   ) : null}
                 </div>
               ))}
-              <div className="settings-credential-row">
-                <div className="settings-credential-field">
-                  <div className="settings-credential-label">
-                    <div
-                      className="search-provider-switch"
-                      role="group"
-                      aria-label="联网搜索 API"
-                    >
-                      <button
-                        type="button"
-                        className={
-                          preferences.webSearchProvider === "serpapi"
-                            ? "active"
-                            : ""
-                        }
-                        aria-pressed={
-                          preferences.webSearchProvider === "serpapi"
-                        }
-                        onClick={() =>
-                          updatePreference("webSearchProvider", "serpapi")
-                        }
-                      >
-                        SerpAPI
-                      </button>
-                      <button
-                        type="button"
-                        className={
-                          preferences.webSearchProvider === "zhipu"
-                            ? "active"
-                            : ""
-                        }
-                        aria-pressed={preferences.webSearchProvider === "zhipu"}
-                        onClick={() =>
-                          updatePreference("webSearchProvider", "zhipu")
-                        }
-                      >
-                        智谱搜索 API
-                      </button>
-                    </div>
-                    <button
-                      type="button"
-                      className="settings-api-link"
-                      aria-label={`打开 ${searchCredential.label} 工作台`}
-                      title="打开 API Key 工作台"
-                      onClick={() => {
-                        void desktopBridge()
-                          ?.openExternal(searchCredential.consoleUrl)
-                          .catch((error: unknown) => {
-                            setCredentialMessage(
-                              error instanceof Error
-                                ? error.message
-                                : "无法打开 API Key 工作台。",
-                            );
-                          });
-                      }}
-                    >
-                      获取↗
-                    </button>
-                  </div>
-                  <input
-                    type="password"
-                    aria-label={`${searchCredential.label} Key`}
-                    autoComplete="off"
-                    value={credentialValues[searchCredential.key]}
-                    placeholder={
-                      searchCredential.configured
-                        ? "已配置；输入新值可替换"
-                        : "尚未配置"
-                    }
-                    onChange={(event) =>
-                      setCredentialValues((current) => ({
-                        ...current,
-                        [searchCredential.key]: event.target.value,
-                      }))
-                    }
-                  />
-                </div>
-                {searchCredential.configured ? (
-                  <button
-                    type="button"
-                    disabled={credentialBusy}
-                    onClick={() =>
-                      void updateCredentials({ [searchCredential.key]: null })
-                    }
-                  >
-                    清除
-                  </button>
-                ) : null}
-              </div>
               <div className="settings-credential-actions">
                 <button
                   type="button"

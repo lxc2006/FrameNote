@@ -29,27 +29,25 @@ const GUIDE_MARKDOWN = String.raw`
 后续回答由 DeepSeek 完成，默认携带视频总结、最近消息以及可用的视频记忆。
 
 - **回顾**：需要字幕细节、完整总结或较早对话时，允许读取已保存的扩展上下文。
-- **联网**：先由搜索规划判断关键词，再调用当前选中的 **SerpAPI / 智谱搜索 API**；读取到的网页证据会交给 DeepSeek。
+- **联网**：允许 DeepSeek Responses API 使用内置网页搜索；明确要求联网或需要最新资料时会强制搜索，其余情况由 DeepSeek 按需决定。
 - **深度**：使用 DeepSeek 深度思考模式，通常更慢，也会消耗更多 Token。
 
-> 搜索“已发起”不等于“已取得证据”。候选网页拒绝访问、需要登录或正文解析失败时，回答区会明确显示搜索状态和失败原因。
+> DeepSeek 的内置搜索由服务端完成。网页拒绝访问、需要登录或没有可引用来源时，回答区会显示实际搜索状态。
 
 ## 4. API Key 是什么
 
 | Key | 用途 | 获取位置 |
 | --- | --- | --- |
 | Qwen / DashScope | 视频总结、在线字幕识别 | [阿里云百炼工作台](https://bailian.console.aliyun.com/?apiKey=1&tab=model) |
-| DeepSeek | 总结后的连续问答、搜索规划与深度思考 | [DeepSeek 开放平台](https://platform.deepseek.com/api_keys) |
-| SerpAPI | Google 聚合搜索 | [SerpAPI 控制台](https://serpapi.com/manage-api-key) |
-| 智谱搜索 API | 国内可访问的联网搜索 | [智谱开放平台](https://open.bigmodel.cn/apikey/platform) |
+| DeepSeek | 连续问答、深度思考与内置联网搜索 | [DeepSeek 开放平台](https://platform.deepseek.com/api_keys) |
 
-在 **设置 → 模型 API Key** 中填写。第三行的滑动按钮决定联网时使用哪一家搜索服务，并同步切换输入框和“获取”链接。Key 由 Electron 主进程使用 Windows 加密保存，不写入对话数据库，也不要提交到 Git。
+在 **设置 → 模型 API Key** 中填写。应用只需要 Qwen 和 DeepSeek 两个 Key；Key 由 Electron 主进程使用 Windows 加密保存，不写入对话数据库，也不要提交到 Git。
 
 ## 5. 快速检查
 
 - [ ] Qwen Key 已配置
 - [ ] DeepSeek Key 已配置
-- [ ] 需要联网时，已选择并配置对应的搜索 Key
+- [ ] 需要联网时，已打开对话区的“联网”按钮
 - [ ] 媒体仍可访问，且未超过本地分析限制
 `;
 

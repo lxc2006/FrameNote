@@ -145,9 +145,6 @@ export function registerDesktopIpc(
   credentialStore: CredentialStore,
   douyinCookieSession: DouyinCookieSession,
 ) {
-  process.env.FRAMENOTE_WEB_SEARCH_PROVIDER =
-    database.settings.getUserPreferences()?.webSearchProvider ?? "serpapi";
-
   ipcMain.handle(DESKTOP_CHANNELS.getRuntimeInfo, () => ({
     appVersion: app.getVersion(),
     isPackaged: app.isPackaged,
@@ -232,12 +229,6 @@ export function registerDesktopIpc(
             signal,
             getConversation: (conversationId) =>
               conversations.get(conversationId),
-            locale: app.getLocale() || "zh-CN",
-            region: "CN",
-            timeZone:
-              Intl.DateTimeFormat().resolvedOptions().timeZone ||
-              "Asia/Shanghai",
-            webContentCache: database.webContentCache,
             onEvent: (modelEvent) => {
               if (event.sender.isDestroyed()) return;
               const message: DesktopModelEvent = {
@@ -339,11 +330,7 @@ export function registerDesktopIpc(
   ipcMain.handle(
     DESKTOP_CHANNELS.settingsSetUserPreferences,
     (_event, preferences: UserPreferences) =>
-    runSettingsRequest(() => {
-      const saved = database.settings.setUserPreferences(preferences);
-      process.env.FRAMENOTE_WEB_SEARCH_PROVIDER = saved.webSearchProvider;
-      return saved;
-    }),
+      runSettingsRequest(() => database.settings.setUserPreferences(preferences)),
   );
   ipcMain.handle(DESKTOP_CHANNELS.credentialsGetStatus, () =>
     runSettingsRequest(() => credentialStore.getStatus()),

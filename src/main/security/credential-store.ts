@@ -11,8 +11,6 @@ type CredentialName = keyof ModelCredentialUpdate;
 const ENVIRONMENT_KEYS: Record<CredentialName, string> = {
   dashscopeApiKey: "DASHSCOPE_API_KEY",
   deepseekApiKey: "DEEPSEEK_API_KEY",
-  serpApiKey: "SERPAPI_API_KEY",
-  zhipuSearchApiKey: "ZHIPU_SEARCH_API_KEY",
 };
 
 interface CredentialFile {
@@ -31,13 +29,19 @@ export class CredentialStore {
       if (parsed.version !== 1 || !parsed.encrypted || typeof parsed.encrypted !== "object") {
         throw new Error("Unsupported credential file format.");
       }
-      this.encrypted = parsed.encrypted;
+      const knownNames = new Set(Object.keys(ENVIRONMENT_KEYS));
+      const removedLegacyCredentials = Object.keys(parsed.encrypted).some(
+        (name) => !knownNames.has(name),
+      );
+      this.encrypted = {};
       for (const name of Object.keys(ENVIRONMENT_KEYS) as CredentialName[]) {
-        const encoded = this.encrypted[name];
+        const encoded = parsed.encrypted[name];
         if (!encoded) continue;
+        this.encrypted[name] = encoded;
         const value = safeStorage.decryptString(Buffer.from(encoded, "base64"));
         if (value) process.env[ENVIRONMENT_KEYS[name]] = value;
       }
+      if (removedLegacyCredentials) await this.persist();
     } catch (error) {
       if ((error as NodeJS.ErrnoException).code !== "ENOENT") {
         console.warn("Unable to load encrypted API credentials.", error);
@@ -49,8 +53,6 @@ export class CredentialStore {
     return {
       dashscopeConfigured: Boolean(process.env.DASHSCOPE_API_KEY?.trim()),
       deepseekConfigured: Boolean(process.env.DEEPSEEK_API_KEY?.trim()),
-      serpApiConfigured: Boolean(process.env.SERPAPI_API_KEY?.trim()),
-      zhipuSearchConfigured: Boolean(process.env.ZHIPU_SEARCH_API_KEY?.trim()),
     };
   }
 
@@ -79,6 +81,11 @@ export class CredentialStore {
       process.env[environmentKey] = normalized;
     }
 
+    await this.persist();
+    return this.getStatus();
+  }
+
+  private async persist() {
     await mkdir(dirname(this.filePath), { recursive: true });
     const temporaryPath = `${this.filePath}.tmp`;
     await writeFile(
@@ -87,6 +94,5 @@ export class CredentialStore {
       { encoding: "utf8", mode: 0o600 },
     );
     await rename(temporaryPath, this.filePath);
-    return this.getStatus();
   }
 }

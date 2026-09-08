@@ -20,7 +20,8 @@ FrameNote 已从网站迁移为 Windows 桌面独占应用。生产运行时由 
 - B站手动预览与总结下载统一为最多 5 次完整解析（1、2、4、8 秒退避）；成功立即继续，只在第 5 次仍失败时向界面报告。
 - Electron 自动启动、监控、有限重启并终止媒体 sidecar。
 - NSIS 安装、升级、卸载和 GitHub Releases 自动更新已经接入。
-- 用户可在设置页录入自己的 DashScope、DeepSeek、SerpAPI Key；主进程用 Windows `safeStorage` 加密，密钥不会返回 Renderer 或写入 SQLite。
+- DeepSeek 调用已统一迁移到 Responses API；联网直接使用其服务端内置 `web_search`，不再包含 SerpAPI、智谱搜索、Qwen Rerank、本机网页正文提取或正文缓存。
+- 用户只需在设置页录入自己的 DashScope 和 DeepSeek Key；主进程用 Windows `safeStorage` 加密，密钥不会返回 Renderer 或写入 SQLite。
 - Next.js、Vinext、Cloudflare Worker、Sites、D1、Drizzle、网页 API Route 和网页测试已删除。
 
 ## 关键入口

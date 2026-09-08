@@ -31,10 +31,6 @@ export interface AskVideoRequest {
   reasoningMode?: "flash" | "pro";
   webSearchEnabled?: boolean;
   fullRecallEnabled?: boolean;
-  searchContext?: {
-    locale?: string;
-    timeZone?: string;
-  };
 }
 
 export interface AnalyzeVideoResponse {

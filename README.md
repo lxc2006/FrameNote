@@ -9,7 +9,8 @@ FrameNote 是 Windows 桌面视频总结与连续问答工具。它支持本地�
 - Electron + React/Vite + TypeScript 桌面界面。
 - 本地 SQLite 保存对话、总结、字幕、显示设置和本地视频绝对路径，不复制原始视频；再次进入对话时自动按路径恢复，文件移动或删除后提示找不到。
 - API Key 由 Electron 主进程使用 Windows `safeStorage` 加密保存，Renderer 只能读取配置状态。
-- `framenote-media-core.exe` 负责 B站/抖音公开链接解析与预览，以及下载、转码、关键帧、音轨和网页正文提取。
+- `framenote-media-core.exe` 负责 B站/抖音公开链接解析与预览，以及下载、转码、关键帧和音轨。
+- DeepSeek Responses API 负责后续问答与服务端内置联网搜索，不再依赖第三方搜索 Key、本机正文提取或网页正文缓存。
 - `qwen-audio-3.0-asr-flash` 通过 Electron 主进程进行在线字幕识别；媒体核心只准备受限长度的音频分片。
 - 媒体准备完成后，在线字幕识别与 Qwen 视频总结并行执行；分叉进度分别显示两路状态，成功的分支变绿，等待两路结束后保存。
 - 播放器支持全屏（Esc 退出）；下载按钮在仅预览时位于右侧标题最右边，已有总结时位于“在线识别字幕”右侧。B站下载最高可用、上限 1080p 的预览轨并合并音轨；抖音下载公开分享视频的带音轨 MP4；本地视频另存原文件，HTTPS 直链直接下载。
@@ -52,7 +53,7 @@ pnpm desktop:dev
 
 如果尚未构建媒体核心，开发模式会回退到项目 `.venv` 中的 `media_service/app.py`。正式安装包不会回退到 Python 源码。
 
-开发者可在 `.env.local` 中临时配置模型 Key。普通用户应在软件右上角“设置 → 模型 API Key”中填写自己的 DashScope、DeepSeek 和可选 SerpAPI Key；保存后立即供主进程使用。
+开发者可在 `.env.local` 中临时配置模型 Key。普通用户只需在软件右上角“设置 → 模型 API Key”中填写自己的 DashScope 和 DeepSeek Key；保存后立即供主进程使用。
 
 ## 构建
 

@@ -83,23 +83,19 @@ export async function assessAnswerReadiness(
     maxRetries: 1,
   });
   try {
-    const completion = await client.chat.completions.create(
+    const response = await client.responses.create(
       {
         model: config.flashModel,
-        messages: [
-          { role: "system", content: ANSWER_READINESS_PROMPT },
-          {
-            role: "user",
-            content: JSON.stringify(readinessInput(context)),
-          },
-        ],
-        response_format: { type: "json_object" },
+        instructions: ANSWER_READINESS_PROMPT,
+        input: JSON.stringify(readinessInput(context)),
+        text: { format: { type: "json_object" } },
+        reasoning: { effort: "none" },
         stream: false,
-        max_tokens: 800,
+        max_output_tokens: 800,
       },
       { signal },
     );
-    const usage = normalizeModelCallUsage(completion.usage, {
+    const usage = normalizeModelCallUsage(response.usage, {
       provider: "deepseek",
       model: config.flashModel,
       operation:
@@ -108,7 +104,7 @@ export async function assessAnswerReadiness(
           : "answer_readiness_after_recall",
     });
     if (usage) onUsage?.(usage);
-    const content = completion.choices[0]?.message.content?.trim();
+    const content = response.output_text.trim();
     if (!content) return fallback;
     const normalized = normalizeDecision(
       JSON.parse(stripCodeFence(content)) as ReadinessPayload,

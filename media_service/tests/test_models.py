@@ -7,7 +7,6 @@ from media_service.service.models import (
     ErrorResponse,
     JobResponse,
     SourceResponse,
-    WebExtractRequest,
 )
 from pydantic import ValidationError
 
@@ -54,16 +53,6 @@ class JobResponseTests(unittest.TestCase):
                 variant="analysis",
                 directSummaryMaxSeconds=901,
             )
-
-    def test_web_extract_request_rejects_extra_fields(self) -> None:
-        request = WebExtractRequest(url="https://example.com/article")
-        self.assertEqual(request.url, "https://example.com/article")
-        with self.assertRaises(ValidationError):
-            WebExtractRequest(
-                url="https://example.com/article",
-                query="unexpected",
-            )
-
 
 if __name__ == "__main__":
     unittest.main()

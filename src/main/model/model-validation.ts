@@ -97,27 +97,10 @@ export function parseAskVideoRequest(value: unknown): AskVideoRequest {
       "fullRecallEnabled",
       false,
     ),
-    ...(object.searchContext === undefined
-      ? {}
-      : { searchContext: parseSearchContext(object.searchContext) }),
     ...(object.context === undefined
       ? {}
       : { context: parseContext(object.context, true) }),
     ...(history ? { history } : {}),
-  };
-}
-
-function parseSearchContext(value: unknown) {
-  const object = recordValue(value, "searchContext");
-  const locale = optionalString(object.locale, "searchContext.locale", 80);
-  const timeZone = optionalString(
-    object.timeZone,
-    "searchContext.timeZone",
-    100,
-  );
-  return {
-    ...(locale ? { locale } : {}),
-    ...(timeZone ? { timeZone } : {}),
   };
 }
 
