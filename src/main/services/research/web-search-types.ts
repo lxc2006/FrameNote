@@ -4,6 +4,7 @@ import type {
   VideoSummary,
 } from "../../../shared/media-types";
 import type {
+  ConversationWebSource,
   ConversationWebSearchFailure,
   ConversationWebSearchStatus,
 } from "../../../shared/conversation-types";
@@ -30,6 +31,7 @@ export interface WebSearchPlanningContext {
   routeReason?: string;
   missingFacts?: string[];
   forceSearch?: boolean;
+  previousSources?: ConversationWebSource[];
 }
 
 export interface WebSearchSource {

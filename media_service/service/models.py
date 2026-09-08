@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from datetime import datetime, timezone
 from typing import Literal
+from urllib.parse import urlsplit
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
@@ -15,7 +16,7 @@ JobPhase = Literal[
     "queued", "resolving", "downloading", "merging", "analyzing", "ready"
 ]
 BilibiliDownloadVariant = Literal["analysis"]
-MediaSourceKind = Literal["upload", "bilibili", "url"]
+MediaSourceKind = Literal["upload", "bilibili", "douyin", "url"]
 WebExtractStatus = Literal["ok", "requires_browser", "skipped"]
 WebExtractMethod = Literal["trafilatura", "pypdf"]
 
@@ -60,6 +61,39 @@ class BilibiliPreviewResponse(BaseModel):
     playbackUrl: str
     audioPlaybackUrl: str | None = None
     bvid: str
+    title: str
+    description: str | None = None
+    durationSeconds: float = Field(gt=0)
+    sizeBytes: int = Field(ge=0)
+    width: int | None = Field(default=None, gt=0)
+    height: int | None = Field(default=None, gt=0)
+    filename: str
+
+
+class DouyinPreviewRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid", str_strip_whitespace=True)
+
+    sourceUrl: str = Field(min_length=12, max_length=2_048)
+
+    @field_validator("sourceUrl")
+    @classmethod
+    def validate_source_url(cls, value: str) -> str:
+        parsed = urlsplit(value)
+        hostname = (parsed.hostname or "").lower().rstrip(".")
+        if (
+            parsed.scheme != "https"
+            or parsed.username is not None
+            or parsed.password is not None
+            or not (hostname == "douyin.com" or hostname.endswith(".douyin.com"))
+        ):
+            raise ValueError("sourceUrl must be an HTTPS Douyin share URL")
+        return value
+
+
+class DouyinPreviewResponse(BaseModel):
+    playbackUrl: str
+    sourceUrl: str
+    videoId: str
     title: str
     description: str | None = None
     durationSeconds: float = Field(gt=0)

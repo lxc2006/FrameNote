@@ -1,6 +1,6 @@
 # 帧记 FrameNote
 
-FrameNote 是 Windows 桌面视频总结与连续问答工具。它支持本地视频、HTTPS 视频直链和无需登录即可访问的 B 站公开视频，并使用 Qwen 生成结构化总结、使用 DeepSeek 继续对话。
+FrameNote 是 Windows 桌面视频总结与连续问答工具。它支持本地视频、HTTPS 视频直链，以及无需登录即可访问的 B站、抖音公开视频，并使用 Qwen 生成结构化总结、使用 DeepSeek 继续对话。
 
 本仓库已经完成桌面独占化：不再包含 Next.js/Vinext 网页入口、HTTP API Route、Cloudflare Worker、Sites 托管配置、D1 或 Drizzle。Electron Renderer 通过受限 IPC 调用主进程；媒体大文件直接发送到 Electron 管理的本机 Python sidecar。
 
@@ -9,10 +9,10 @@ FrameNote 是 Windows 桌面视频总结与连续问答工具。它支持本地�
 - Electron + React/Vite + TypeScript 桌面界面。
 - 本地 SQLite 保存对话、总结、字幕、显示设置和本地视频绝对路径，不复制原始视频；再次进入对话时自动按路径恢复，文件移动或删除后提示找不到。
 - API Key 由 Electron 主进程使用 Windows `safeStorage` 加密保存，Renderer 只能读取配置状态。
-- `framenote-media-core.exe` 负责 B 站预览、下载、转码、关键帧、音轨和网页正文提取。
+- `framenote-media-core.exe` 负责 B站/抖音公开链接解析与预览，以及下载、转码、关键帧、音轨和网页正文提取。
 - `qwen-audio-3.0-asr-flash` 通过 Electron 主进程进行在线字幕识别；媒体核心只准备受限长度的音频分片。
 - 媒体准备完成后，在线字幕识别与 Qwen 视频总结并行执行；分叉进度分别显示两路状态，成功的分支变绿，等待两路结束后保存。
-- 播放器支持全屏（Esc 退出）；下载按钮在仅预览时位于右侧标题最右边，已有总结时位于“在线识别字幕”右侧。B站下载最高可用、上限 1080p 的预览轨并合并音轨；本地视频另存原文件，HTTPS 直链直接下载。
+- 播放器支持全屏（Esc 退出）；下载按钮在仅预览时位于右侧标题最右边，已有总结时位于“在线识别字幕”右侧。B站下载最高可用、上限 1080p 的预览轨并合并音轨；抖音下载公开分享视频的带音轨 MP4；本地视频另存原文件，HTTPS 直链直接下载。
 - electron-builder 生成 NSIS 安装包，electron-updater 使用 GitHub Releases 元数据检查应用更新。
 
 ## 源码结构

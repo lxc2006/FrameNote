@@ -59,6 +59,7 @@ class BilibiliPreviewTrack:
     urls: tuple[str, ...]
     headers: tuple[tuple[str, str], ...]
     media_type: str
+    cookies: tuple[tuple[str, str, str, str], ...] = ()
 
     @property
     def primary_url(self) -> str:

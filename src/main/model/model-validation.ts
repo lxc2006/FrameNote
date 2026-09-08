@@ -35,13 +35,13 @@ export function parseAnalyzeVideoRequest(value: unknown): AnalyzeVideoRequest {
   const source = parseSource(object.source);
   const context = parseContext(object.context, true);
   if (
-    source.kind === "bilibili" &&
+    (source.kind === "bilibili" || source.kind === "douyin") &&
     !context.audioUrl &&
     !context.videoUrl &&
     !context.mediaJobId
   ) {
     throw new QwenInputError(
-      "B站视频总结必须包含完整视频或已提取音轨，不能仅用关键帧生成纯画面总结。",
+      "平台视频总结必须包含完整视频或已提取音轨，不能仅用关键帧生成纯画面总结。",
     );
   }
   return {
@@ -201,8 +201,8 @@ export function modelErrorDetails(
 function parseSource(value: unknown): VideoSourceDescriptor {
   const object = recordValue(value, "source");
   const kind = object.kind;
-  if (kind !== "upload" && kind !== "bilibili" && kind !== "url") {
-    throw new QwenInputError("source.kind 必须是 upload、bilibili 或 url。");
+  if (kind !== "upload" && kind !== "bilibili" && kind !== "douyin" && kind !== "url") {
+    throw new QwenInputError("source.kind 必须是 upload、bilibili、douyin 或 url。");
   }
 
   return {

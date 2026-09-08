@@ -167,6 +167,11 @@ async def open_bilibili_preview_stream(
     proxy = os.getenv("FRAMENOTE_MEDIA_PROXY", "").strip()
     if proxy:
         client_options["proxy"] = proxy
+    if track.cookies:
+        cookies = httpx.Cookies()
+        for domain, path, name, value in track.cookies:
+            cookies.set(name, value, domain=domain, path=path)
+        client_options["cookies"] = cookies
     client = httpx.AsyncClient(**client_options)
     last_status: int | None = None
     try:
@@ -198,5 +203,5 @@ async def open_bilibili_preview_stream(
     raise BilibiliPreviewProxyError(
         502,
         "BILIBILI_PREVIEW_CDN_FAILED",
-        "B站 CDN 拒绝或中断了视频预览请求，请重新获取视频。",
+        "视频 CDN 拒绝或中断了预览请求，请重新获取视频。",
     )

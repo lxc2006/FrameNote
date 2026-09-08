@@ -12,6 +12,7 @@ import { startAutomaticUpdates } from "./updates/auto-update";
 import { createMainWindow, hasMainWindow, openExternalUrl } from "./window";
 import { CredentialStore } from "./security/credential-store";
 import { abortVideoDownloads, registerVideoFiles, registerVideoFileScheme } from "./media/video-files";
+import { DouyinCookieSession } from "./media/douyin-cookie-session";
 
 registerVideoFileScheme();
 
@@ -19,7 +20,16 @@ const DESKTOP_OWNER_ID = "desktop-local-user";
 let desktopDatabase: DesktopDatabase | undefined;
 let mediaSidecar: MediaSidecarManager | undefined;
 let credentialStore: CredentialStore | undefined;
+let douyinCookieSession: DouyinCookieSession | undefined;
 let shutdownStarted = false;
+
+function openMainWindow() {
+  createMainWindow({
+    shouldDetectClipboardLinks: () =>
+      desktopDatabase?.settings.getUserPreferences()?.autoDetectClipboardLinks ??
+      true,
+  });
+}
 
 function loadDesktopEnvironment() {
   const candidates = app.isPackaged
@@ -60,6 +70,9 @@ app.whenReady().then(async () => {
     join(app.getPath("userData"), "credentials.json"),
   );
   await credentialStore.initialize();
+  douyinCookieSession = new DouyinCookieSession(
+    join(app.getPath("userData"), "media-sidecar", "douyin-cookies.txt"),
+  );
   mediaSidecar = new MediaSidecarManager({
     isPackaged: app.isPackaged,
     resourcesPath: process.resourcesPath,
@@ -80,6 +93,7 @@ app.whenReady().then(async () => {
     ),
     mediaSidecar,
     credentialStore,
+    douyinCookieSession,
   );
 
   ipcMain.handle(
@@ -92,13 +106,13 @@ app.whenReady().then(async () => {
     },
   );
 
-  registerVideoFiles(mediaSidecar);
-  createMainWindow();
+  registerVideoFiles(mediaSidecar, douyinCookieSession);
+  openMainWindow();
   void removeLegacyOfflineSubtitleFiles();
   startAutomaticUpdates();
 
   app.on("activate", () => {
-    if (!hasMainWindow()) createMainWindow();
+    if (!hasMainWindow()) openMainWindow();
   });
 });
 
@@ -110,8 +124,10 @@ app.on("before-quit", (event) => {
   void Promise.allSettled([
     abortVideoDownloads(),
     mediaSidecar?.stop() ?? Promise.resolve(),
+    douyinCookieSession?.dispose() ?? Promise.resolve(),
   ]).finally(() => {
     mediaSidecar = undefined;
+    douyinCookieSession = undefined;
     desktopDatabase?.close();
     desktopDatabase = undefined;
     app.exit(0);

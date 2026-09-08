@@ -1,6 +1,6 @@
 # FrameNote 当前工作链路与参数
 
-> 本文记录当前桌面版代码的真实运行方式，不是后续规划。更新日期：2026-09-06。
+> 本文记录当前桌面版代码的真实运行方式，不是后续规划。更新日期：2026-09-07。
 
 ## 1. 运行边界
 
@@ -14,7 +14,7 @@ React Renderer
   │                                      └─ 本地文件打开、下载与外部链接
   └─ 带令牌的 loopback HTTP ─────────────> Python media core
                                          ├─ FFmpeg / ffprobe
-                                         ├─ yt-dlp（B站公开内容）
+                                         ├─ yt-dlp（B站/抖音公开内容）
                                          ├─ 关键帧、音轨与网页正文提取
                                          └─ 临时分析任务与签名资源
 ```
@@ -64,10 +64,18 @@ React Renderer
 - 下载层本身还配置网络/分片重试 10 次、文件访问重试 3 次，分片并发数为 4。这和上面的“5 次完整解析”不是同一层重试。
 - 播放器画面非原生控制条区域支持单击播放/暂停、双击进入或退出应用内全屏；单击会延迟 220 ms，以区分双击并避免一次双击触发两次播放切换。
 
-### 2.4 视频下载按钮
+### 2.4 抖音视频
+
+1. 用户切到“抖音”并粘贴分享文本或 `douyin.com` / `v.douyin.com` 的 HTTPS 链接；Renderer 只提取其中第一个合法抖音链接。
+2. “获取视频”调用 `/v1/douyin/preview`。media core 使用 yt-dlp 解析公开分享页，最多完整尝试 5 次，并选择最高不超过 1080p、同时带画面和声音的 MP4 流。
+3. 原始 CDN 地址和所需请求头不会交给 Renderer；media core 建立短期预览会话，由 `/v1/douyin/preview/{session}/video` 代理并支持 Range 播放。
+4. 点击总结时，Renderer 从本机代理读取视频并上传到 `/v1/media/jobs`，`sourceKind=douyin`；之后完全复用 HTTPS/本地媒体的校验、转码、关键帧、音轨、Qwen 总结与在线 ASR 链路。
+5. 历史记录只保存原分享链接与公开元数据，重新打开时再次解析预览。应用不读取浏览器 Cookie，不处理需要登录、验证码、私密或其他访问限制的内容。
+
+### 2.5 视频下载按钮
 
 - 下载由主进程弹出系统“另存为”，Renderer 不能自行指定任意文件路径。
-- 本地视频复制原文件；HTTPS 来源由主进程流式下载。
+- 本地视频复制原文件；HTTPS 来源由主进程流式下载；抖音会重新解析原分享链接并流式保存带声音的 MP4。
 - B站下载重新获取一次预览流，分别下载视频轨和音频轨，再用随 media core 提供的 FFmpeg 做无重编码合并和 `faststart`。
 - 所有来源先写到目标磁盘上的 `.framenote-download-*` 临时目录，成功后原子重命名为用户选择的文件；取消或失败会删除临时目录。
 - 单次远程流下载超时 30 分钟；关闭页面或应用会取消在途下载。
@@ -78,7 +86,7 @@ React Renderer
 
 Renderer 展示五个阶段：
 
-1. 上传本地视频 / 读取 HTTPS 视频直链 / 下载 B站分析视频。
+1. 上传本地视频 / 读取 HTTPS 视频直链 / 下载 B站分析视频 / 读取抖音分享视频。
 2. 压缩或准备约 480p 的分析视频。
 3. 按时长准备完整视频或关键帧。
 4. Qwen 视频总结与在线字幕识别并行运行；关闭字幕时只运行视频总结。
@@ -190,7 +198,7 @@ Renderer 展示五个阶段：
 
 总结成功后创建 SQLite 对话，保存：
 
-- 视频来源元数据（包括本地文件路径、BVID 或 HTTPS URL）。
+- 视频来源元数据（包括本地文件路径、BVID、抖音分享链接或 HTTPS URL）。
 - 完整总结 JSON 和当前 Qwen 模型名。
 - 初始助手消息。
 - 字幕 `ready` 或 `unavailable` 状态、全文、时间 cue、语言和错误说明。
@@ -244,15 +252,16 @@ Renderer 发起问答时最多提交最近 10 条消息。若有 `conversationId
 
 ### 4.4 联网搜索（web）
 
-只有启用联网搜索并配置 SerpAPI Key 时才会实际搜索：
+只有启用联网搜索，并配置当前搜索供应商 Key、千问 Key 时才会实际搜索：
 
 1. flash 模型生成最长 240 字的搜索词，规划最多 600 tokens；明确联网请求即使规划器想跳过，也会生成后备关键词强制搜索。
-2. SerpAPI 默认最多取 12 个候选，请求超时 15 秒。
+2. SerpAPI 或智谱搜索默认最多取 12 个候选，请求超时 15 秒。
 3. 依次读取候选，目标为最多 4 个真正可读页面。
 4. HTML/PDF 优先交给 media core，用 Trafilatura 或 pypdf 提取；需要浏览器时只有配置 Cloudflare Browser Rendering 后才会使用该后备能力。
-5. 单页正文最多 180000 字；从每页选择最多 4 段相关内容，每段最多 1600 字。
-6. 搜索证据、回顾证据、现有总结和最近对话一起进入最终 DeepSeek 回答；即使没有成功提取正文，也会把 `status / query / note` 和资料充分性原因交给最终模型，明确区分“没有发起搜索”和“搜索已执行但没有可读证据”。
-7. 每轮保存搜索状态、关键词、是否已发出请求、候选数量、可读证据数量、正文提取失败数量和失败原因；页面分别显示“已发起搜索，但未取得可读网页”或“已取得 N 个网页证据”。
+5. 完整提取正文按块分片后交给 `qwen3.7-text-rerank`；默认保留相关度不低于 `0.2` 的全部分片，再按原文顺序恢复，每个网页最终最多向 DeepSeek 提供约 20000 tokens。
+6. SQLite 保存最近访问的 12 个网页正文，单篇最多 100000 字；命中历史来源 URL、序号或标题时直接读取缓存并重新精排，缓存未命中时按保存的 URL 重新提取。
+7. 搜索证据、回顾证据、现有总结和最近对话一起进入最终 DeepSeek 回答；即使没有成功提取正文，也会把 `status / query / note` 和资料充分性原因交给最终模型，明确区分“没有发起搜索”和“搜索已执行但没有可读证据”。
+8. 每轮保存搜索状态、关键词、是否已发出请求、候选数量、可读证据数量、正文提取失败数量和失败原因；页面分别显示“已发起搜索，但未取得可读网页”或“已取得 N 个网页证据”。
 
 ### 4.5 流式事件、停止和重发
 
@@ -267,7 +276,7 @@ Electron 使用 `app.getPath("userData")` 作为数据根目录。Windows 正式
 
 ```text
 %APPDATA%\FrameNote\
-  framenote.sqlite3       # 对话、字幕、设置、token 统计
+  framenote.sqlite3       # 对话、字幕、设置、token 统计、最近 12 篇网页正文
   framenote.sqlite3-wal   # SQLite WAL（运行时可能存在）
   framenote.sqlite3-shm   # SQLite 共享内存（运行时可能存在）
   credentials.json       # Windows safeStorage 加密后的 API Key
@@ -288,7 +297,7 @@ Electron 使用 `app.getPath("userData")` 作为数据根目录。Windows 正式
 | --- | --- |
 | Runtime | 获取版本/平台、打开受校验的外部链接、通过主进程写入系统剪贴板 |
 | Media | 获取本次 sidecar 的 loopback 地址和访问令牌 |
-| Video files | 打开/释放本地视频、下载本地/B站/HTTPS 视频、取消下载 |
+| Video files | 打开/释放本地视频、下载本地/B站/抖音/HTTPS 视频、取消下载 |
 | Model | Qwen 总结、DeepSeek 问答、取消请求、订阅流式事件 |
 | Transcription | Qwen 在线字幕提取与取消 |
 | Conversations | 列表、创建、读取、重命名、更新字幕、删除、追加/截断消息 |
@@ -307,6 +316,8 @@ Electron 使用 `app.getPath("userData")` 作为数据根目录。Windows 正式
 | `GET /v1/bilibili/preview/{session}/video` | 代理 B站视频流，支持 Range |
 | `GET /v1/bilibili/preview/{session}/audio` | 代理 B站独立音频流 |
 | `POST /v1/bilibili/jobs` | 创建 B站下载与分析任务 |
+| `POST /v1/douyin/preview` | 解析抖音公开分享链接并创建短期预览会话 |
+| `GET /v1/douyin/preview/{session}/video` | 代理带画面和声音的抖音视频流，支持 Range |
 | `GET /v1/media/jobs/{id}` | 查询普通媒体任务 |
 | `GET /v1/bilibili/jobs/{id}` | 查询 B站任务 |
 | `DELETE /v1/media/jobs/{id}` | 取消/释放普通媒体任务 |

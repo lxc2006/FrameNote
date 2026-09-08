@@ -1,4 +1,5 @@
 export type ThemePreference = "light" | "dark";
+export type WebSearchProvider = "serpapi" | "zhipu";
 
 export type FontPreference =
   | "system"
@@ -18,6 +19,8 @@ export interface UserPreferences {
   textFont: FontPreference;
   textFontSize: number;
   qwenDirectSummaryMaxSeconds: number;
+  autoDetectClipboardLinks: boolean;
+  webSearchProvider: WebSearchProvider;
 }
 
 interface LegacyUserPreferences {
@@ -45,6 +48,8 @@ export const DEFAULT_USER_PREFERENCES: UserPreferences = {
   textFont: "system",
   textFontSize: DEFAULT_FONT_SIZE,
   qwenDirectSummaryMaxSeconds: DEFAULT_QWEN_DIRECT_SUMMARY_MAX_SECONDS,
+  autoDetectClipboardLinks: true,
+  webSearchProvider: "serpapi",
 };
 
 const LEGACY_FONT_SIZES: Record<
@@ -70,6 +75,10 @@ function isLegacyFontSize(
 
 function isThemePreference(value: unknown): value is ThemePreference {
   return value === "light" || value === "dark";
+}
+
+function isWebSearchProvider(value: unknown): value is WebSearchProvider {
+  return value === "serpapi" || value === "zhipu";
 }
 
 function isFontPreference(value: unknown): value is FontPreference {
@@ -140,6 +149,13 @@ export function parseUserPreferences(storedValue: string): UserPreferences {
       qwenDirectSummaryMaxSeconds: normalizeDirectSummarySeconds(
         parsed.qwenDirectSummaryMaxSeconds,
       ),
+      autoDetectClipboardLinks:
+        typeof parsed.autoDetectClipboardLinks === "boolean"
+          ? parsed.autoDetectClipboardLinks
+          : DEFAULT_USER_PREFERENCES.autoDetectClipboardLinks,
+      webSearchProvider: isWebSearchProvider(parsed.webSearchProvider)
+        ? parsed.webSearchProvider
+        : DEFAULT_USER_PREFERENCES.webSearchProvider,
     };
   } catch {
     return DEFAULT_USER_PREFERENCES;

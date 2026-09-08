@@ -5,6 +5,7 @@ import type {
   ConversationStatement,
 } from "./conversation-repository";
 import { SettingsRepository } from "./settings-repository";
+import { WebContentCacheRepository } from "./web-content-cache-repository";
 
 type SQLiteValue = string | number | bigint | Uint8Array | null;
 
@@ -76,6 +77,7 @@ class LocalPreparedStatement implements ConversationStatement {
 export class DesktopDatabase implements ConversationDatabase {
   private readonly database: DatabaseSync;
   readonly settings: SettingsRepository;
+  readonly webContentCache: WebContentCacheRepository;
   private closed = false;
 
   constructor(readonly filePath: string) {
@@ -84,6 +86,7 @@ export class DesktopDatabase implements ConversationDatabase {
     this.database.exec("PRAGMA journal_mode = WAL");
     this.database.exec("PRAGMA busy_timeout = 5000");
     this.settings = new SettingsRepository(this.database);
+    this.webContentCache = new WebContentCacheRepository(this.database);
   }
 
   prepare(query: string): ConversationStatement {

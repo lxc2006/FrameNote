@@ -16,7 +16,7 @@ const MAX_JOB_WAIT_MS = 22 * 60 * 1_000;
 const MIN_KEYFRAMES = 3;
 
 interface MediaJobSource {
-  kind: "upload" | "url";
+  kind: "upload" | "douyin" | "url";
   filename?: string;
   sourceUrl?: string;
   title?: string;
@@ -52,7 +52,7 @@ export interface MediaAnalysisResult {
 }
 
 interface MediaAnalysisOptions {
-  sourceKind: Extract<SourceKind, "upload" | "url">;
+  sourceKind: Extract<SourceKind, "upload" | "douyin" | "url">;
   sourceUrl?: string;
   directSummaryMaxSeconds: number;
   signal?: AbortSignal;
@@ -83,7 +83,7 @@ export async function prepareMediaAnalysis(
     "directSummaryMaxSeconds",
     String(options.directSummaryMaxSeconds),
   );
-  if (options.sourceKind === "url" && options.sourceUrl) {
+  if ((options.sourceKind === "url" || options.sourceKind === "douyin") && options.sourceUrl) {
     form.set("sourceUrl", options.sourceUrl);
   }
 
@@ -347,7 +347,7 @@ function isMediaJobSnapshot(value: unknown): value is MediaJobSnapshot {
     Boolean(source) &&
     typeof source === "object" &&
     !Array.isArray(source) &&
-    ["upload", "url"].includes(
+    ["upload", "douyin", "url"].includes(
       String((source as Record<string, unknown>).kind),
     )
   );

@@ -11,7 +11,9 @@ import { promisify } from "node:util";
 import { DESKTOP_CHANNELS, type DesktopIpcResult } from "../../shared/ipc-contract";
 import type { LocalVideoFile, VideoDownloadInput, VideoDownloadResult } from "../../shared/video-files";
 import type { BilibiliPreviewResponse } from "../../shared/bilibili-api";
+import type { DouyinPreviewResponse } from "../../shared/douyin-api";
 import type { MediaSidecarManager } from "./media-sidecar";
+import type { DouyinCookieSession } from "./douyin-cookie-session";
 
 const execFileAsync = promisify(execFile);
 const videoExtensions = new Set([".mp4", ".mov", ".webm", ".mkv", ".m4v"]);
@@ -72,12 +74,23 @@ async function saveVideo(
   event: IpcMainInvokeEvent,
   input: VideoDownloadInput,
   sidecar: MediaSidecarManager,
+  douyinCookieSession: DouyinCookieSession,
   signal: AbortSignal,
 ): Promise<VideoDownloadResult> {
   const window = trustedWindow(event);
-  if (!input || !["local", "bilibili", "remote"].includes(input.kind)) throw new Error("视频下载来源无效。");
+  if (!input || !["local", "bilibili", "douyin", "remote"].includes(input.kind)) throw new Error("视频下载来源无效。");
   const sourcePath = input.kind === "local" ? await localVideoPath(input.path) : undefined;
   if (input.kind === "bilibili" && !/^BV[0-9A-Za-z]{10}$/.test(input.bvid)) throw new Error("BV 号无效。");
+  if (input.kind === "douyin") {
+    const url = new URL(input.sourceUrl);
+    const hostname = url.hostname.toLowerCase().replace(/\.$/u, "");
+    if (
+      url.protocol !== "https:" ||
+      url.username ||
+      url.password ||
+      (hostname !== "douyin.com" && !hostname.endsWith(".douyin.com"))
+    ) throw new Error("抖音分享链接无效。");
+  }
   if (input.kind === "remote") {
     const url = new URL(input.url);
     if (url.protocol !== "https:" || url.username || url.password) throw new Error("视频直链必须是 HTTPS 地址。");
@@ -128,6 +141,23 @@ async function saveVideo(
       } else {
         await rename(video, output);
       }
+    } else if (input.kind === "douyin") {
+      await douyinCookieSession.prepare();
+      const connection = sidecar.getConnection();
+      const response = await fetch(`${connection.baseUrl}/v1/douyin/preview`, {
+        method: "POST",
+        headers: { "content-type": "application/json", authorization: `Bearer ${connection.authorizationToken}` },
+        body: JSON.stringify({ sourceUrl: input.sourceUrl }),
+        signal: AbortSignal.any([signal, AbortSignal.timeout(120_000)]),
+      });
+      const preview = await response.json() as DouyinPreviewResponse & { error?: { message?: string } };
+      if (!response.ok) throw new Error(preview.error?.message || "无法获取抖音视频下载地址。");
+      const url = new URL(preview.playbackUrl);
+      if (
+        url.origin !== connection.baseUrl ||
+        !/^\/v1\/douyin\/preview\/[A-Za-z0-9_-]+\/video$/u.test(url.pathname)
+      ) throw new Error("抖音视频下载地址无效。");
+      await downloadStream(url.href, output, signal);
     }
     signal.throwIfAborted();
     if (!(await stat(output)).size) throw new Error("没有生成有效的视频文件。");
@@ -138,7 +168,10 @@ async function saveVideo(
   }
 }
 
-export function registerVideoFiles(sidecar: MediaSidecarManager) {
+export function registerVideoFiles(
+  sidecar: MediaSidecarManager,
+  douyinCookieSession: DouyinCookieSession,
+) {
   protocol.handle("framenote-media", async (request) => {
     const url = new URL(request.url);
     const entry = localVideos.get(url.hostname);
@@ -195,7 +228,13 @@ export function registerVideoFiles(sidecar: MediaSidecarManager) {
       const cancel = () => controller.abort();
       event.sender.once("destroyed", cancel);
       try {
-        return await saveVideo(event, input, sidecar, controller.signal);
+        return await saveVideo(
+          event,
+          input,
+          sidecar,
+          douyinCookieSession,
+          controller.signal,
+        );
       } catch (error) {
         if (controller.signal.aborted) return { cancelled: true };
         throw error;

@@ -4,7 +4,7 @@
 
 ## 交付边界
 
-- `framenote-media-core`：B 站预览和下载、本地/HTTPS 上传、探测、转码、关键帧、音轨、在线识别音频分片、签名资源和联网正文提取。
+- `framenote-media-core`：B站/抖音公开链接预览和下载、本地/HTTPS 上传、探测、转码、关键帧、音轨、在线识别音频分片、签名资源和联网正文提取。
 
 sidecar 不执行语音识别，也不接收模型 API Key；Electron 主进程会读取签名音频分片并调用 Qwen Audio。
 
@@ -19,6 +19,8 @@ python -m venv .venv
 Electron 开发模式会自动启动 sidecar、选择可用 loopback 端口、设置随机 Bearer Token 和签名密钥，并在退出时回收进程树，通常无需手动执行上述命令。
 
 B站手动预览和总结下载共用同一套解析策略：一次操作最多完整解析 5 次，失败后按 1、2、4、8 秒退避；任意一次成功即继续，只有第 5 次仍失败才向上报告错误。
+
+抖音只处理公开、无需登录的分享链接。解析最多尝试 5 次，预览返回带画面与声音的 MP4 代理；总结、字幕与关键帧继续走通用 `/v1/media/jobs` 链路。
 
 ## 冻结构建
 
@@ -41,6 +43,7 @@ media_service/dist/framenote-media-core/framenote-media-core.exe
 - 最多 2 个下载 worker、20 个排队任务；
 - 默认任务超时 20 分钟，产物保留 1 小时；
 - B 站只支持无需登录即可访问且用户有权处理的公开 UGC；
+- 抖音只支持无需登录或验证即可访问且用户有权处理的公开视频；
 - 不读取 Cookie，不处理会员、付费、私有、直播或地区受限内容；
 - 网页正文提取只允许公开 HTTP(S) 地址和 80/443 端口，并逐次校验重定向和 DNS 结果。
 
@@ -55,6 +58,8 @@ POST   /v1/bilibili/preview
 POST   /v1/bilibili/jobs
 GET    /v1/bilibili/jobs/{jobId}
 DELETE /v1/bilibili/jobs/{jobId}
+POST   /v1/douyin/preview
+GET    /v1/douyin/preview/{sessionId}/video
 POST   /v1/web/extract
 ```
 

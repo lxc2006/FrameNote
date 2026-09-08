@@ -798,8 +798,8 @@ function parseSource(value: unknown): VideoSourceDescriptor {
   const object = recordValue(value, "source");
   assertOnlyKeys(object, [...SOURCE_KEYS], "source");
   const kind = object.kind;
-  if (kind !== "upload" && kind !== "bilibili" && kind !== "url") {
-    throw invalidInput("source.kind 必须是 upload、bilibili 或 url。");
+  if (kind !== "upload" && kind !== "bilibili" && kind !== "douyin" && kind !== "url") {
+    throw invalidInput("source.kind 必须是 upload、bilibili、douyin 或 url。");
   }
 
   const title = stringValue(object.title, "source.title", 300);
@@ -856,6 +856,28 @@ function parseSource(value: unknown): VideoSourceDescriptor {
       subtitle,
       bvid,
       sourceUrl: `https://www.bilibili.com/video/${bvid}`,
+      ...(durationLabel ? { durationLabel } : {}),
+      ...(description ? { description } : {}),
+    };
+  }
+
+  if (kind === "douyin") {
+    if (object.bvid !== undefined || object.localPath !== undefined) {
+      throw invalidInput("抖音来源不能包含 bvid 或本地视频路径。");
+    }
+    const sourceUrl = stableHttpsUrl(
+      stringValue(object.sourceUrl, "source.sourceUrl", 2_048),
+      "source.sourceUrl",
+    );
+    const hostname = sourceUrl.hostname.toLowerCase().replace(/\.$/u, "");
+    if (hostname !== "douyin.com" && !hostname.endsWith(".douyin.com")) {
+      throw invalidInput("抖音来源只能保存有效的抖音分享链接。");
+    }
+    return {
+      kind,
+      title,
+      subtitle,
+      sourceUrl: sourceUrl.href,
       ...(durationLabel ? { durationLabel } : {}),
       ...(description ? { description } : {}),
     };
@@ -1499,7 +1521,7 @@ function parsePersistedUsage(value: string): ConversationUsageRecord {
 }
 
 function sourceKindValue(value: string): SourceKind {
-  if (value !== "upload" && value !== "bilibili" && value !== "url") {
+  if (value !== "upload" && value !== "bilibili" && value !== "douyin" && value !== "url") {
     throw new Error("数据库中的来源类型无效。");
   }
   return value;

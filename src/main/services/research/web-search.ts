@@ -1,4 +1,7 @@
-import { extractWebDocument } from "./web-content";
+import {
+  extractWebDocument,
+  type ExtractedWebDocument,
+} from "./web-content";
 import { positiveInteger, runtimeValue } from "../../config/app-env";
 import { planWebSearch } from "./web-search-planner";
 import type {
@@ -7,7 +10,12 @@ import type {
   WebSearchSource,
 } from "./web-search-types";
 import type { ModelUsageSink } from "../../../shared/model-usage";
-import type { ConversationWebSearchFailure } from "../../../shared/conversation-types";
+import type {
+  ConversationWebSearchFailure,
+  ConversationWebSource,
+} from "../../../shared/conversation-types";
+import type { WebContentCacheRepository } from "../../database/web-content-cache-repository";
+import { rerankWebDocument } from "./qwen-rerank";
 
 export type {
   WebSearchEvidence,
@@ -17,11 +25,10 @@ export type {
 } from "./web-search-types";
 
 const DEFAULT_SERPAPI_ENDPOINT = "https://serpapi.com/search.json";
+const ZHIPU_SEARCH_ENDPOINT = "https://open.bigmodel.cn/api/paas/v4/web_search";
 const TARGET_READABLE_PAGES = 4;
 const MAX_SEARCH_CANDIDATES = 12;
 const DEFAULT_TIMEOUT_MS = 15_000;
-const MAX_PASSAGES_PER_SOURCE = 4;
-const MAX_PASSAGE_CHARACTERS = 1_600;
 
 interface SearchCandidate {
   title: string;
@@ -40,6 +47,14 @@ interface SerpApiResult {
   };
 }
 
+interface ZhipuSearchResult {
+  error?: unknown;
+  message?: unknown;
+  search_result?: Array<Record<string, unknown>>;
+}
+
+type WebSearchProvider = "serpapi" | "zhipu";
+
 interface SearchCandidateResult {
   candidates: SearchCandidate[];
   failure?: ConversationWebSearchFailure;
@@ -48,6 +63,7 @@ interface SearchCandidateResult {
 interface WebSearchUsageHooks {
   onModelUsage?: ModelUsageSink;
   onSearchRequest?: () => void;
+  contentCache?: WebContentCacheRepository;
 }
 
 export async function prepareWebSearch(
@@ -55,36 +71,49 @@ export async function prepareWebSearch(
   signal?: AbortSignal,
   usageHooks: WebSearchUsageHooks = {},
 ): Promise<WebSearchEvidence> {
+  const previousSources = referencedPreviousSources(
+    context.question,
+    context.previousSources ?? [],
+  );
   let plan;
-  try {
-    plan = await planWebSearch(
-      context,
-      signal,
-      undefined,
-      usageHooks.onModelUsage,
-    );
-  } catch (error) {
-    if (signal?.aborted) throw error;
-    return {
-      status: "unavailable",
-      plan: {
-        decision: "skip",
-        reason: "搜索规划模型暂时不可用。",
-      },
-      sources: [],
-      visitedPageCount: 0,
-      requestIssued: false,
-      candidateCount: 0,
-      extractionFailureCount: 0,
-      failures: [
-        {
-          stage: "search",
-          code: "SEARCH_PLANNING_FAILED",
-          message: safeErrorMessage(error, "搜索规划模型暂时不可用。"),
-        },
-      ],
-      note: "未能完成联网意图判断与关键词提取，本轮没有执行搜索。",
+  if (previousSources.length) {
+    plan = {
+      decision: "search" as const,
+      query: context.question.replace(/\s+/g, " ").trim().slice(0, 240),
+      reason: "用户要求继续访问此前联网结果。",
+      searchLanguage: context.locale,
     };
+  } else {
+    try {
+      plan = await planWebSearch(
+        context,
+        signal,
+        undefined,
+        usageHooks.onModelUsage,
+      );
+    } catch (error) {
+      if (signal?.aborted) throw error;
+      return {
+        status: "unavailable",
+        plan: {
+          decision: "skip",
+          reason: "搜索规划模型暂时不可用。",
+        },
+        sources: [],
+        visitedPageCount: 0,
+        requestIssued: false,
+        candidateCount: 0,
+        extractionFailureCount: 0,
+        failures: [
+          {
+            stage: "search",
+            code: "SEARCH_PLANNING_FAILED",
+            message: safeErrorMessage(error, "搜索规划模型暂时不可用。"),
+          },
+        ],
+        note: "未能完成联网意图判断与关键词提取，本轮没有执行搜索。",
+      };
+    }
   }
 
   if (plan.decision !== "search" || !plan.query) {
@@ -105,8 +134,7 @@ export async function prepareWebSearch(
     };
   }
 
-  const apiKey = runtimeValue("SERPAPI_API_KEY");
-  if (!apiKey) {
+  if (!runtimeValue("DASHSCOPE_API_KEY")) {
     return {
       status: "unavailable",
       plan,
@@ -118,28 +146,71 @@ export async function prepareWebSearch(
       extractionFailureCount: 0,
       failures: [
         {
-          stage: "search",
-          code: "SERPAPI_NOT_CONFIGURED",
-          message: "尚未配置 SerpAPI Key。",
+          stage: "filter",
+          code: "QWEN_RERANK_NOT_CONFIGURED",
+          message: "尚未配置千问 API Key。",
         },
       ],
-      note: "尚未配置 SERPAPI_API_KEY，无法执行联网检索。",
+      note: "尚未配置千问 API Key，无法对网页正文进行精排。",
     };
   }
 
-  usageHooks.onSearchRequest?.();
-  const searchResult = await searchSerpApi(
-    plan.query,
-    plan.searchLanguage ?? context.locale,
-    plan.countryCode ?? countryCodeFromRegion(context.region),
-    apiKey,
-    signal,
-  );
+  const provider = selectedSearchProvider();
+  const providerLabel = provider === "zhipu" ? "智谱搜索" : "SerpAPI";
+  let searchResult: SearchCandidateResult;
+  if (previousSources.length) {
+    searchResult = {
+      candidates: previousSources.map((source) => ({
+        title: source.title,
+        url: source.url,
+        snippet: "来自当前对话此前访问的网页。",
+        sourceType: "organic",
+      })),
+    };
+  } else {
+    const apiKey = runtimeValue(
+      provider === "zhipu" ? "ZHIPU_SEARCH_API_KEY" : "SERPAPI_API_KEY",
+    );
+    if (!apiKey) {
+      return {
+        status: "unavailable",
+        plan,
+        query: plan.query,
+        sources: [],
+        visitedPageCount: 0,
+        requestIssued: false,
+        candidateCount: 0,
+        extractionFailureCount: 0,
+        failures: [
+          {
+            stage: "search",
+            code:
+              provider === "zhipu"
+                ? "ZHIPU_SEARCH_NOT_CONFIGURED"
+                : "SERPAPI_NOT_CONFIGURED",
+            message: `尚未配置${providerLabel} Key。`,
+          },
+        ],
+        note: `尚未配置${providerLabel} Key，无法执行联网检索。`,
+      };
+    }
+    usageHooks.onSearchRequest?.();
+    searchResult =
+      provider === "zhipu"
+        ? await searchZhipu(plan.query, apiKey, signal)
+        : await searchSerpApi(
+            plan.query,
+            plan.searchLanguage ?? context.locale,
+            plan.countryCode ?? countryCodeFromRegion(context.region),
+            apiKey,
+            signal,
+          );
+  }
   const candidates = searchResult.candidates;
   if (!candidates.length) {
     const note = searchResult.failure?.message
       ? `搜索已执行，但未取得可读网页：${searchResult.failure.message}`
-      : "搜索已执行，但 SerpAPI 没有返回网页候选结果。";
+      : `搜索已执行，但${providerLabel}没有返回网页候选结果。`;
     return {
       status: "unavailable",
       plan,
@@ -159,27 +230,54 @@ export async function prepareWebSearch(
   let extractionFailureCount = 0;
   for (const candidate of candidates) {
     if (sources.length >= TARGET_READABLE_PAGES) break;
-    const extraction = await extractWebDocument(candidate.url, signal);
-    if (!extraction.ok) {
-      extractionFailureCount += 1;
+    let document = cachedDocument(usageHooks.contentCache, candidate.url);
+    if (!document) {
+      const extraction = await extractWebDocument(candidate.url, signal);
+      if (!extraction.ok) {
+        extractionFailureCount += 1;
+        failures.push({
+          stage: "extract",
+          code: extraction.code,
+          message: extraction.message,
+          url: candidate.url,
+        });
+        continue;
+      }
+      document = extraction.document;
+      usageHooks.contentCache?.put({
+        originalUrl: document.url,
+        finalUrl: document.finalUrl,
+        title: document.title || candidate.title,
+        ...(document.publishedAt ? { publishedAt: document.publishedAt } : {}),
+        ...(document.contentType ? { contentType: document.contentType } : {}),
+        text: document.text,
+        method: document.method,
+      });
+    }
+    let passages: string[];
+    try {
+      const reranked = await rerankWebDocument(
+        `${plan.query} ${context.question}`,
+        document.text,
+        signal,
+      );
+      passages = reranked.passages;
+      if (reranked.usage) usageHooks.onModelUsage?.(reranked.usage);
+    } catch (error) {
+      if (signal?.aborted) throw error;
       failures.push({
-        stage: "extract",
-        code: extraction.code,
-        message: extraction.message,
+        stage: "filter",
+        code: "QWEN_RERANK_FAILED",
+        message: safeErrorMessage(error, "千问网页精排失败。"),
         url: candidate.url,
       });
       continue;
     }
-    const document = extraction.document;
-    const passages = selectRelevantPassages(
-      document.text,
-      `${plan.query} ${context.question}`,
-    );
     if (!passages.length) {
       failures.push({
         stage: "filter",
-        code: "NO_RELEVANT_PASSAGES",
-        message: "网页正文已读取，但没有筛选出与问题相关的段落。",
+        code: "NO_RERANK_PASSAGES_ABOVE_THRESHOLD",
+        message: "网页正文已读取，但没有分片达到精排阈值。",
         url: candidate.url,
       });
       continue;
@@ -222,6 +320,78 @@ export async function prepareWebSearch(
           }`,
         }),
   };
+}
+
+async function searchZhipu(
+  query: string,
+  apiKey: string,
+  signal?: AbortSignal,
+): Promise<SearchCandidateResult> {
+  const timeoutSignal = AbortSignal.timeout(DEFAULT_TIMEOUT_MS);
+  const requestSignal = signal
+    ? AbortSignal.any([signal, timeoutSignal])
+    : timeoutSignal;
+  try {
+    const response = await fetch(ZHIPU_SEARCH_ENDPOINT, {
+      method: "POST",
+      headers: {
+        accept: "application/json",
+        authorization: `Bearer ${apiKey}`,
+        "content-type": "application/json",
+      },
+      body: JSON.stringify({
+        search_query: query.slice(0, 70),
+        search_engine: "search_std",
+        search_intent: false,
+        count: MAX_SEARCH_CANDIDATES,
+        search_recency_filter: "noLimit",
+        content_size: "high",
+      }),
+      signal: requestSignal,
+    });
+    const body = (await response.json().catch(() => null)) as
+      | ZhipuSearchResult
+      | null;
+    if (!response.ok) {
+      return {
+        candidates: [],
+        failure: {
+          stage: "search",
+          code: `ZHIPU_SEARCH_HTTP_${response.status}`,
+          message:
+            stringField(body?.message) ||
+            stringField(body?.error) ||
+            `智谱搜索请求失败（HTTP ${response.status}）。`,
+        },
+      };
+    }
+    if (!body || !Array.isArray(body.search_result)) {
+      return {
+        candidates: [],
+        failure: {
+          stage: "search",
+          code: "ZHIPU_SEARCH_INVALID_RESPONSE",
+          message: "智谱搜索返回了无法解析的响应。",
+        },
+      };
+    }
+    return {
+      candidates: collectZhipuCandidates(body.search_result).slice(
+        0,
+        MAX_SEARCH_CANDIDATES,
+      ),
+    };
+  } catch (error) {
+    if (signal?.aborted) throw error;
+    return {
+      candidates: [],
+      failure: {
+        stage: "search",
+        code: "ZHIPU_SEARCH_REQUEST_FAILED",
+        message: safeErrorMessage(error, "智谱搜索请求失败。"),
+      },
+    };
+  }
 }
 
 async function searchSerpApi(
@@ -366,64 +536,118 @@ function collectCandidates(body: SerpApiResult) {
   return candidates;
 }
 
-export function selectRelevantPassages(text: string, query: string) {
-  const paragraphs = text
-    .replace(/\r/g, "")
-    .split(/\n{2,}|\n(?=(?:[-*•]|\d+[.)、])\s+)/)
-    .map((paragraph) => paragraph.replace(/\s+/g, " ").trim())
-    .filter((paragraph) => paragraph.length >= 60)
-    .slice(0, 500);
-  if (!paragraphs.length) return [];
-
-  const terms = searchTerms(query);
-  const ranked = paragraphs
-    .map((paragraph, order) => {
-      const normalized = paragraph.toLocaleLowerCase();
-      const overlap = terms.reduce(
-        (score, term) => score + (normalized.includes(term) ? 1 : 0),
+function collectZhipuCandidates(results: Array<Record<string, unknown>>) {
+  const candidates: SearchCandidate[] = [];
+  const seen = new Set<string>();
+  for (const result of results) {
+    const url = publicHttpUrl(stringField(result.link));
+    const title = stringField(result.title);
+    if (!url || !title || seen.has(url)) continue;
+    seen.add(url);
+    candidates.push({
+      title: title.slice(0, 240),
+      url,
+      snippet: (stringField(result.content) ?? "搜索结果没有提供摘要。").slice(
         0,
-      );
-      const lengthScore = Math.min(paragraph.length, 800) / 800;
-      const earlyScore = 1 / (order + 4);
-      return {
-        paragraph,
-        order,
-        score: overlap * 3 + lengthScore + earlyScore,
-      };
-    })
-    .sort((left, right) => right.score - left.score || left.order - right.order);
-
-  const selected: string[] = [];
-  for (const item of ranked) {
-    if (
-      selected.some(
-        (existing) =>
-          existing.includes(item.paragraph.slice(0, 80)) ||
-          item.paragraph.includes(existing.slice(0, 80)),
-      )
-    ) {
-      continue;
-    }
-    selected.push(item.paragraph.slice(0, MAX_PASSAGE_CHARACTERS));
-    if (selected.length >= MAX_PASSAGES_PER_SOURCE) break;
+        800,
+      ),
+      ...(stringField(result.publish_date)
+        ? { publishedAt: stringField(result.publish_date)?.slice(0, 80) }
+        : {}),
+      sourceType: "organic",
+    });
   }
-  return selected;
+  return candidates;
 }
 
-function searchTerms(value: string) {
-  const normalized = value.toLocaleLowerCase();
-  const terms = new Set(
-    normalized
-      .match(/[a-z0-9][a-z0-9._-]{1,}|[\p{Script=Han}]{2,}/gu)
-      ?.map((term) => term.trim())
-      .filter(Boolean) ?? [],
+function selectedSearchProvider(): WebSearchProvider {
+  return runtimeValue("FRAMENOTE_WEB_SEARCH_PROVIDER") === "zhipu"
+    ? "zhipu"
+    : "serpapi";
+}
+
+function cachedDocument(
+  cache: WebContentCacheRepository | undefined,
+  url: string,
+): ExtractedWebDocument | null {
+  const cached = cache?.get(url);
+  if (!cached) return null;
+  return {
+    url: cached.originalUrl,
+    finalUrl: cached.finalUrl,
+    ...(cached.title ? { title: cached.title } : {}),
+    ...(cached.publishedAt ? { publishedAt: cached.publishedAt } : {}),
+    ...(cached.contentType ? { contentType: cached.contentType } : {}),
+    text: cached.text,
+    method: cached.method,
+  };
+}
+
+function referencedPreviousSources(
+  question: string,
+  sources: ConversationWebSource[],
+) {
+  const unique = sources.filter(
+    (source, index) =>
+      sources.findIndex((candidate) => candidate.url === source.url) === index,
   );
-  for (const run of normalized.match(/[\p{Script=Han}]{3,}/gu) ?? []) {
-    for (let index = 0; index < run.length - 1 && terms.size < 80; index += 1) {
-      terms.add(run.slice(index, index + 2));
-    }
+  const normalizedQuestion = question.toLocaleLowerCase().replace(/\s+/g, "");
+  const explicitUrls = (question.match(/https?:\/\/[^\s<>"']+/gi) ?? [])
+    .map((url) => publicHttpUrl(url.replace(/[),，。；;]+$/, "")))
+    .filter((url): url is string => Boolean(url));
+  const urlMatches = explicitUrls.map((url, index) => {
+    const existing = unique.find((source) => source.url === url);
+    return existing ?? { index: index + 1, title: url, url };
+  });
+  if (urlMatches.length) return urlMatches;
+  if (!unique.length) return [];
+
+  const ordinalMatch = normalizedQuestion.match(
+    /第?(1[0-2]|[1-9]|一|二|三|四|五|六|七|八|九|十|十一|十二)(?:个|条|篇)?(?:网页|来源|链接|结果)/,
+  );
+  if (ordinalMatch) {
+    const index = ordinalNumber(ordinalMatch[1]);
+    const matched = unique.find((source) => source.index === index);
+    return matched ? [matched] : [];
   }
-  return [...terms].slice(0, 80);
+
+  const titleMatches = unique.filter((source) => {
+    const title = source.title.toLocaleLowerCase().replace(/\s+/g, "");
+    return title.length >= 4 && normalizedQuestion.includes(title);
+  });
+  if (titleMatches.length) return titleMatches;
+
+  return /(?:之前|此前|刚才|上次|前面).{0,12}(?:网页|来源|链接|搜索结果|资料)|(?:这个|这些|该)(?:网页|来源|链接)/.test(normalizedQuestion)
+    ? unique
+    : [];
+}
+
+export function referencesPreviousWebSource(
+  question: string,
+  sources: ConversationWebSource[] = [],
+) {
+  return referencedPreviousSources(question, sources).length > 0;
+}
+
+function ordinalNumber(value: string) {
+  const numeric = Number(value);
+  if (Number.isSafeInteger(numeric)) return numeric;
+  return (
+    {
+      一: 1,
+      二: 2,
+      三: 3,
+      四: 4,
+      五: 5,
+      六: 6,
+      七: 7,
+      八: 8,
+      九: 9,
+      十: 10,
+      十一: 11,
+      十二: 12,
+    } as Record<string, number>
+  )[value];
 }
 
 function normalizeGoogleLanguage(value: string) {

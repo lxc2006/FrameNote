@@ -206,7 +206,7 @@ class JobManager:
         direct_summary_max_seconds: int,
         source_url: str | None = None,
     ) -> JobRecord:
-        if source_kind not in {"upload", "url"}:
+        if source_kind not in {"upload", "douyin", "url"}:
             raise ValueError("unsupported media source kind")
         if not source_file.is_file() or source_file.is_symlink():
             raise ValueError("uploaded media file is unavailable")
@@ -677,7 +677,7 @@ class JobManager:
                 valid_source = (
                     job.source_kind == "bilibili" and is_valid_bvid(job.bvid)
                 ) or (
-                    job.source_kind in {"upload", "url"} and not job.bvid
+                    job.source_kind in {"upload", "douyin", "url"} and not job.bvid
                 )
                 if job.job_id != entry.name or not valid_source:
                     raise ValueError("invalid persisted job")

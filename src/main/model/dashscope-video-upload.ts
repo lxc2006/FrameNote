@@ -67,7 +67,7 @@ async function readTrustedArtifact(
   signal?: AbortSignal,
 ): Promise<TrustedArtifact> {
   if (!JOB_ID_PATTERN.test(jobId)) {
-    throw new QwenInputError("本地 B 站视频任务标识无效。");
+    throw new QwenInputError("本地视频任务标识无效。");
   }
   const routePrefix =
     expectedSource.kind === "bilibili"
@@ -80,7 +80,7 @@ async function readTrustedArtifact(
   const body = await response.json().catch(() => null);
   if (!response.ok) {
     throw new QwenResponseError(
-      mediaServiceMessage(body) ?? "无法读取本地 B 站分析视频。",
+      mediaServiceMessage(body) ?? "无法读取本地分析视频。",
     );
   }
   if (!body || typeof body !== "object" || Array.isArray(body)) {

@@ -54,6 +54,7 @@ hiddenimports = sorted(
             "media_service.bilibili_retry",
             "media_service.bilibili_preview",
             "media_service.bilibili_preview_proxy",
+            "media_service.douyin_preview",
             "media_service.service.config",
             "media_service.service.job_manager",
             "media_service.service.models",

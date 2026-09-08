@@ -37,8 +37,10 @@ import {
 } from "../model/video-recall";
 import {
   prepareWebSearch,
+  referencesPreviousWebSource,
   type WebSearchEvidence,
 } from "./research/web-search";
+import type { WebContentCacheRepository } from "../database/web-content-cache-repository";
 
 export interface AskVideoServiceOptions {
   signal: AbortSignal;
@@ -47,6 +49,7 @@ export interface AskVideoServiceOptions {
   region?: string;
   timeZone?: string;
   onEvent?: (event: AskVideoStreamEvent) => void;
+  webContentCache?: WebContentCacheRepository;
 }
 
 export async function analyzeVideoService(
@@ -101,9 +104,20 @@ export async function askVideoService(
   const archiveHistory = storedHistory.length
     ? storedHistory
     : payload.history ?? [];
+  const previousWebSources = conversation?.messages
+    .slice()
+    .reverse()
+    .flatMap((message) => message.webSources ?? [])
+    .filter(
+      (source, index, sources) =>
+        sources.findIndex((candidate) => candidate.url === source.url) === index,
+    )
+    .slice(0, 12);
   const transcript = conversation?.transcript ?? payload.context?.transcript;
   const mustRecall = requiresMandatoryRecall(payload.question);
-  const mustSearch = requiresMandatoryWebSearch(payload.question);
+  const mustSearch =
+    requiresMandatoryWebSearch(payload.question) ||
+    referencesPreviousWebSource(payload.question, previousWebSources);
 
   send({
     type: "phase",
@@ -212,6 +226,9 @@ export async function askVideoService(
           routeReason: readiness.reason,
           missingFacts: readiness.missingFacts,
           forceSearch: mustSearch,
+          ...(previousWebSources?.length
+            ? { previousSources: previousWebSources }
+            : {}),
         },
         options.signal,
         {
@@ -219,6 +236,7 @@ export async function askVideoService(
           onSearchRequest: () => {
             searchCount += 1;
           },
+          contentCache: options.webContentCache,
         },
       );
       readiness =

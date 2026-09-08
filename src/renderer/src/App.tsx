@@ -1,4 +1,4 @@
-import VideoWorkbench from "./components/VideoWorkbench";
+import VideoWorkbench from "./components/video-workbench/VideoWorkbench";
 
 export default function App() {
   return <VideoWorkbench />;

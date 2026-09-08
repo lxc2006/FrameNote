@@ -21,6 +21,7 @@ import {
 } from "../../shared/ipc-contract";
 import type { DesktopDatabase } from "../database/database";
 import type { MediaSidecarManager } from "../media/media-sidecar";
+import type { DouyinCookieSession } from "../media/douyin-cookie-session";
 import type { CredentialStore } from "../security/credential-store";
 import type { ModelCredentialUpdate } from "../../shared/credential-types";
 import {
@@ -142,7 +143,11 @@ export function registerDesktopIpc(
   conversations: ConversationService,
   mediaSidecar: MediaSidecarManager,
   credentialStore: CredentialStore,
+  douyinCookieSession: DouyinCookieSession,
 ) {
+  process.env.FRAMENOTE_WEB_SEARCH_PROVIDER =
+    database.settings.getUserPreferences()?.webSearchProvider ?? "serpapi";
+
   ipcMain.handle(DESKTOP_CHANNELS.getRuntimeInfo, () => ({
     appVersion: app.getVersion(),
     isPackaged: app.isPackaged,
@@ -188,6 +193,22 @@ export function registerDesktopIpc(
     }
   });
 
+  ipcMain.handle(DESKTOP_CHANNELS.mediaPrepareDouyinSession, async () => {
+    try {
+      await douyinCookieSession.prepare();
+      return success(undefined);
+    } catch (error) {
+      return failure({
+        code: "DOUYIN_COOKIE_SESSION_FAILED",
+        message:
+          error instanceof Error
+            ? error.message
+            : "无法建立抖音匿名会话。",
+        retryable: true,
+      });
+    }
+  });
+
   ipcMain.handle(
     DESKTOP_CHANNELS.modelAnalyze,
     (event, requestId: string, value: unknown) =>
@@ -216,6 +237,7 @@ export function registerDesktopIpc(
             timeZone:
               Intl.DateTimeFormat().resolvedOptions().timeZone ||
               "Asia/Shanghai",
+            webContentCache: database.webContentCache,
             onEvent: (modelEvent) => {
               if (event.sender.isDestroyed()) return;
               const message: DesktopModelEvent = {
@@ -317,7 +339,11 @@ export function registerDesktopIpc(
   ipcMain.handle(
     DESKTOP_CHANNELS.settingsSetUserPreferences,
     (_event, preferences: UserPreferences) =>
-    runSettingsRequest(() => database.settings.setUserPreferences(preferences)),
+    runSettingsRequest(() => {
+      const saved = database.settings.setUserPreferences(preferences);
+      process.env.FRAMENOTE_WEB_SEARCH_PROVIDER = saved.webSearchProvider;
+      return saved;
+    }),
   );
   ipcMain.handle(DESKTOP_CHANNELS.credentialsGetStatus, () =>
     runSettingsRequest(() => credentialStore.getStatus()),

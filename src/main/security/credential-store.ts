@@ -12,6 +12,7 @@ const ENVIRONMENT_KEYS: Record<CredentialName, string> = {
   dashscopeApiKey: "DASHSCOPE_API_KEY",
   deepseekApiKey: "DEEPSEEK_API_KEY",
   serpApiKey: "SERPAPI_API_KEY",
+  zhipuSearchApiKey: "ZHIPU_SEARCH_API_KEY",
 };
 
 interface CredentialFile {
@@ -49,6 +50,7 @@ export class CredentialStore {
       dashscopeConfigured: Boolean(process.env.DASHSCOPE_API_KEY?.trim()),
       deepseekConfigured: Boolean(process.env.DEEPSEEK_API_KEY?.trim()),
       serpApiConfigured: Boolean(process.env.SERPAPI_API_KEY?.trim()),
+      zhipuSearchConfigured: Boolean(process.env.ZHIPU_SEARCH_API_KEY?.trim()),
     };
   }
 

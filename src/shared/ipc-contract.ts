@@ -24,7 +24,9 @@ export const DESKTOP_CHANNELS = {
   getRuntimeInfo: "desktop:get-runtime-info",
   openExternal: "desktop:open-external",
   clipboardWriteText: "desktop:clipboard-write-text",
+  clipboardCandidate: "desktop:clipboard-candidate",
   mediaGetConnection: "desktop:media-get-connection",
+  mediaPrepareDouyinSession: "desktop:media-prepare-douyin-session",
   videoOpenLocal: "desktop:video-open-local",
   videoReleaseLocal: "desktop:video-release-local",
   videoDownload: "desktop:video-download",
@@ -60,6 +62,11 @@ export interface DesktopMediaConnection {
   authorizationToken: string;
 }
 
+export interface DesktopClipboardCandidate {
+  kind: "bilibili" | "douyin" | "remote";
+  value: string;
+}
+
 export interface DesktopIpcError {
   code: string;
   message: string;
@@ -86,9 +93,16 @@ export interface FrameNoteDesktopApi {
   openExternal(url: string): Promise<void>;
   clipboard: {
     writeText(text: string): Promise<DesktopIpcResult<void>>;
+    subscribeCandidate(
+      listener: (candidate: DesktopClipboardCandidate) => void,
+    ): void;
+    unsubscribeCandidate(
+      listener: (candidate: DesktopClipboardCandidate) => void,
+    ): void;
   };
   media: {
     getConnection(): Promise<DesktopIpcResult<DesktopMediaConnection>>;
+    prepareDouyinSession(): Promise<DesktopIpcResult<void>>;
   };
   videoFiles: {
     pathForFile(file: File): string;

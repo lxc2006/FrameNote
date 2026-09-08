@@ -9,6 +9,7 @@ export interface LocalVideoFile {
 export type VideoDownloadInput =
   | { kind: "local"; path: string }
   | { kind: "bilibili"; bvid: string; title: string }
+  | { kind: "douyin"; sourceUrl: string; title: string }
   | { kind: "remote"; url: string; title: string };
 
 export interface VideoDownloadResult {

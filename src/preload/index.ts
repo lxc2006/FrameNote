@@ -1,10 +1,21 @@
 import { contextBridge, ipcRenderer, webUtils } from "electron";
 import {
   DESKTOP_CHANNELS,
+  type DesktopClipboardCandidate,
   type DesktopModelEvent,
   type DesktopTranscriptionProgress,
   type FrameNoteDesktopApi,
 } from "../shared/ipc-contract";
+
+const clipboardCandidateSubscriptions = new Set<
+  (candidate: DesktopClipboardCandidate) => void
+>();
+ipcRenderer.on(
+  DESKTOP_CHANNELS.clipboardCandidate,
+  (_event, candidate: DesktopClipboardCandidate) => {
+    for (const listener of clipboardCandidateSubscriptions) listener(candidate);
+  },
+);
 
 const modelSubscriptions = new Map<
   string,
@@ -98,6 +109,8 @@ const credentialApi: FrameNoteDesktopApi["credentials"] = Object.freeze({
 
 const mediaApi: FrameNoteDesktopApi["media"] = Object.freeze({
   getConnection: () => ipcRenderer.invoke(DESKTOP_CHANNELS.mediaGetConnection),
+  prepareDouyinSession: () =>
+    ipcRenderer.invoke(DESKTOP_CHANNELS.mediaPrepareDouyinSession),
 });
 
 const transcriptionApi: FrameNoteDesktopApi["transcription"] = Object.freeze({
@@ -124,6 +137,12 @@ const desktopApi: FrameNoteDesktopApi = Object.freeze({
   clipboard: Object.freeze({
     writeText: (text: string) =>
       ipcRenderer.invoke(DESKTOP_CHANNELS.clipboardWriteText, text),
+    subscribeCandidate: (listener: (candidate: DesktopClipboardCandidate) => void) => {
+      clipboardCandidateSubscriptions.add(listener);
+    },
+    unsubscribeCandidate: (listener: (candidate: DesktopClipboardCandidate) => void) => {
+      clipboardCandidateSubscriptions.delete(listener);
+    },
   }),
   media: mediaApi,
   videoFiles: Object.freeze({

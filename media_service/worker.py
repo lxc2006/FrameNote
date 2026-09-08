@@ -599,7 +599,7 @@ def run_uploaded_media(args: argparse.Namespace) -> None:
         args.max_bytes,
         args.direct_summary_max_seconds,
     )
-    if args.source_kind not in {"upload", "url"}:
+    if args.source_kind not in {"upload", "douyin", "url"}:
         raise WorkerFailure("INVALID_SOURCE", "媒体分析来源无效。", False)
     state_root = Path(args.state_root)
     job_dir = resolve_job_dir(state_root, args.job_id)
@@ -842,7 +842,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--source-kind",
         default="bilibili",
-        choices=("upload", "bilibili", "url"),
+        choices=("upload", "bilibili", "douyin", "url"),
     )
     parser.add_argument("--source-name", default="video")
     parser.add_argument("--source-url")

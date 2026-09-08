@@ -190,6 +190,11 @@ export class MediaSidecarManager {
         this.options.userDataPath,
         "media-sidecar",
       ),
+      FRAMENOTE_DOUYIN_COOKIE_FILE: join(
+        this.options.userDataPath,
+        "media-sidecar",
+        "douyin-cookies.txt",
+      ),
     };
     const child = spawn(this.launch.command, this.launch.args, {
       cwd: this.launch.cwd,

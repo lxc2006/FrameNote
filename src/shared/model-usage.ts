@@ -7,6 +7,7 @@ export type ModelUsageOperation =
   | "recall_plan"
   | "recall_rerank"
   | "web_search_plan"
+  | "web_rerank"
   | "chat_answer";
 
 export interface ModelTokenDetails {
@@ -170,6 +171,7 @@ function parseModelCallUsage(value: unknown): ModelCallUsage | null {
     record?.operation === "recall_plan" ||
     record?.operation === "recall_rerank" ||
     record?.operation === "web_search_plan" ||
+    record?.operation === "web_rerank" ||
     record?.operation === "chat_answer"
       ? record.operation
       : null;

@@ -37,6 +37,11 @@ from .bilibili_preview_proxy import (
     BilibiliPreviewSessionStore,
     open_bilibili_preview_stream,
 )
+from .douyin_preview import (
+    DouyinPreviewError,
+    is_douyin_url,
+    resolve_douyin_preview,
+)
 from .web_extract import extract_web_document
 from .service.config import Settings
 from .service.job_manager import JobManager, JobRecord, QueueCapacityError
@@ -49,6 +54,8 @@ from .service.models import (
     BilibiliPreviewRequest,
     BilibiliPreviewResponse,
     CreateJobRequest,
+    DouyinPreviewRequest,
+    DouyinPreviewResponse,
     ErrorResponse,
     JobListResponse,
     JobResponse,
@@ -142,7 +149,7 @@ async def lifespan(app: FastAPI):
 
 
 app = FastAPI(
-    title="FrameNote Bilibili Media Service",
+    title="FrameNote Media Service",
     version="1.0.0",
     docs_url=None,
     redoc_url=None,
@@ -559,6 +566,58 @@ async def stream_bilibili_preview_audio(
 
 
 @app.post(
+    "/v1/douyin/preview",
+    response_model=DouyinPreviewResponse,
+    response_model_exclude_none=True,
+    dependencies=[Depends(require_api_access)],
+)
+async def resolve_douyin_video_preview(
+    body: DouyinPreviewRequest,
+    request: Request,
+    preview_store: BilibiliPreviewSessionStore = Depends(preview_store_from_request),
+) -> DouyinPreviewResponse:
+    try:
+        preview = await resolve_douyin_preview(body.sourceUrl)
+    except DouyinPreviewError as exc:
+        raise api_error(
+            status.HTTP_502_BAD_GATEWAY if exc.retryable else status.HTTP_403_FORBIDDEN,
+            exc.code,
+            exc.message,
+        ) from exc
+    preview_session = preview_store.create(preview)  # type: ignore[arg-type]
+    preview_base_url = (
+        f"{get_public_base_url(request)}/v1/douyin/preview/"
+        f"{preview_session.session_id}"
+    )
+    return DouyinPreviewResponse(
+        playbackUrl=f"{preview_base_url}/video",
+        sourceUrl=preview.source_url,
+        videoId=preview.video_id,
+        title=preview.title,
+        description=preview.description,
+        durationSeconds=preview.duration_seconds,
+        sizeBytes=preview.size_bytes,
+        width=preview.width,
+        height=preview.height,
+        filename=preview.filename,
+    )
+
+
+@app.get("/v1/douyin/preview/{session_id}/video")
+async def stream_douyin_preview_video(
+    request: Request,
+    session_id: str,
+    preview_store: BilibiliPreviewSessionStore = Depends(preview_store_from_request),
+) -> StreamingResponse:
+    return await _stream_bilibili_preview_track(
+        request,
+        session_id,
+        "video",
+        preview_store,
+    )
+
+
+@app.post(
     "/v1/bilibili/jobs",
     response_model=JobResponse,
     response_model_exclude_none=True,
@@ -609,11 +668,11 @@ async def create_media_job(
     directSummaryMaxSeconds: int = Form(default=0, ge=0, le=900),
     sourceUrl: str | None = Form(default=None),
 ) -> JobResponse:
-    if sourceKind not in {"upload", "url"}:
+    if sourceKind not in {"upload", "douyin", "url"}:
         raise api_error(
             status.HTTP_422_UNPROCESSABLE_ENTITY,
             "INVALID_SOURCE",
-            "媒体来源只支持本地上传或 HTTPS 视频直链。",
+            "媒体来源只支持本地上传、抖音分享链接或 HTTPS 视频直链。",
         )
     if sourceKind == "url" and (
         not sourceUrl
@@ -624,6 +683,12 @@ async def create_media_job(
             status.HTTP_422_UNPROCESSABLE_ENTITY,
             "INVALID_SOURCE_URL",
             "HTTPS 视频直链无效。",
+        )
+    if sourceKind == "douyin" and (not sourceUrl or not is_douyin_url(sourceUrl)):
+        raise api_error(
+            status.HTTP_422_UNPROCESSABLE_ENTITY,
+            "INVALID_DOUYIN_URL",
+            "抖音分享链接无效。",
         )
     raw_filename = Path(file.filename or "video.mp4").name
     if not raw_filename or len(raw_filename) > 240:

@@ -1,4 +1,4 @@
-export type SourceKind = "upload" | "bilibili" | "url";
+export type SourceKind = "upload" | "bilibili" | "douyin" | "url";
 export type TranscriptLanguage = "zh" | "ja" | "en";
 
 export interface VideoSourceDescriptor {
@@ -10,7 +10,7 @@ export interface VideoSourceDescriptor {
   sourceUrl?: string;
   /** 用户选择的原视频绝对路径，仅用于桌面本地恢复，不发送给模型。 */
   localPath?: string;
-  /** B站视频页公开简介。 */
+  /** 平台视频页公开简介。 */
   description?: string;
 }
 

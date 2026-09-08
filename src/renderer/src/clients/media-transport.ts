@@ -20,7 +20,11 @@ async function getDesktopConnection() {
 
 export async function mediaApiFetch(path: string, init?: RequestInit) {
   const connection = await getDesktopConnection();
-  if (!path.startsWith("/v1/media/") && !path.startsWith("/v1/bilibili/")) {
+  if (
+    !path.startsWith("/v1/media/") &&
+    !path.startsWith("/v1/bilibili/") &&
+    !path.startsWith("/v1/douyin/")
+  ) {
     throw new TypeError(`Unsupported media sidecar path: ${path}`);
   }
 

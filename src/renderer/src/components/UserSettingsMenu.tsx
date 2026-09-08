@@ -19,10 +19,7 @@ import {
   type ThemePreference,
   type UserPreferences,
 } from "@/shared/preference-types";
-import {
-  desktopBridge,
-  unwrapDesktopResult,
-} from "../clients/desktop-bridge";
+import { desktopBridge, unwrapDesktopResult } from "../clients/desktop-bridge";
 import type {
   ModelCredentialStatus,
   ModelCredentialUpdate,
@@ -46,8 +43,7 @@ const FONT_STACKS: Record<FontPreference, string> = {
   songti: 'SimSun, "宋体", "Songti SC", STSong, Georgia, serif',
   humanist:
     '"Trebuchet MS", "Segoe UI", "Microsoft YaHei", "PingFang SC", sans-serif',
-  serif:
-    'Georgia, "Times New Roman", SimSun, "宋体", "Songti SC", serif',
+  serif: 'Georgia, "Times New Roman", SimSun, "宋体", "Songti SC", serif',
   consolas:
     'Consolas, "Cascadia Mono", "Microsoft YaHei", "PingFang SC", monospace',
 };
@@ -207,6 +203,7 @@ export default function UserSettingsMenu() {
     dashscopeApiKey: "",
     deepseekApiKey: "",
     serpApiKey: "",
+    zhipuSearchApiKey: "",
   });
   const [credentialBusy, setCredentialBusy] = useState(false);
   const [credentialMessage, setCredentialMessage] = useState("");
@@ -332,9 +329,11 @@ export default function UserSettingsMenu() {
   const updateCredentials = async (update?: ModelCredentialUpdate) => {
     const credentials = desktopBridge()?.credentials;
     if (!credentials || credentialBusy) return;
-    const changes = update ?? Object.fromEntries(
-      Object.entries(credentialValues).filter(([, value]) => value.trim()),
-    ) as ModelCredentialUpdate;
+    const changes =
+      update ??
+      (Object.fromEntries(
+        Object.entries(credentialValues).filter(([, value]) => value.trim()),
+      ) as ModelCredentialUpdate);
     if (Object.keys(changes).length === 0) {
       setCredentialMessage("请输入至少一个需要保存的 API Key。");
       return;
@@ -348,6 +347,7 @@ export default function UserSettingsMenu() {
         dashscopeApiKey: "",
         deepseekApiKey: "",
         serpApiKey: "",
+        zhipuSearchApiKey: "",
       });
       setCredentialMessage("API Key 已使用 Windows 加密保存。");
     } catch (error) {
@@ -358,6 +358,21 @@ export default function UserSettingsMenu() {
       setCredentialBusy(false);
     }
   };
+
+  const searchCredential =
+    preferences.webSearchProvider === "zhipu"
+      ? {
+          key: "zhipuSearchApiKey" as const,
+          label: "智谱搜索 API",
+          configured: credentialStatus?.zhipuSearchConfigured,
+          consoleUrl: "https://open.bigmodel.cn/apikey/platform",
+        }
+      : {
+          key: "serpApiKey" as const,
+          label: "SerpAPI",
+          configured: credentialStatus?.serpApiConfigured,
+          consoleUrl: "https://serpapi.com/manage-api-key",
+        };
 
   return (
     <div className="user-settings" ref={containerRef}>
@@ -408,10 +423,7 @@ export default function UserSettingsMenu() {
               ref={firstControlRef}
               value={preferences.theme}
               onChange={(event) =>
-                updatePreference(
-                  "theme",
-                  event.target.value as ThemePreference,
-                )
+                updatePreference("theme", event.target.value as ThemePreference)
               }
             >
               <option value="light">浅色</option>
@@ -434,14 +446,35 @@ export default function UserSettingsMenu() {
             font={preferences.textFont}
             fontSize={preferences.textFontSize}
             onFontChange={(value) => updatePreference("textFont", value)}
-            onFontSizeChange={(value) => updatePreference("textFontSize", value)}
+            onFontSizeChange={(value) =>
+              updatePreference("textFontSize", value)
+            }
           />
 
           <fieldset className="settings-group">
+            <legend>剪贴板</legend>
+            <label className="analysis-setting-row">
+              <span>
+                <strong>自动识别剪贴板有效连接</strong>
+                <small>应用重新获得焦点时，自动填入识别到的视频链接</small>
+              </span>
+              <input
+                type="checkbox"
+                checked={preferences.autoDetectClipboardLinks}
+                onChange={(event) =>
+                  updatePreference(
+                    "autoDetectClipboardLinks",
+                    event.target.checked,
+                  )
+                }
+              />
+              <i aria-hidden="true" />
+            </label>
+          </fieldset>
+
+          <fieldset className="settings-group">
             <legend>视频分析</legend>
-            <p>
-              视频不超过此时长时，优先让 Qwen 直接读取视频
-            </p>
+            <p>视频不超过此时长时，优先让 Qwen 直接读取视频</p>
             <label className="settings-field">
               <span>直接总结上限</span>
               <span className="settings-number-input">
@@ -497,12 +530,6 @@ export default function UserSettingsMenu() {
                     credentialStatus?.deepseekConfigured,
                     "https://platform.deepseek.com/api_keys",
                   ],
-                  [
-                    "serpApiKey",
-                    "SerpAPI",
-                    credentialStatus?.serpApiConfigured,
-                    "https://serpapi.com/manage-api-key",
-                  ],
                 ] as const
               ).map(([key, label, configured, consoleUrl]) => (
                 <div className="settings-credential-row" key={key}>
@@ -534,7 +561,9 @@ export default function UserSettingsMenu() {
                       aria-label={`${label} API Key`}
                       autoComplete="off"
                       value={credentialValues[key]}
-                      placeholder={configured ? "已配置；输入新值可替换" : "尚未配置"}
+                      placeholder={
+                        configured ? "已配置；输入新值可替换" : "尚未配置"
+                      }
                       onChange={(event) =>
                         setCredentialValues((current) => ({
                           ...current,
@@ -554,6 +583,95 @@ export default function UserSettingsMenu() {
                   ) : null}
                 </div>
               ))}
+              <div className="settings-credential-row">
+                <div className="settings-credential-field">
+                  <div className="settings-credential-label">
+                    <div
+                      className="search-provider-switch"
+                      role="group"
+                      aria-label="联网搜索 API"
+                    >
+                      <button
+                        type="button"
+                        className={
+                          preferences.webSearchProvider === "serpapi"
+                            ? "active"
+                            : ""
+                        }
+                        aria-pressed={
+                          preferences.webSearchProvider === "serpapi"
+                        }
+                        onClick={() =>
+                          updatePreference("webSearchProvider", "serpapi")
+                        }
+                      >
+                        SerpAPI
+                      </button>
+                      <button
+                        type="button"
+                        className={
+                          preferences.webSearchProvider === "zhipu"
+                            ? "active"
+                            : ""
+                        }
+                        aria-pressed={preferences.webSearchProvider === "zhipu"}
+                        onClick={() =>
+                          updatePreference("webSearchProvider", "zhipu")
+                        }
+                      >
+                        智谱搜索 API
+                      </button>
+                    </div>
+                    <button
+                      type="button"
+                      className="settings-api-link"
+                      aria-label={`打开 ${searchCredential.label} 工作台`}
+                      title="打开 API Key 工作台"
+                      onClick={() => {
+                        void desktopBridge()
+                          ?.openExternal(searchCredential.consoleUrl)
+                          .catch((error: unknown) => {
+                            setCredentialMessage(
+                              error instanceof Error
+                                ? error.message
+                                : "无法打开 API Key 工作台。",
+                            );
+                          });
+                      }}
+                    >
+                      获取↗
+                    </button>
+                  </div>
+                  <input
+                    type="password"
+                    aria-label={`${searchCredential.label} Key`}
+                    autoComplete="off"
+                    value={credentialValues[searchCredential.key]}
+                    placeholder={
+                      searchCredential.configured
+                        ? "已配置；输入新值可替换"
+                        : "尚未配置"
+                    }
+                    onChange={(event) =>
+                      setCredentialValues((current) => ({
+                        ...current,
+                        [searchCredential.key]: event.target.value,
+                      }))
+                    }
+                  />
+                </div>
+                {searchCredential.configured ? (
+                  <button
+                    type="button"
+                    disabled={credentialBusy}
+                    onClick={() =>
+                      void updateCredentials({ [searchCredential.key]: null })
+                    }
+                  >
+                    清除
+                  </button>
+                ) : null}
+              </div>
               <div className="settings-credential-actions">
                 <button
                   type="button"
@@ -564,7 +682,10 @@ export default function UserSettingsMenu() {
                 </button>
               </div>
               {credentialMessage ? (
-                <span className="settings-credential-message" aria-live="polite">
+                <span
+                  className="settings-credential-message"
+                  aria-live="polite"
+                >
                   {credentialMessage}
                 </span>
               ) : null}

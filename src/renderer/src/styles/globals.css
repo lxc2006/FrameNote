@@ -211,6 +211,142 @@ textarea:focus-visible {
   transform: translateX(10px);
 }
 
+.usage-guide {
+  position: relative;
+}
+
+.usage-guide-button {
+  display: grid;
+  width: 40px;
+  height: 40px;
+  padding: 0;
+  place-items: center;
+  border: 1px solid transparent;
+  border-radius: 11px;
+  background: transparent;
+  color: var(--muted);
+  cursor: pointer;
+}
+
+.usage-guide-button:hover,
+.usage-guide-button[aria-expanded="true"] {
+  border-color: var(--line-strong);
+  background: var(--paper);
+  color: var(--ink-strong);
+}
+
+.usage-guide-button svg {
+  width: 21px;
+  height: 21px;
+}
+
+.usage-guide-popover {
+  position: absolute;
+  z-index: 65;
+  top: calc(100% + 10px);
+  right: 0;
+  width: min(760px, calc(100vw - 32px));
+  max-height: min(760px, calc(100vh - 92px));
+  padding: 20px;
+  overflow-y: auto;
+  border: 1px solid var(--line-strong);
+  border-radius: 16px;
+  background: var(--paper);
+  box-shadow: 0 22px 64px rgba(12, 19, 26, 0.22);
+}
+
+.usage-guide-header {
+  position: sticky;
+  z-index: 1;
+  top: -20px;
+  display: flex;
+  margin: -20px -20px 8px;
+  padding: 17px 20px 13px;
+  align-items: center;
+  justify-content: space-between;
+  border-bottom: 1px solid var(--line);
+  background: var(--paper);
+}
+
+.usage-guide-header span {
+  color: var(--accent-deep);
+  font-size: max(11px, calc(var(--ui-font-size) - 5px));
+}
+
+.usage-guide-header h2 {
+  margin: 2px 0 0;
+  color: var(--ink-strong);
+  font-size: max(18px, calc(var(--ui-font-size) + 2px));
+}
+
+.usage-guide-header button {
+  min-height: 32px;
+  padding: 0 11px;
+  border: 1px solid var(--line);
+  border-radius: 9px;
+  background: transparent;
+  color: var(--muted);
+  cursor: pointer;
+}
+
+.usage-guide-markdown {
+  color: var(--muted);
+  font-size: max(13px, calc(var(--ui-font-size) - 2px));
+  line-height: 1.75;
+}
+
+.usage-guide-markdown h1,
+.usage-guide-markdown h2 {
+  color: var(--ink-strong);
+}
+
+.usage-guide-markdown h1 {
+  margin: 18px 0 8px;
+  font-size: max(21px, calc(var(--ui-font-size) + 5px));
+}
+
+.usage-guide-markdown h2 {
+  margin: 24px 0 8px;
+  font-size: max(16px, var(--ui-font-size));
+}
+
+.usage-guide-markdown p,
+.usage-guide-markdown ul,
+.usage-guide-markdown ol {
+  margin: 8px 0;
+}
+
+.usage-guide-markdown table {
+  width: 100%;
+  margin: 10px 0;
+  border-collapse: collapse;
+  font-size: max(12px, calc(var(--ui-font-size) - 3px));
+}
+
+.usage-guide-markdown th,
+.usage-guide-markdown td {
+  padding: 8px 10px;
+  border: 1px solid var(--line);
+  text-align: left;
+  vertical-align: top;
+}
+
+.usage-guide-markdown th {
+  background: var(--paper-soft);
+  color: var(--ink-strong);
+}
+
+.usage-guide-markdown blockquote {
+  margin: 12px 0;
+  padding: 8px 13px;
+  border-left: 3px solid var(--accent);
+  background: var(--paper-soft);
+}
+
+.usage-guide-markdown a {
+  color: var(--accent-deep);
+}
+
 .user-settings,
 .history-menu {
   position: relative;
@@ -573,7 +709,7 @@ html[data-resizing] .setup-column {
   padding: 4px;
   border-radius: 15px;
   background: #f1f3f5;
-  grid-template-columns: 1fr 1fr;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
   gap: 4px;
 }
 
@@ -603,6 +739,13 @@ html[data-resizing] .setup-column {
   color: var(--accent);
   font-size: 13px;
   font-weight: 820;
+}
+
+.mode-tabs .platform-tab-icon {
+  width: 20px;
+  height: 20px;
+  flex: 0 0 20px;
+  color: var(--accent);
 }
 
 .source-form {
@@ -2408,15 +2551,31 @@ html[data-video-fullscreen="true"] .setup-column {
   border-radius: 12px;
 }
 
+.transcript-list.virtualized {
+  position: relative;
+}
+
+.transcript-virtual-space {
+  position: relative;
+  width: 100%;
+}
+
+.transcript-virtual-row {
+  position: absolute;
+  top: 0;
+  left: 0;
+  width: 100%;
+}
+
+.transcript-virtual-row.has-divider {
+  border-top: 1px solid var(--line);
+}
+
 .transcript-row {
   display: grid;
   padding: 11px 13px;
   grid-template-columns: 58px 1fr;
   gap: 10px;
-}
-
-.transcript-row + .transcript-row {
-  border-top: 1px solid var(--line);
 }
 
 .transcript-row button {
@@ -2473,6 +2632,21 @@ html[data-video-fullscreen="true"] .setup-column {
   display: flex;
   flex-direction: column;
   gap: 34px;
+}
+
+.message-list.virtualized {
+  position: relative;
+  display: block;
+  width: 100%;
+  gap: 0;
+}
+
+.message-virtual-row {
+  position: absolute;
+  top: 0;
+  left: 0;
+  width: 100%;
+  padding-bottom: 34px;
 }
 
 .message {
@@ -2535,6 +2709,24 @@ html[data-video-fullscreen="true"] .setup-column {
   border: 0;
   border-radius: 0;
   background: transparent;
+}
+
+.message-expand-button {
+  display: block;
+  margin: 12px auto 2px;
+  padding: 6px 14px;
+  border: 1px solid var(--line);
+  border-radius: 999px;
+  background: var(--paper);
+  color: var(--accent-deep);
+  cursor: pointer;
+  font: inherit;
+  font-size: max(10px, calc(var(--text-font-size) - 4px));
+  font-weight: 720;
+}
+
+.message-expand-button:hover {
+  border-color: var(--accent);
 }
 
 .message-answer-footer {
@@ -3786,13 +3978,41 @@ html[data-theme="dark"] .conversation-item-actions button.delete:hover:not(:disa
   padding: 0 0.4em;
   border-radius: 7px;
   color: var(--accent);
-  font-size: 16px;
+  font-size: 13px;
   line-height: 1;
 }
 
 .settings-credential-row .settings-api-link:hover {
   border-color: var(--accent);
   background: var(--paper-soft);
+}
+
+.settings-credential-row .search-provider-switch {
+  display: grid;
+  grid-template-columns: 0.5fr 0.5fr;
+  min-width: 180px;
+  padding: 3px;
+  border: 1px solid var(--line);
+  border-radius: 999px;
+  background: var(--paper-soft);
+}
+
+.settings-credential-row .search-provider-switch button {
+  min-height: 28px;
+  padding: 0 0px;
+  border: 0;
+  border-radius: 40px;
+  background: transparent;
+  color: var(--faint);
+  font-size: max(11px, calc(var(--ui-font-size) - 5px));
+  line-height: 1;
+  white-space: nowrap;
+}
+
+.settings-credential-row .search-provider-switch button.active {
+  background: var(--paper);
+  color: var(--ink-strong);
+  box-shadow: 0 1px 5px rgba(12, 19, 26, 0.16);
 }
 
 .settings-credential-message {
